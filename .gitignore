@@ -24,6 +24,6 @@ target
 # Added by cargo
 
 /target
-target
 .idea
-
+/**/target
+**/**/target

@@ -1,6 +1,7 @@
-[package]
-name = "smalux"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = [
+    "crates/smalux-agent",
+    "crates/smalux-server",
+    "crates/smalux-core",
+    "crates/smalux-proto"
+]
