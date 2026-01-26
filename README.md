@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/smalux.png" alt="Smalux" width="320" />
+</p>
+
 # Smalux
 
 **Smalux** is a lightweight monitoring probe designed to illuminate system behavior with clarity and minimal intrusion.  
