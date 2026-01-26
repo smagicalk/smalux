@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
-name = "smalux"
+name = "smalux-agent"
+version = "0.1.0"
+
+[[package]]
+name = "smalux-core"
+version = "0.1.0"
+
+[[package]]
+name = "smalux-proto"
+version = "0.1.0"
+
+[[package]]
+name = "smalux-server"
 version = "0.1.0"

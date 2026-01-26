@@ -37,21 +37,71 @@ Smalux 采用模块化架构，明确划分数据采集、聚合、存储与展�
 
 ---
 
+## Project Structure | 项目结构
+
+Smalux is organized as a Rust workspace.  
+Executable components and shared libraries are separated into independent crates, allowing multiple binaries to be built in a single compilation while keeping responsibilities clearly isolated.
+
+Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库拆分为独立的 crate，  
+在一次构建中生成多个运行程序，同时保持职责清晰、边界明确。
+
+- **smalux-agent**  
+  The monitoring probe deployed close to observed systems.  
+  Responsible for data collection, preprocessing, buffering, and reporting.
+
+- **smalux-server**  
+  The central collector and management service.  
+  Handles data ingestion, aggregation, querying, and configuration management.
+
+- **smalux-core**  
+  Shared core library containing common types, configuration models, error definitions, and utilities.
+
+- **smalux-proto (optional)**  
+  Contains gRPC and protobuf definitions used for high-performance or cross-language communication.  
+  This crate is optional and only required when gRPC-based communication is enabled.
+
+- **assets**  
+  Static assets such as project icons, diagrams, and documentation resources.
+
+---
+
 ## Core Components | 核心组件
 
 Smalux consists of a small set of focused components, each responsible for a well-defined role within the monitoring pipeline:
 
-- Probe / Agent: runs close to the observed system and performs data collection.
-- Collector / Server: receives, aggregates, and exposes monitoring data.
-- Storage Layer: persists metrics, events, and configuration data.
-- Web Interface: provides visualization and operational access.
+- **Probe / Agent**  
+  Runs close to the observed system and performs data collection, preprocessing, buffering, and reporting.
+
+- **Collector / Server**  
+  Receives, validates, aggregates, and exposes monitoring data through query and management APIs.
+
+- **Storage Layer**  
+  Persists metrics, events, and configuration data using purpose-built storage backends.
+
+- **Web Interface**  
+  Provides visualization, system overview, and operational access.
+
+- **gRPC Module (Optional)**  
+  Provides a high-performance, strongly-typed communication layer for data ingestion and internal service interaction.  
+  This module is optional and can be enabled when higher throughput, stricter schemas, or cross-language integration is required.
 
 Smalux 由一组职责明确的核心组件构成：
 
-- 探针 / Agent：运行在被监控系统附近，负责数据采集。
-- 收集器 / 服务端：接收、聚合并对外暴露监控数据。
-- 存储层：用于持久化指标、事件及配置信息。
-- Web 界面：用于可视化展示与运维操作。
+- **探针 / Agent**  
+  运行在被监控系统附近，负责数据采集、预处理、缓冲以及数据上报。
+
+- **收集器 / 服务端**  
+  接收、校验、聚合监控数据，并通过查询与管理接口对外提供服务。
+
+- **存储层**  
+  使用合适的存储后端对指标、事件和配置数据进行持久化。
+
+- **Web 界面**  
+  用于系统状态可视化与运维操作。
+
+- **gRPC 模块（可选）**  
+  提供高性能、强类型的通信能力，用于数据上报或内部服务交互。  
+  当系统需要更高吞吐、更严格数据结构约束或跨语言集成时，可启用该模块。
 
 ---
 
@@ -97,33 +147,19 @@ The backend and probe components of Smalux are implemented in **Rust**, chosen f
 
 Rust is used consistently across probe agents and server-side components to ensure predictable behavior and low operational overhead.
 
-Smalux 的后端与探针组件基于 **Rust** 实现，  
-Rust 在性能、内存安全以及长期运行的系统服务场景中具有明显优势。
-
-统一使用 Rust 有助于保持行为一致性，并降低整体运行与维护成本。
-
 ---
 
 ### Frontend | 前端
 
 The Smalux web interface is built with **React** and **TypeScript**, focusing on clarity, responsiveness, and ease of iteration.
 
-The frontend is responsible for visualization, system overview, and operational interaction, while remaining decoupled from backend implementation details.
-
-Smalux 的 Web 界面基于 **React** 与 **TypeScript** 构建，  
-强调清晰的可视化、良好的交互体验以及快速迭代能力。
-
-前端主要负责状态展示与操作入口，并与后端实现保持解耦。
-
 ---
 
 ### Data & Communication | 数据与通信
 
-Smalux adopts straightforward and explicit communication patterns between components.  
-Data exchange prioritizes readability, debuggability, and operational transparency.
+HTTP-based interfaces are used as the primary integration surface, prioritizing debuggability and operational transparency.
 
-Smalux 在组件间通信上采用清晰直接的模式，  
-数据交互优先考虑可读性、可调试性以及运维透明度。
+An optional gRPC-based communication module can be enabled for higher throughput, stricter schema guarantees, or efficient internal service communication.
 
 ---
 
@@ -133,19 +169,13 @@ Smalux components are designed to be deployed independently and operate reliably
 
 The deployment model favors simplicity and predictability, allowing Smalux to fit naturally into existing infrastructure setups.
 
-Smalux 的各个组件均可独立部署，并被设计为适合长期稳定运行。  
-整体部署模型强调简单性与可预测性，便于融入现有基础设施环境。
-
 ---
 
 ## Extensibility | 可扩展性
 
 The chosen architecture and technology stack allow Smalux to evolve gradually without forcing early complexity.
 
-New capabilities can be introduced incrementally while preserving the core design principles of simplicity and stability.
-
-当前架构与技术选型支持 Smalux 以渐进方式演进，  
-在不引入过早复杂度的前提下，逐步扩展能力并保持简洁与稳定的核心原则。
+New capabilities can be introduced incrementally while preserving the core principles of simplicity and stability.
 
 ---
 
@@ -153,14 +183,12 @@ New capabilities can be introduced incrementally while preserving the core desig
 
 Smalux is developed iteratively, with an emphasis on correctness, operational experience, and real-world feedback.
 
-Future work will focus on improving observability quality, operational ergonomics, and ecosystem integration.
-
-Smalux 采用渐进式开发方式，优先关注正确性、运维体验以及真实使用场景中的反馈。
-
-未来的工作将集中在提升可观测性质量、运维友好度以及与现有生态的集成能力上。
+Future work includes improvements to observability quality, operational ergonomics, and optional high-performance communication paths such as gRPC.
 
 ---
 
 ## License | 许可证
 
 This project is licensed under the terms specified in the LICENSE file.
+
+
