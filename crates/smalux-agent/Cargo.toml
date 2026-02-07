@@ -4,3 +4,32 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = {version = "1.49.0",features = ["full"]}
+futures = {version = "0.3.31",features = ["default"]}
+#futures-util = {version = "0.3.31",features = ["default","tokio-io"]}
+
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = {version = "1.0.149"}
+serde_json_path = {version = "0.7.2",features = ["default"]}
+
+#sea-orm = {version = "2.0.0-rc.29",features = ["default","runtime-tokio-rustls","macros","sqlx-all"]}
+#sea-query = {version = "1.0.0-rc.30",features = ["default","sea-orm","serde"]}
+
+tracing = {version = "0.1.44",features = ["log","std"]}
+tracing-subscriber = {version = "0.3.22",features = ["env-filter","json","local-time"]}
+
+
+anyhow = {version = "1.0.100",features = ["default"]}
+thiserror = {version = "2.0.18",features = ["default"]}
+
+sysinfo = {version = "0.38.0",features = ["default","multithread"]}
+reqwest = {version = "0.13.1",features = ["http2","rustls","multipart","hickory-dns","json"]}
+
+tonic = {version = "0.14.2",features = ["default"]}
+prost = {version = "0.14.3",features = ["default"]}
+
+ureq = {version = "3.1.4",features = ["default","rustls"]}
+
+smalux-core = { path = "../smalux-core"}
+
+

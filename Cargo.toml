@@ -5,3 +5,4 @@ members = [
     "crates/smalux-core",
     "crates/smalux-proto"
 ]
+resolver = "3"

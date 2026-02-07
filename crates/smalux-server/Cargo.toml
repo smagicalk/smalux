@@ -4,3 +4,33 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = {version = "1.49.0",features = ["full"]}
+axum = {version = "0.8.8",features = ["default","http2","multipart","ws","macros"]}
+axum-extra = {version = "0.12.5",features = ["middleware"]}
+tower-http = {version = "0.6.8",features = []}
+tower = {version = "0.5.3",features = []}
+
+
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = {version = "1.0.149"}
+
+sea-orm = {version = "2.0.0-rc.29",features = ["default","runtime-tokio-rustls","macros","sqlx-all"]}
+sea-query = {version = "1.0.0-rc.30",features = ["default","sea-orm","serde"]}
+
+tracing = {version = "0.1.44",features = ["log","std"]}
+tracing-subscriber = {version = "0.3.22",features = ["env-filter","json","local-time"]}
+
+config = {version = "0.15.19",features = ["default"]}
+dotenvy = {version = "0.15.7",features = []}
+
+
+anyhow = {version = "1.0.100",features = ["default"]}
+thiserror = {version = "2.0.18",features = ["default"]}
+
+sysinfo = {version = "0.38.0",features = []}
+reqwest = {version = "0.13.1",features = ["http2","rustls","multipart"]}
+
+tonic = {version = "0.14.2",features = ["default"]}
+prost = {version = "0.14.3",features = ["default"]}
+
+
