@@ -1,28 +1,54 @@
+//! 流量和容量单位换算工具。
+//!
+//! 内部统一先换算为 bytes，再转换到目标单位，避免不同单位之间直接互转产生重复逻辑。
+
 use std::fmt;
 
+/// 容量单位。
+///
+/// `KiB/MiB/GiB/TiB` 使用 1024 进制，`KB/MB/GB/TB` 使用 1000 进制。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
+    /// 字节。
     Bytes,
+    /// 1024 字节。
     KiB,
+    /// 1024^2 字节。
     MiB,
+    /// 1024^3 字节。
     GiB,
+    /// 1024^4 字节。
     TiB,
+    /// 1000 字节。
     KB,
+    /// 1000^2 字节。
     MB,
+    /// 1000^3 字节。
     GB,
+    /// 1000^4 字节。
     TB,
 }
 
+/// 带单位的容量值。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Flow {
+    /// 字节值。
     BYTES(f64),
+    /// KiB 值。
     KIB(f64),
+    /// MiB 值。
     MIB(f64),
+    /// GiB 值。
     GIB(f64),
+    /// TiB 值。
     TIB(f64),
+    /// KB 值。
     KB(f64),
+    /// MB 值。
     MB(f64),
+    /// GB 值。
     GB(f64),
+    /// TB 值。
     TB(f64),
 }
 
@@ -32,13 +58,13 @@ impl Unit {
         match self {
             Unit::Bytes => 1.0,
 
-            // IEC (1024)
+            // IEC 单位使用 1024 进制。
             Unit::KiB => 1024.0,
             Unit::MiB => 1024.0_f64.powi(2),
             Unit::GiB => 1024.0_f64.powi(3),
             Unit::TiB => 1024.0_f64.powi(4),
 
-            // SI (1000)
+            // SI 单位使用 1000 进制。
             Unit::KB => 1000.0,
             Unit::MB => 1000.0_f64.powi(2),
             Unit::GB => 1000.0_f64.powi(3),
@@ -46,6 +72,7 @@ impl Unit {
         }
     }
 
+    /// 返回展示用单位名称。
     pub fn format_name(self) -> &'static str {
         match self {
             Unit::Bytes => "B",
@@ -62,8 +89,6 @@ impl Unit {
 }
 
 impl Flow {
-
-
     /// Pretty 打印：自动换算成 IEC 单位并带 2 位小数
     pub fn pretty(&self) -> String {
         let bytes = self.as_bytes();
@@ -75,7 +100,7 @@ impl Flow {
             Flow::MIB(v) => format!("{:.2} MiB", v),
             Flow::GIB(v) => format!("{:.2} GiB", v),
             Flow::TIB(v) => format!("{:.2} TiB", v),
-            // human_iec 不会走到 SI 单位，这里兜底
+            // human_iec 不会走到 SI 单位，这里做兜底。
             Flow::KB(v) => format!("{:.2} KB", v),
             Flow::MB(v) => format!("{:.2} MB", v),
             Flow::GB(v) => format!("{:.2} GB", v),
@@ -83,6 +108,7 @@ impl Flow {
         }
     }
 
+    /// 返回当前值的单位。
     pub fn unit(&self) -> Unit {
         match self {
             Flow::BYTES(_) => Unit::Bytes,
@@ -97,6 +123,7 @@ impl Flow {
         }
     }
 
+    /// 返回当前值的数值部分，不做单位换算。
     pub fn value(&self) -> f64 {
         match *self {
             Flow::BYTES(v)
@@ -157,6 +184,7 @@ impl Flow {
 
 /// 默认 Display 也做 pretty 输出
 impl fmt::Display for Flow {
+    // Display 和 pretty 保持一致，避免两套容量展示格式。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.pretty())
     }
@@ -164,8 +192,11 @@ impl fmt::Display for Flow {
 
 #[cfg(test)]
 mod tests {
+    //! Flow 单位换算测试。
+
     use super::*;
 
+    /// 验证 1024 进制 bytes 到 KiB 的转换。
     #[test]
     fn test_bytes_to_kib() {
         let f = Flow::BYTES(2048.0);
@@ -173,6 +204,7 @@ mod tests {
         assert_eq!(kib, Flow::KIB(2.0));
     }
 
+    /// 验证 1000 进制 bytes 到 KB 的转换。
     #[test]
     fn test_bytes_to_kb() {
         let f = Flow::BYTES(2048.0);
@@ -180,6 +212,7 @@ mod tests {
         assert_eq!(kb, Flow::KB(2.048));
     }
 
+    /// 验证 Display 和 pretty 输出一致。
     #[test]
     fn test_pretty() {
         let f = Flow::BYTES(2048.0);

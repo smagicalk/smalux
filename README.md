@@ -56,9 +56,9 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 - **smalux-core**  
   Shared core library containing common types, configuration models, error definitions, and utilities.
 
-- **smalux-proto (optional)**  
-  Contains gRPC and protobuf definitions used for high-performance or cross-language communication.  
-  This crate is optional and only required when gRPC-based communication is enabled.
+- **smalux-protocol**
+  Contains the shared agent/server wire protocol, including versioned frames and JSON message contracts.
+  gRPC/protobuf support can be added later as a separate crate when needed.
 
 - **assets**  
   Static assets such as project icons, diagrams, and documentation resources.
