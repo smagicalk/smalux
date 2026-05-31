@@ -4,6 +4,15 @@
 
 这个文件用于在其他电脑或新会话中恢复当前开发上下文。项目路径为 `F:/code/rust/smalux`，当前仓库是 Rust 2024 workspace。
 
+## 快速恢复摘要
+
+- 当前主开发分支是 `dev`。
+- 最新功能基线提交为 `35106f5 refactor: regroup agent service modules`，已推送到远端 `dev`。
+- 恢复时先执行 `git pull`，再运行 `git status --short`；预期工作区为空。
+- 当前 agent 已完成采集、动态配置、WebSocket/HTTP 导出、Komari 兼容、remote shell、remote task、remote probe、secure_psk、snapshot/delta/heartbeat 和控制层 ack/error。
+- 当前 `smalux-agent/src/service/` 已按职责聚合：`message/` 放 listener、inbound、outbound，`remote/` 放 shell、task、probe，`service.rs` 继续作为运行入口和兼容导出层。
+- 后续重点建议从 `smalux-server` 开始：先接 WebSocket ingest，解析 `smalux-protocol::ClientFrame`，保存 latest state，再考虑历史存储和 Web UI。
+
 ## 项目概况
 
 - `crates/smalux-agent`：探针端，已有系统身份、CPU、内存、磁盘、网络、进程/socket、公网 IP、动态配置、WebSocket/HTTP 导出、Komari 兼容、remote shell、remote task 和 remote probe。
@@ -319,34 +328,23 @@ cargo test --workspace
 
 ## 当前工作区状态
 
-开始本次会话前仓库已有未提交改动和新增文件。本次会话没有回滚任何既有改动。
+当前功能代码已提交并推送，恢复后预期 `git status --short` 为空。若不为空，优先确认是否是其他机器或用户的新改动，不要直接回滚。
 
-最后一次观察到的关键新增/迁移区域包括：
+当前关键结构：
 
-- `crates/smalux-agent/src/collect.rs` 和 `crates/smalux-agent/src/collect/`
-- `crates/smalux-agent/src/config.rs` 和 `crates/smalux-agent/src/config/`
-- `crates/smalux-agent/src/export.rs` 和 `crates/smalux-agent/src/export/`
-- `crates/smalux-agent/src/telemetry.rs` 和 `crates/smalux-agent/src/telemetry/`
-- `crates/smalux-agent/src/service.rs` 和 `crates/smalux-agent/src/service/`
-- `crates/smalux-protocol/`
-- `crates/smalux-agent/README.md`
-- `session.md`
-
-最后一次观察到的关键已修改区域包括：
-
-- `Cargo.lock`
-- `Cargo.toml`
-- `crates/smalux-agent/Cargo.toml`
-- `crates/smalux-core/Cargo.toml`
-- `crates/smalux-core/src/model/info/*`
-- `crates/smalux-server/Cargo.toml`
-- `crates/smalux-server/src/main.rs`
+- `crates/smalux-agent/src/collect.rs` 和 `crates/smalux-agent/src/collect/`：本机采集入口和具体采集实现。
+- `crates/smalux-agent/src/config.rs` 和 `crates/smalux-agent/src/config/`：默认值、CLI、动态配置和 patch 校验。
+- `crates/smalux-agent/src/telemetry.rs` 和 `crates/smalux-agent/src/telemetry/`：latest state、snapshot/delta/heartbeat 聚合。
+- `crates/smalux-agent/src/export.rs` 和 `crates/smalux-agent/src/export/`：adapter、transport hub、WebSocket、HTTP、Komari、wire 和 secure_psk。
+- `crates/smalux-agent/src/service.rs` 和 `crates/smalux-agent/src/service/`：agent 运行编排、message 控制链路、remote 能力、采集循环和上报循环。
+- `crates/smalux-protocol/`：agent/server 共享 frame、payload 和 JSON codec。
+- `crates/smalux-server/`：server crate 仍是骨架，但 README 已写好接入流程和协议处理建议。
 
 继续开发前建议先运行：
 
 ```powershell
 git status --short
-cargo check
+cargo check --workspace --all-targets
 ```
 
 ## 编码与协作注意事项
@@ -359,10 +357,10 @@ cargo check
 
 ## 建议下一步
 
-1. 接 `smalux-server` 的 WebSocket ingest，接收并记录 agent 上报的 `ClientFrame::Snapshot`。
-2. 明确 server 侧存储策略：先内存缓存，还是直接接数据库。
-3. 再考虑进程明细、连接明细、温度、GPU、电池等新采集功能。
-4. 新功能先放入现有 crate 的独立 module；只有需要独立复用、独立发布或依赖边界明显不同时，再拆成新 crate。
+1. 接 `smalux-server` 的 WebSocket ingest，完成 upgrade、wire 解包、`ClientFrame` 解析和 latest state 更新。
+2. 先用内存 latest state 跑通 agent 到 server 闭环，再决定 SQLite 表结构和历史指标保留策略。
+3. 接 server 下发 `ServerFrame::snapshot_request` 和后续 desired config，下发前先按 README 的控制消息边界实现幂等和限频。
+4. agent 后续采集项可继续补温度、GPU、电池；新功能先放现有 crate 的独立 module，只有依赖边界或复用边界明显时再拆新 crate。
 
 ## 建议使用的技能
 
