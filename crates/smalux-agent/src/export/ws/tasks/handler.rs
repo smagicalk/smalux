@@ -28,6 +28,8 @@ pub(super) async fn handle_incoming_message(
 ) -> bool {
     match msg {
         Some(Ok(tungstenite::protocol::Message::Text(msg_bytes))) => {
+            // secure_psk 模式下业务 JSON 必须走 SecureData，拒绝 text 可以避免控制命令
+            // 绕过加密通道进入 ServiceControlListener。
             if matches!(wire_state.mode(), ExportWireMode::SecurePsk) {
                 tracing::warn!("websocket text message rejected in secure_psk wire mode");
                 return false;
@@ -46,6 +48,8 @@ pub(super) async fn handle_incoming_message(
         }
         Some(Ok(tungstenite::protocol::Message::Binary(bytes))) => {
             let len = bytes.len();
+            // binary frame 始终先按 Smalux wire 解包；payload 才是后续解析
+            // ServerFrame 或 raw control JSON 的 UTF-8 JSON bytes。
             match decode_binary_payload(bytes.as_ref(), wire_state) {
                 Ok((packet, payload)) => handle_data_message(
                     ExportInboundMessage::Binary(payload),
@@ -184,6 +188,8 @@ fn encode_binary_payload(
     sequence: u64,
     payload: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
+    // transport 不解析 JSON 内容，只按 wire_mode 给业务 payload 加壳或加密。
+    // 这样 report、ack/error、remote task result 和 shell stream event 可以复用同一发送路径。
     let packet = match wire_state {
         WebSocketWireState::BinaryPlain { session_id } => {
             WirePacket::plain_data(*session_id, sequence, payload)
@@ -208,6 +214,7 @@ fn decode_binary_payload(
     let packet = wire::decode_wire_packet(input)?;
     let payload = match wire_state {
         WebSocketWireState::BinaryPlain { .. } => {
+            // binary_plain 只接受 PlainData，避免握手包或密文包被误当成明文控制消息。
             if packet.kind != WirePacketKind::PlainData {
                 anyhow::bail!(
                     "unexpected wire packet kind for binary_plain: {}",
@@ -217,6 +224,7 @@ fn decode_binary_payload(
             packet.payload.clone()
         }
         WebSocketWireState::SecurePsk { transport, .. } => {
+            // secure_psk 只接受 SecureData；解密失败会停止连接并交给 export supervisor 重连。
             if packet.kind != WirePacketKind::SecureData {
                 anyhow::bail!(
                     "unexpected wire packet kind for secure_psk: {}",
@@ -264,6 +272,8 @@ async fn handle_data_message(
 
     let event = InboundMessageEvent { payload, listener };
 
+    // listener 回调放进独立有界队列串行执行。WebSocket 读循环只负责收包和解包；
+    // 如果业务处理变慢，背压会在这里显式表现为队列满，而不是无界占用内存。
     match listener_tx.try_send(event) {
         Ok(()) => true,
         Err(TrySendError::Full(_event)) => {

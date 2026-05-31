@@ -1,4 +1,4 @@
-//! Service 内部出站事件队列。
+//! Service message 内部出站事件队列。
 //!
 //! 采样上报、远程任务结果等业务事件先进入统一队列，再由 export supervisor
 //! 根据当前导出格式编码和投递到具体 transport。

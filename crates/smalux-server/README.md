@@ -27,6 +27,16 @@ src/
 - `storage.rs`: 定义存储 trait，接入数据库。
 - `query.rs`: 面向仪表盘或 API 提供查询模型。
 
+建议职责边界：
+
+- `http.rs` 只处理 HTTP/WebSocket 框架细节：路由、upgrade、请求参数、响应码、连接超时。
+- `ingest.rs` 只处理协议语义：decode `ClientFrame`、校验、snapshot/delta/heartbeat 分发、控制响应关联。
+- `storage.rs` 只处理持久化：latest state、pending command、remote task/probe result，不直接依赖 axum。
+- `query.rs` 只处理读模型：把 storage 数据转换成 API 返回结构，不直接解析 wire frame。
+- `config.rs` 只放 server 启动参数，例如监听地址、数据库路径、wire mode、token/secret 加载方式。
+
+这样后续增加 REST、gRPC 或 Web UI 时，不需要重写 agent 上报接入逻辑；只新增入口层或查询层。
+
 ## Agent 上报接入设计
 
 首版 server 先做“接收并保存最新快照”，不急着做历史时序库。这样可以先把 agent 到 server 的协议闭环跑通，再根据 UI 和查询需求决定是否落库、如何分表、是否保留明细历史。
@@ -78,6 +88,62 @@ agent connects /ws
 
 `secure_psk` 模式下，server 需要保存 `key_id -> secret`。收到 agent 的 `Hello` 后，用同样 HKDF-SHA256 参数派生 32 字节 PSK，再以 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` responder 身份回复第二条 handshake。握手成功后，所有业务 JSON 都必须先加密再放入 `SecureData`。
 
+### 连接状态机
+
+server 侧可以把每条 agent 主连接按下面状态管理：
+
+```text
+accepted
+  -> authenticating        # 校验 query token / bearer token / 后续自定义认证
+  -> wire_negotiating      # binary_plain 直接进入 ready；secure_psk 等 Hello + Handshake
+  -> ready                 # 可以收 ClientFrame，也可以下发控制消息
+  -> closing               # 收到 close、读写失败或协议错误
+  -> disconnected          # 清理内存连接态，latest snapshot 可保留
+```
+
+建议把“连接态”和“监控最新状态”分开保存。连接断开只清理 WebSocket sink、Noise transport、未完成的请求等待器，不删除 `latest_report`；这样 UI 还能显示最后一次上报和离线时间。
+
+### Wire 解包伪代码
+
+server 的 WebSocket binary 处理逻辑可以按这个顺序写：
+
+```text
+on_binary(bytes):
+  packet = decode_wire_packet(bytes)
+  assert packet.magic == "SMX1"
+  assert packet.version == 1
+  assert packet.payload_len == bytes.len - 36
+
+  if mode == binary_plain:
+    assert packet.kind == PlainData
+    json_bytes = packet.payload
+
+  if mode == secure_psk:
+    if state == waiting_hello:
+      assert packet.kind == Hello
+      hello = json_decode(packet.payload)
+      secret = lookup_secret(hello.key_id)
+      psk = hkdf_sha256(secret, key_id=hello.key_id)
+      start_noise_responder(psk)
+      state = waiting_handshake
+
+    else if state == waiting_handshake:
+      assert packet.kind == Handshake
+      read_noise_msg1(packet.payload)
+      msg2 = write_noise_msg2()
+      send WirePacket(kind=Handshake, same session_id, payload=msg2)
+      state = ready
+
+    else if state == ready:
+      assert packet.kind == SecureData
+      json_bytes = noise_decrypt(packet.payload)
+
+  text = utf8(json_bytes)
+  route_json(text)
+```
+
+`binary_plain` 开发期可以允许 WebSocket text frame 直接进入 `route_json()`；`secure_psk` 不允许 text frame，因为 text 会绕过业务加密。
+
 ### 消息格式
 
 agent 内部先生成 `OutboundReport::Snapshot`，当前默认 `smalux_json` 格式会把它编码成 `ClientFrame::Snapshot` JSON，snapshot payload 内包含完整 `AgentReport`。核心结构：
@@ -119,6 +185,39 @@ server 不应该把所有 payload 都当成完整指标：
 - `remote_task_result`：通过 `result.task_id` 关联非交互任务。
 - `remote_probe_result`：通过 `result.task_id` 关联网络探测；`value=-1` 表示失败、禁用、限频或暂不支持。
 
+### Delta 合并伪代码
+
+server 只需要保存一份 latest state 和一个 delta 基准序号：
+
+```text
+on_snapshot(frame):
+  latest_report = frame.report
+  base_sequence = frame.sequence
+  last_seen_at = now()
+
+on_delta(frame):
+  if latest_report is None:
+    send_snapshot_request("missing_snapshot")
+    return
+
+  if frame.delta.base_sequence != base_sequence:
+    send_snapshot_request("delta_base_mismatch")
+    return
+
+  for group in [identity, core, disk, network, processes, sockets]:
+    if group field is absent:
+      keep existing group
+    else if group field is null:
+      clear existing group
+    else:
+      replace whole group with incoming group
+
+  base_sequence = frame.sequence
+  last_seen_at = now()
+```
+
+`identity` 是对象，不是 `Option<Option<...>>`；它出现时整体替换，不出现时保持旧值。`core/disk/network/processes/sockets` 出现 `null` 时表示该采集组被关闭。
+
 ### 校验规则
 
 `ingest.rs` 首版只做轻量 fail-fast 校验：
@@ -139,6 +238,30 @@ server 不应该把所有 payload 都当成完整指标：
 - `report.processes.value.level` / `report.sockets.value.level` 可能为 `count`、`light` 或 `details`；server 需要按字段是否存在处理 `light/details`，不要假设每次都有明细。
 
 认证和授权后续单独设计。当前可以先只支持本地开发无认证，或临时使用 WebSocket 握手里的 query/bearer token 做简单识别。
+
+### 错误处理
+
+server 收到异常数据时要区分“单条消息错误”和“连接级错误”，不要因为某个可忽略业务字段导致主连接频繁断开。
+
+建议规则：
+
+- 连接级错误：wire magic/version 错误、`secure_psk` 握手失败、token 或 key_id 不存在、密文解不开、payload 超过上限。这类错误应关闭连接。
+- frame 级错误：JSON 语法错误、缺少 `protocol_version` / `agent_id` / `sequence` / `type`、`protocol_version` 不支持。这类错误记录后可以关闭连接，避免双方状态继续错位。
+- 业务级错误：`delta.base_sequence` 不匹配、未知 `type`、未知可选字段、单个采集组字段不完整。这类错误优先记录日志和指标；`delta` 不匹配时发送 `snapshot_request`，未知字段默认忽略。
+- 控制级错误：server 发出的 `ServerFrame` 收到 `error.sequence` 时，只把对应 pending command 标记为失败，不要关闭主连接。
+
+建议给日志打上固定字段，方便后续排查：
+
+```text
+agent_id
+connection_id
+client_sequence
+server_sequence
+frame_type
+wire_mode
+error_code
+error_message
+```
 
 ### 控制消息
 
@@ -162,6 +285,162 @@ server 通过同一条 Smalux WebSocket 控制通道下发 JSON。当前有两�
 - `remote_probe_run`：执行一次 TCP/HTTP 探测；默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
 
 server 如果要远程打开 `processes.level=details` 或 `sockets.level=details`，agent 必须启动时带对应 CLI-only 授权：`--allow-process-details true` 或 `--allow-socket-details true`。一次性 details 采集同样受这个限制。
+
+控制消息发送规则：
+
+- 发送 `ServerFrame` 前先分配 server 侧递增 `sequence`，保存一条 pending command。
+- 收到 `ack.sequence` 后，只能把该 command 标记为“已调度”；不能把远程 task/probe 标记为完成。
+- 收到 `error.sequence` 后，把该 command 标记为失败，并记录 `error.code` 和 `error.message`。
+- raw control JSON 没有 `sequence`，server 不能等待 ack；需要结果的 raw 命令应通过后续业务结果判断，例如 `remote_task_result.task_id`。
+- 重连后不要盲目重发所有 raw 命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重。
+
+### 控制消息示例
+
+请求完整快照：
+
+```jsonc
+{
+  "protocol_version": 1,
+  "sequence": 201,
+  "sent_at": 1710001000,
+  "type": "snapshot_request",
+  "request": { "reason": "manual_refresh" }
+}
+```
+
+动态调整采样频率：
+
+```jsonc
+{
+  "type": "config_patch",
+  "patch": {
+    "core": { "interval": "2s" },
+    "network": { "interval": "10s" },
+    "report": { "interval": "10s" },
+    "jobs": {
+      "realtime_report": { "interval": "10s" }
+    }
+  }
+}
+```
+
+开启远程 probe 并请求 TCP 探测：
+
+```jsonc
+{ "type": "config_patch", "patch": { "remote_probe": { "enabled": true } } }
+```
+
+```jsonc
+{
+  "protocol_version": 1,
+  "sequence": 202,
+  "sent_at": 1710001001,
+  "type": "remote_probe_run",
+  "request": {
+    "task_id": "probe-1",
+    "probe_type": "tcp",
+    "target": "example.com:443"
+  }
+}
+```
+
+### Server 内部状态建议
+
+首版 server 不需要一开始就做复杂领域模型，但建议把下面几类状态分开：
+
+```text
+AgentConnectionState
+  agent_id
+  connection_id
+  connected_at
+  last_frame_at
+  wire_mode
+  secure_key_id
+  websocket_sink
+  noise_transport
+
+AgentLatestState
+  agent_id
+  last_seen_at
+  last_frame_sequence
+  delta_base_sequence
+  latest_report
+  last_heartbeat_at
+  connection_state
+
+PendingCommand
+  server_sequence
+  agent_id
+  command_type
+  sent_at
+  status          # queued | sent | acked | failed | timed_out
+  error_code
+  error_message
+
+PendingRemoteTask
+  task_id
+  agent_id
+  sent_at
+  status          # sent | running | success | failed | timed_out | rejected
+  result
+
+PendingRemoteProbe
+  task_id
+  agent_id
+  sent_at
+  status          # sent | success | failed | rejected
+  result
+```
+
+这样拆分后，WebSocket 重连不会影响最新监控状态；server 下发命令的 ack/error 也不会和 remote task/probe 的最终结果混在一起。
+
+### 幂等和重连策略
+
+server 需要把三类数据分开处理：
+
+- 最新状态：`snapshot` / `delta` / `heartbeat`。只保存最新状态，旧 report 不排队，防止高频 agent 把 server 内存打满。
+- 一次性结果：`ack` / `error` / `remote_task_result` / `remote_probe_result`。用 `sequence` 或 `task_id` 关联 pending 记录，可重复接收同一结果并做幂等覆盖。
+- 控制命令：server 主动发送给 agent。`config_patch` 可以在重连后按 desired config 重新下发；`remote_task_run` 这类有副作用的命令不要自动重发，除非 server 能根据 `task_id` 确认 agent 没有执行过。
+
+建议规则：
+
+- 同一 agent 的 `ClientFrame.sequence` 小于等于已处理序号时，记录为重复或乱序，默认忽略。
+- 收到 `delta.base_sequence != delta_base_sequence` 时，不处理该 delta，立即发送 `snapshot_request`。
+- 收到新的 `snapshot` 后，用它重建 latest state，并把 `delta_base_sequence` 设置为该 frame 的 `sequence`。
+- 收到 `heartbeat` 时只更新 `last_heartbeat_at` 和 `last_seen_at`，不要覆盖指标。
+- WebSocket 断开时，把连接态改成 disconnected，但保留 `latest_report` 和 pending 任务结果等待状态。
+- pending command 超时只说明 agent 没回 ack/error，不代表命令一定没执行；对有副作用命令要靠业务结果或人工确认。
+
+### 安全底线
+
+即使首版只用于自用，也建议先固定下面的底线，避免后面补安全时推翻协议：
+
+- 生产环境优先使用 `wss`；如果用 `ws`，至少限制在可信内网。
+- `secure_psk` 模式下不要同时使用 query/bearer token，agent 当前也会拒绝这种组合，避免 token 明文出现在 URL 或 header。
+- server 日志不要打印完整 token、secure secret、PSK、Authorization header、带 token 的 URL。
+- `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
+- raw `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
+- server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-details` 或 `--allow-socket-details`。
+- 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_run` 和未来的 remote task。
+
+### 测试清单
+
+server 第一版建议至少覆盖这些测试：
+
+| 类型 | 场景 | 期望 |
+| --- | --- | --- |
+| wire | `PlainData` 正常解包 | 得到 JSON bytes |
+| wire | magic/version/payload_len 错误 | 拒绝 frame，不 panic |
+| secure | Hello key_id 不存在 | 关闭连接或返回协议错误 |
+| secure | PSK 不匹配 | Noise 握手失败，不能进入 ready |
+| frame | `snapshot` 写入 | latest state 被完整覆盖 |
+| frame | `delta.base_sequence` 匹配 | 顶层采集组整体替换 |
+| frame | `delta.base_sequence` 不匹配 | 不修改 latest，发送 `snapshot_request` |
+| frame | `heartbeat` | 只更新在线时间，不修改指标 |
+| control | `snapshot_request` ack | pending command 标记为 acked |
+| control | `snapshot_request` error | pending command 标记失败并保存错误 |
+| task | 重复 `remote_task_result.task_id` | 幂等覆盖，不创建重复记录 |
+| reconnect | agent 断开重连后发 snapshot | connection state 更新，latest state 正常覆盖 |
 
 ### 存储策略
 
@@ -190,6 +469,74 @@ AgentRuntimeState
 - 不做 report 队列，避免 server 因 agent 高频上报堆积。
 - 如果后续需要历史曲线，再把 `core/disk/network/processes/sockets` 拆成时序写入，不影响 latest 缓存。
 
+如果首版就接 SQLite，建议仍然先保持 latest-only 思路，把“在线最新状态”和“历史曲线”分开：
+
+```text
+agents
+  agent_id TEXT PRIMARY KEY
+  display_name TEXT NULL
+  created_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL
+
+agent_connections
+  connection_id TEXT PRIMARY KEY
+  agent_id TEXT NOT NULL
+  connected_at INTEGER NOT NULL
+  disconnected_at INTEGER NULL
+  remote_addr TEXT NULL
+  wire_mode TEXT NOT NULL
+  close_reason TEXT NULL
+
+agent_latest_reports
+  agent_id TEXT PRIMARY KEY
+  last_seen_at INTEGER NOT NULL
+  last_report_at INTEGER NOT NULL
+  last_sequence INTEGER NOT NULL
+  delta_base_sequence INTEGER NOT NULL
+  schema_version INTEGER NOT NULL
+  hostname TEXT NULL
+  public_ip_status TEXT NOT NULL
+  report_json TEXT NOT NULL
+
+pending_commands
+  command_id TEXT PRIMARY KEY
+  agent_id TEXT NOT NULL
+  server_sequence INTEGER NOT NULL
+  command_type TEXT NOT NULL
+  status TEXT NOT NULL        # sent | acked | failed | timeout
+  request_json TEXT NOT NULL
+  response_json TEXT NULL
+  created_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL
+
+remote_task_results
+  task_id TEXT PRIMARY KEY
+  agent_id TEXT NOT NULL
+  status TEXT NOT NULL
+  exit_code INTEGER NULL
+  stdout_truncated INTEGER NOT NULL
+  stderr_truncated INTEGER NOT NULL
+  result_json TEXT NOT NULL
+  updated_at INTEGER NOT NULL
+
+remote_probe_results
+  task_id TEXT PRIMARY KEY
+  agent_id TEXT NOT NULL
+  probe_type TEXT NOT NULL
+  target TEXT NOT NULL
+  value INTEGER NOT NULL
+  error TEXT NULL
+  updated_at INTEGER NOT NULL
+```
+
+落库事务建议：
+
+- `snapshot`：一个事务内更新 `agents.updated_at`、覆盖 `agent_latest_reports.report_json`、更新 `last_sequence` 和 `delta_base_sequence`。
+- `delta`：先读取当前 `delta_base_sequence`；匹配才合并 JSON 并写回，不匹配不写库，只发送 `snapshot_request`。
+- `heartbeat`：只更新 `last_seen_at`，不改 `report_json` 和 `delta_base_sequence`。
+- `ack/error`：只更新 `pending_commands`，不要修改 latest report。
+- `remote_task_result` / `remote_probe_result`：按 `task_id` upsert，重复结果覆盖同一行，保证幂等。
+
 ### 查询接口
 
 首版查询可以先提供两个只读接口：
@@ -208,15 +555,84 @@ GET /agents/{agent_id}
 - 查询历史 CPU/内存/磁盘/网络曲线。
 - 查询离线 agent 和最近错误状态。
 
+### HTTP 端点规划
+
+首版 server 可以按“写入入口少、查询入口清晰”的方式规划端点：
+
+| 端点 | 方法 | 作用 | 首版是否需要 |
+| --- | --- | --- | --- |
+| `/ws` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
+| `/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
+| `/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
+| `/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_run` | 可后做 |
+| `/agents/{agent_id}/commands/{command_id}` | `GET` | 查询 pending command 的 ack/error 状态 | 可后做 |
+| `/agents/{agent_id}/tasks/{task_id}` | `GET` | 查询 remote task 结果 | 可后做 |
+| `/agents/{agent_id}/probes/{task_id}` | `GET` | 查询 remote probe 结果 | 可后做 |
+
+端点职责建议：
+
+- `/ws` 不直接做复杂查询，只负责连接、解包、分发和发送控制消息。
+- 查询端点只读 storage，不直接访问 WebSocket sink。
+- 创建控制命令时先写 `pending_commands`，再投递到当前在线连接；如果 agent 离线，按命令类型决定是拒绝、排队还是只保存 desired config。
+- `config_patch` 更像 desired config，不建议作为普通一次性命令长期排队；agent 重连后 server 可以比较 desired config 和当前 effective 状态后再下发。
+
+### Ingest 分发伪代码
+
+server 的 `ingest.rs` 可以把 transport 细节隔离掉，只接收已经解包出来的 JSON bytes：
+
+```text
+handle_client_json(connection, json_bytes):
+  frame = decode ClientFrame(json_bytes)
+  validate_common_fields(frame)
+
+  if frame.agent_id != connection.agent_id:
+    return protocol_error("agent_id_mismatch")
+
+  match frame.type:
+    snapshot:
+      validate_report(frame.report)
+      storage.apply_snapshot(frame.agent_id, frame.sequence, frame.report)
+      connection.last_seen_at = now()
+
+    delta:
+      result = storage.apply_delta(frame.agent_id, frame.sequence, frame.delta)
+      if result == DeltaBaseMismatch:
+        send_server_frame(snapshot_request("delta_base_mismatch"))
+
+    heartbeat:
+      storage.touch_heartbeat(frame.agent_id, frame.sequence, frame.heartbeat)
+
+    ack:
+      storage.mark_command_acked(frame.agent_id, frame.ack.sequence)
+
+    error:
+      storage.mark_command_failed(frame.agent_id, frame.error.sequence, frame.error)
+
+    remote_task_result:
+      storage.upsert_remote_task_result(frame.agent_id, frame.result)
+
+    remote_probe_result:
+      storage.upsert_remote_probe_result(frame.agent_id, frame.result)
+
+    unknown:
+      log and ignore
+```
+
+注意 `ClientFrame.sequence` 是 agent 的全局出站序号，不是每种消息各自递增。server 可以用它判断“该连接上是否见过更新的 frame”，但不要假设连续序号一定都到达；导出 job 可能因为只发送最新 report 而跳过中间 report。
+
 ### 实现顺序
 
 建议按下面顺序写代码：
 
 1. 在 `storage.rs` 定义 latest-only 存储 trait 和内存实现。
 2. 在 `ingest.rs` 实现 `validate_report()` 和 `handle_report()`。
-3. 在 `http.rs` 增加 `/ws` WebSocket handler。
-4. 增加本地测试：合法 report 写入成功、schema 不匹配失败、同 agent 覆盖旧快照。
-5. 再补 `GET /agents` 和 `GET /agents/{agent_id}` 查询接口。
+3. 在 `ingest.rs` 实现 `apply_snapshot()` / `apply_delta()` / `apply_heartbeat()`。
+4. 在 `http.rs` 增加 `/ws` WebSocket handler。
+5. 实现 `binary_plain` wire 解包和 `ClientFrame` 分发。
+6. 增加本地测试：合法 report 写入成功、schema 不匹配失败、同 agent 覆盖旧快照、delta base 不匹配会请求 snapshot。
+7. 再补 `GET /agents` 和 `GET /agents/{agent_id}` 查询接口。
+8. 增加 `pending_commands` 和 desired config 状态，支持手动发送 `snapshot_request` 和 `config_patch`。
+9. 最后接 `secure_psk`、remote task/probe/shell、历史指标落库和 Web UI。
 
 ## 常用命令
 

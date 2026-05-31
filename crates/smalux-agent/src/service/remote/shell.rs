@@ -7,6 +7,6 @@ mod manager;
 mod message;
 mod options;
 
-pub(crate) use manager::RemoteShellManager;
-pub(crate) use message::RemoteShellOpenRequest;
-pub(crate) use options::RemoteShellOptions;
+pub(crate) use self::manager::RemoteShellManager;
+pub(crate) use self::message::RemoteShellOpenRequest;
+pub(crate) use self::options::RemoteShellOptions;

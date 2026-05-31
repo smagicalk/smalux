@@ -4,9 +4,11 @@
 //! 分开建模，默认关闭，且只能由 CLI 启动参数开启。任务并发数放在动态
 //! `AgentConfig.remote_task` 中，server patch 可以在能力已开启后调整。
 
-use super::outbound::{OutboundEvent, OutboundSender, OutboundSequence, RemoteTaskResultEnvelope};
 use crate::collect::unix_timestamp_secs;
 use crate::config::ConfigManager;
+use crate::service::message::outbound::{
+    OutboundEvent, OutboundSender, OutboundSequence, RemoteTaskResultEnvelope,
+};
 use serde::Deserialize;
 use smalux_core::utils::validate::ensure_non_empty;
 use smalux_protocol::{RemoteTaskResult, RemoteTaskStatus};
@@ -403,7 +405,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AgentConfig, ConfigManager};
-    use crate::service::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
+    use crate::service::message::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
 
     /// 验证默认远程任务关闭。
     #[test]

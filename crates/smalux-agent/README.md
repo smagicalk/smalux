@@ -51,7 +51,11 @@ src/
   telemetry.rs     # telemetry 状态、事件和聚合策略入口
   telemetry/       # TelemetryState、ReportEvent、TelemetryAggregator
   service.rs       # bootstrap、导出监管、采集循环、上报循环和控制消息
-  service/         # service 子模块：启动、采集、上报、出站事件、入站命令、公网 IP、远程能力
+  service/         # service 子模块：按消息流和远程能力聚合，避免文件过散
+    message.rs     # message 子模块入口
+    message/       # listener / inbound / outbound：协议入站、控制分发、出站事件
+    remote.rs      # remote 子模块入口
+    remote/        # shell / task / probe：远程 shell、一次性任务和探测能力
   export.rs        # 导出抽象
   export/          # WebSocket、HTTP、Komari、rustls 和 transport worker 适配
   export/komari/   # Komari model、URL、server message、terminal/exec 消息解析
@@ -447,6 +451,36 @@ cargo run -p smalux-agent -- `
   -r 5s
 ```
 
+调试自有 server 时建议先用最小命令启动：
+
+```powershell
+cargo run -p smalux-agent -- `
+  -i agent-dev-1 `
+  -s ws://127.0.0.1:9000/ws `
+  -f smalux_json `
+  --wire-mode binary_plain `
+  -a none `
+  --report-delta-enabled false `
+  -R 5s
+```
+
+这个组合只要求 server 支持 WebSocket upgrade、Smalux binary wire 的 `PlainData` 和 `ClientFrame(type=snapshot)`。等 snapshot 跑通后，再逐步打开 `delta`、`secure_psk`、remote probe、remote task 和 remote shell。
+
+如果要调试加密链路，先生成并保存同一份 secret：
+
+```powershell
+cargo run -p smalux-agent -- `
+  -i agent-secure-1 `
+  -s wss://example.com/ws `
+  -f smalux_json `
+  --wire-mode secure_psk `
+  --secure-required true `
+  -a none `
+  -t smx1.agent-secure-1.REPLACE_WITH_BASE64URL_SECRET
+```
+
+server 侧只保存 `key_id=agent-secure-1` 对应的 secret；agent 不会把 secret 明文发出。加密链路调试时可以把日志级别设为 `RUST_LOG=smalux_agent=debug,smalux_protocol=debug`，日志只应出现 `key_id`、wire kind、sequence 和握手状态，不应出现完整 token 或 secret。
+
 完整 CLI 参数示例：
 
 ```powershell
@@ -768,6 +802,21 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 
 可以后做的功能：`remote_shell_open`、`remote_task_run`、`remote_probe_run`、历史指标落库、Web UI、Komari server 兼容、真实 ICMP probe。
 
+### Server 对接注意事项
+
+写自有 server 时，下面这些边界要按当前 agent 行为处理：
+
+- `export.heartbeat` 是 WebSocket ping，不是业务 heartbeat；业务 heartbeat 由 `report.heartbeat_enabled` 控制，默认关闭。
+- `jobs.realtime_report.interval` 控制导出层多久发送一次最新 report；`report.interval` 控制 agent 多久生成一次 report。两者不一定相等。
+- `latest_report` 是最新状态语义，不是队列语义。server 端也应该保存 latest state，而不是试图按每个 report 建无界队列。
+- `ack/error` 只说明带 `sequence` 的 `ServerFrame` 是否被调度，不说明远程 task/probe 已完成。
+- raw `config_patch` 没有 ack。server 如果需要确认配置是否生效，可以等下一次 snapshot/delta 中对应采样频率变化，或后续把 `config_patch` 提升到 `ServerFrame`。
+- `secure_psk` 模式下，server 不能发送 WebSocket text 控制消息；agent 会直接拒绝连接路径。
+- `remote_task_run` 有副作用，重连后不要盲目重发；用 `task_id` 做幂等。
+- `remote_probe_run` 被禁用或限频时，agent 不会发网络包，但仍会回 `remote_probe_result.value=-1`。
+- 进程和 socket 的 `level=details` 即使通过 server patch 请求，也需要 agent 启动时允许 details；否则会返回控制错误或拒绝一次性采集。
+- `public_ip.status=failed/stale/disabled` 都是正常上报状态，server 不应因为公网 IP 不 ready 就拒绝整包。
+
 ## 远程能力
 
 远程 shell 和 remote task 默认关闭，只能通过 CLI 启动参数开启，server patch 不能动态开启或关闭这些执行能力。remote probe 默认关闭，但不执行本地命令，可由 server patch 动态开启或关闭，并受本地频率保护。能力开启后的运行限制属于动态配置，server 可以按需调整。
@@ -853,6 +902,37 @@ raw `config_patch`：
 ```
 
 patch 只更新传入字段。`export.query`、`network.include_interfaces` 和 `network.exclude_interfaces` 是整体替换语义；如果需要清空网卡筛选，server 可以下发空列表。`jobs.realtime_report`、`jobs.basic_info`、`remote_shell`、`remote_task` 和 `remote_probe` 是局部 patch，未出现的对象或字段保持当前值；如果下发值和当前配置完全相同，`ConfigManager` 会直接忽略，不通知运行任务重建。`remote_shell.program` 有三态语义：字段缺省表示不修改，`null` 表示清空为平台默认 shell，字符串表示覆盖 shell 程序。网卡名称会在应用 patch 时做 trim、过滤空字符串并去重。网络筛选优先级为：`include_interfaces` 非空时只统计 include 列表，`exclude_interfaces` 不参与过滤；`include_interfaces` 为空时才应用 `exclude_interfaces`。server patch 打开 `processes.level=details` 需要启动时传 `--allow-process-details true`，打开 `sockets.level=details` 需要 `--allow-socket-details true`；否则控制消息会被拒绝。`diagnostics`、`remote_shell.enabled` 和 `remote_task.enabled` 不在 patch 模型中，不能通过 server 动态下发；`remote_probe.enabled` 在 patch 模型中，允许动态开启或关闭。
+
+推荐配置组合：
+
+- 本地开发：`wire_mode=binary_plain`、`auth_mode=none`、`report.delta_enabled=false`。server 先只实现 binary wire + snapshot，方便抓包和打印 JSON。
+- 自有生产：`wire_mode=secure_psk`、`secure_required=true`、`auth_mode=none`、token 使用 `smx1.<key_id>.<secret_base64url>`。此时 token 只用于派生 PSK，不进入 URL 或 header。
+- 低流量监控：开启 `report.delta_enabled=true`，把 `report.snapshot_interval` 设为 `5m` 或更长；如果 server 没实现 delta，就保持默认完整 snapshot。
+- 低频公网 IP：保持 `public_ip.enabled=true`，把 `public_ip.refresh_interval` 设为 `24h` 或更长；失败时状态会随 report 上报，不阻塞主流程。
+- 高成本诊断：默认 `processes.level=count`、`sockets.level=count`；需要排查时由 server 临时 patch 到 `light` 或触发一次性采集，`details` 必须配合启动时 `--allow-process-details true` / `--allow-socket-details true`。
+- 远程执行：`remote_shell.enabled` 和 `remote_task.enabled` 只通过 CLI 打开；server 只能调整超时、并发和输出大小，不能在运行中扩大执行权限。
+
+推荐 server patch 最小化原则：
+
+- 只下发变化字段，不要每次都发送完整配置。
+- 不要把日志字段放进 patch；日志只在启动阶段初始化。
+- 修改 `export.server_url`、`export.format`、`export.wire_mode`、`export.auth_mode` 或 `export.token` 会触发导出连接重建，server 应避免高频下发这些字段。
+- 修改采样 interval 会让对应采集循环按新频率继续运行，但已经产生的最新状态不会被清空。
+- 如果 server 切换 `report.delta_enabled`，建议立即发送一次 `snapshot_request`，让双方重新建立 delta 基准。
+
+server 想确认 patch 是否生效，可以按字段类型观察：
+
+| patch 类型 | 生效观察方式 |
+| --- | --- |
+| 采样开关或 interval | 后续 snapshot/delta 中对应采样组出现、消失或 `sampled_at` 间隔变化 |
+| `report.delta_enabled` | 后续上报从 `snapshot` 变为 `delta` / `heartbeat`，或关闭后恢复完整 `snapshot` |
+| `jobs.*.interval` | transport 发送节奏变化；report 本身可能仍按 `report.interval` 生成 |
+| `network.include_interfaces` / `exclude_interfaces` | `network.value.networks` 和汇总值只包含筛选后的网卡 |
+| `processes.level` / `sockets.level` | 总数字段始终存在，`light` / `details` 字段按级别出现 |
+| `remote_probe.enabled` | 后续 `remote_probe_run` 从 rejected/`value=-1` 变为实际 TCP/HTTP 探测结果 |
+| `export.*` 连接字段 | agent 会按新配置重建导出连接，server 可能看到旧连接关闭和新连接建立 |
+
+如果 patch 下发后没有变化，先看三点：字段是否属于 server patch 模型、值是否和当前配置相同、是否被 CLI-only 授权挡住。完全相同的 patch 会被忽略，不会重建任务；`remote_shell.enabled`、`remote_task.enabled`、`diagnostics.allow_*` 和日志字段本来就不能动态修改。
 
 按需完整快照请求使用同一条控制通道。它不修改配置，只请求 reporter 通过 `TelemetryAggregator` 立即生成完整 `snapshot`，同时刷新后续 delta 的基准状态。为了避免 server 连续刷完整包，agent 用 `report.force_snapshot_min_interval` 做最小响应间隔保护；间隔内的重复请求会合并，等到允许后只发送一次完整 snapshot。
 
@@ -1029,7 +1109,7 @@ server frame or legacy text message
 远程 shell 打开流程：
 
 ```text
-server text message: remote_shell_open
+server control JSON: remote_shell_open
   -> ServiceControlListener::on_message()
   -> InboundCommand::RemoteShellOpen
   -> ControlDispatcher::dispatch()
@@ -1120,6 +1200,15 @@ server 控制消息当前由 `smalux_json` 主 WebSocket 承载。Smalux 自有 
 
 - `ServerFrame`：稳定协议 frame，当前支持 `snapshot_request` 和 `remote_probe_run`，包含 server `sequence`，agent 调度后回 `ack/error`。
 - raw control JSON：当前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 raw `remote_probe_run`，没有 server `sequence`，agent 不会自动回控制 ack。
+
+所有下面的 JSON 示例都只是业务 payload。真正通过 WebSocket 发送时还要按 wire mode 加一层封装：
+
+| wire mode | WebSocket frame | payload 处理 | agent 接收要求 |
+| --- | --- | --- | --- |
+| `binary_plain` | binary | `WirePacket(kind=PlainData, payload=utf8_json_bytes)` | binary 必须是 `PlainData`；开发期 text 可以直接作为 raw JSON |
+| `secure_psk` | binary | `Noise.encrypt(utf8_json_bytes)` 后放入 `WirePacket(kind=SecureData)` | 只接受 `SecureData`；text 会被拒绝 |
+
+因此 server 实现时可以先把控制对象序列化为 UTF-8 JSON bytes，再交给统一的 `send_payload(bytes)`。`send_payload` 根据当前连接的 wire mode 决定直接封 `PlainData`，还是用 Noise transport 加密后封 `SecureData`。
 
 raw `config_patch` 示例：
 

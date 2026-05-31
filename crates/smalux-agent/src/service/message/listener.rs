@@ -5,17 +5,18 @@
 //! 当前兼容的 raw control JSON 解析，用于 `config_patch`、远程 task 等还没有提升到
 //! `smalux-protocol` 的命令。
 
-use super::probe::RemoteProbeRunRequest;
 use crate::config::model::AgentConfigPatch;
 use crate::export::{ExportInboundMessage, ExportMessageListener, inbound_message_into_string};
-use crate::service::inbound::{InboundCommand, InboundCommandEnvelope, InboundCommandSender};
-use crate::service::shell::RemoteShellOpenRequest;
-use crate::service::task::RemoteTaskRunRequest;
+use crate::service::{
+    probe::RemoteProbeRunRequest, shell::RemoteShellOpenRequest, task::RemoteTaskRunRequest,
+};
 use serde::Deserialize;
 use smalux_core::model::info::MetricLevel;
 use smalux_protocol::{ServerPayload, decode_server_frame};
 use std::future::Future;
 use std::pin::Pin;
+
+use super::inbound::{InboundCommand, InboundCommandEnvelope, InboundCommandSender};
 
 /// 服务端下发给 agent 的 raw 控制消息。
 ///

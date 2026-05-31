@@ -4,39 +4,41 @@
 
 mod bootstrap;
 mod collector;
-mod control;
 mod export;
-mod inbound;
+mod message;
 mod options;
-pub(crate) mod outbound;
-mod probe;
 mod public_ip;
+mod remote;
 mod reporter;
-mod shell;
-mod task;
 
 use crate::collect::LocalCollector;
 use crate::config::ConfigManager;
 use bootstrap::{bootstrap_once, public_ip_required_for_first_report, retry_identity_until_ready};
 use collector::{collector_command_channel, collector_loop};
 use export::export_supervisor;
-use inbound::{ControlDispatcher, inbound_command_loop};
-use outbound::{OutboundSequence, outbound_channel};
-use probe::RemoteProbeManager;
+use message::inbound::{ControlDispatcher, inbound_command_loop};
+use message::outbound::{OutboundSequence, outbound_channel};
 use public_ip::public_ip_refresh_loop;
+use remote::probe::RemoteProbeManager;
+use remote::task::RemoteTaskManager;
 use reporter::{reporter_command_channel, reporter_loop};
 use std::sync::Arc;
-use task::RemoteTaskManager;
 use tokio::sync::{RwLock, watch};
 
-pub(crate) use inbound::{
+pub(crate) use message::inbound;
+pub(crate) use message::inbound::{
     InboundCommand, InboundCommandEnvelope, InboundCommandSender, inbound_command_channel,
 };
+pub(crate) use message::listener as control;
+pub(crate) use message::outbound;
 pub(crate) use options::ServiceOptions;
-pub(crate) use probe::{RemoteProbeRunRequest, display_task_id as display_probe_task_id};
-pub(crate) use shell::RemoteShellOpenRequest;
+pub(crate) use remote::probe;
+pub(crate) use remote::probe::{RemoteProbeRunRequest, display_task_id as display_probe_task_id};
+pub(crate) use remote::shell;
+pub(crate) use remote::shell::RemoteShellOpenRequest;
+pub(crate) use remote::task;
+pub(crate) use remote::task::RemoteTaskRunRequest;
 pub(crate) use smalux_protocol::RemoteProbeType;
-pub(crate) use task::RemoteTaskRunRequest;
 
 /// 启动 agent 服务。
 ///

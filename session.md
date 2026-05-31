@@ -181,9 +181,9 @@
   - `service_export_sends_komari_websocket_report_and_basic_info` 使用一个本地 TCP listener 同时 mock WebSocket report 和 HTTP basic info，验证 report 没有 smalux `type` 外壳，并验证 basic info URL / JSON。
   - mock 没有访问外网，也没有引入额外 HTTP server 依赖。
 - remote shell 已接入 PTY 运行链路，remote task 已接入非交互执行和主出站回传：
-  - `crates/smalux-agent/src/service/shell.rs` 现在是 shell 模块入口，子模块包括 `options.rs`、`message.rs`、`manager.rs`。
+  - `crates/smalux-agent/src/service/remote/shell.rs` 现在是 shell 模块入口，子模块包括 `options.rs`、`message.rs`、`manager.rs`。
   - `RemoteShellOptions` 只保留 CLI-only `enabled` 开关；`max_sessions`、`idle_timeout`、`session_timeout`、`program` 已迁入动态 `AgentConfig.remote_shell`。
-  - `crates/smalux-agent/src/service/task.rs` 定义 `RemoteTaskOptions`、`RemoteTaskRunRequest` 和 `RemoteTaskManager`；CLI-only `enabled` 只在启动时开启，`max_concurrent`、`timeout`、`max_stdout_bytes`、`max_stderr_bytes` 放在动态 `AgentConfig.remote_task`。
+  - `crates/smalux-agent/src/service/remote/task.rs` 定义 `RemoteTaskOptions`、`RemoteTaskRunRequest` 和 `RemoteTaskManager`；CLI-only `enabled` 只在启动时开启，`max_concurrent`、`timeout`、`max_stdout_bytes`、`max_stderr_bytes` 放在动态 `AgentConfig.remote_task`。
   - `CliArgs::into_startup()` 同时生成动态 `AgentConfig` 和 CLI-only `ServiceOptions`；`main.rs` 已把 `ServiceOptions` 传入 `service::run()`。
   - 远程能力只允许启动参数开启，server `config_patch` 不能开启或关闭能力，避免运行中扩大远程执行权限；运行限制可由 CLI 设置初始值，也可由 server patch 调整。
   - `ServiceControlListener` 支持 `remote_shell_open` 控制消息；启用后会调用 `RemoteShellManager::open()`。
@@ -439,9 +439,16 @@ cargo check
 - 已补充 `crates/smalux-agent/README.md` 的 server 自实现对接流程，覆盖 WebSocket 接入、`binary_plain` / `secure_psk` 解包、`ClientFrame` 处理、delta 基准校验、`ServerFrame` 下发和动态 patch 边界。
 - 已补充 `crates/smalux-agent/README.md` 的 server 最小实现 checklist，列出第一版 server 必做项和可后做项，方便后续按清单实现 server。
 - 已增强 remote probe 日志字段：accepted / rejected / finished 日志包含 `task_id`、`probe_type`、`target`，完成日志额外包含 `value`、`duration_ms` 和 `error`。
-- 已补充主代码注释覆盖，重点是 `service.rs`、`service/inbound.rs`、`service/export.rs`、`export.rs`、`export/router.rs`、`export/wire.rs`、`export/security.rs`、`export/ws/client.rs`、`service/probe.rs`、`service/task.rs` 和 server 日志常量。
+- 已补充主代码注释覆盖，重点是 `service.rs`、`service/message/inbound.rs`、`service/export.rs`、`export.rs`、`export/router.rs`、`export/wire.rs`、`export/security.rs`、`export/ws/client.rs`、`service/remote/probe.rs`、`service/remote/task.rs` 和 server 日志常量。
 - 已完成注释缺口收尾：`collect/socket.rs` 的 cfg 分支采样函数、`export/wire.rs` 和 `export/ws/config.rs` 的转换错误类型、`smalux-core/src/flow.rs` 的 `Display::fmt` 都已补充相邻中文注释。
 - 已验证注释扫描结果为 `MISSING_COUNT=0`，并通过 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、core/protocol/agent/server 的 `cargo rustdoc ... -D missing_docs`、`cargo test --workspace`。
 - 已补充协议和 server 对接文档：`crates/smalux-protocol/README.md` 新增消息分层、Frame 字段、Server 对接流程和兼容边界；`crates/smalux-server/README.md` 新增 WebSocket/wire 交换流程、Frame 分发语义和控制消息边界。
-- 已修正 agent README 的控制消息说明：当前 `ServerFrame` 只覆盖 `snapshot_request` 和 `remote_probe_run`，带 `sequence` 时回 `ack/error`；`config_patch`、`collect_*`、`remote_shell_open`、`remote_task_run` 仍是 raw control JSON，不自动回 ack。相关代码注释同步补在 `smalux-protocol/src/frame.rs`、`codec.rs` 和 `smalux-agent/src/service/control.rs`。
+- 已修正 agent README 的控制消息说明：当前 `ServerFrame` 只覆盖 `snapshot_request` 和 `remote_probe_run`，带 `sequence` 时回 `ack/error`；`config_patch`、`collect_*`、`remote_shell_open`、`remote_task_run` 仍是 raw control JSON，不自动回 ack。相关代码注释同步补在 `smalux-protocol/src/frame.rs`、`codec.rs` 和 `smalux-agent/src/service/message/listener.rs`。
 - 本轮验证通过：`cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`cargo rustdoc -p smalux-protocol --lib -- -D missing_docs`、`cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs`。
+- 已再次补全 server 实现文档：`crates/smalux-server/README.md` 新增连接状态机、Wire 解包伪代码、Delta 合并伪代码、控制消息发送规则和控制消息示例；`crates/smalux-protocol/README.md` 新增 Frame JSON 示例；`crates/smalux-agent/README.md` 明确 JSON 示例只是业务 payload，WebSocket 发送时必须按 `binary_plain` / `secure_psk` 再封装。
+- 已补充 WebSocket 读写路径注释：`crates/smalux-agent/src/export/ws/tasks/handler.rs` 明确 secure_psk 拒绝 text、binary 先解 wire、transport 不解析 JSON、listener 队列有界背压。
+- 本轮再次验证通过：`cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs`、`cargo rustdoc -p smalux-protocol --lib -- -D missing_docs`，注释扫描 `MISSING_COUNT=0`。
+- 再一轮文档补强：`crates/smalux-server/README.md` 增加模块职责边界、server 错误处理分级、SQLite latest-only 表结构建议和落库事务语义；`crates/smalux-protocol/README.md` 增加协议错误码建议；`crates/smalux-agent/README.md` 增加推荐配置组合和 server patch 最小化原则，方便后续按文档实现 server。
+- 再一轮文档补强：`crates/smalux-server/README.md` 增加 HTTP 端点规划、ingest 分发伪代码和 desired config 接入顺序；`crates/smalux-protocol/README.md` 增加 `ClientFrame.sequence`、`ServerFrame.sequence`、`task_id` 的顺序和幂等边界；`crates/smalux-agent/README.md` 增加自有 server 调试启动命令、`secure_psk` 调试说明和 patch 生效观察方式。
+- 已把 `smalux-agent/src/service/` 按职责聚合，避免 inbound/outbound/control 和 remote 能力文件平铺过散：`message/` 保存 listener、inbound、outbound，`remote/` 保存 shell、task、probe；`service.rs` 暂时保留旧模块别名导出，仓库内旧调用路径不用一次性大改。
+- 本轮 service 目录聚合验证通过：旧平铺路径搜索无残留；`cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs`、`cargo rustdoc -p smalux-protocol --lib -- -D missing_docs` 均通过。

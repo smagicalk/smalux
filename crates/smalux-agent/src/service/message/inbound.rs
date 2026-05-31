@@ -2,18 +2,20 @@
 //!
 //! 协议 listener 只负责把 server 消息转换为内部命令，本模块负责校验和执行业务动作。
 
-use super::collector::{CollectorCommand, CollectorCommandSender};
-use super::options::DiagnosticOptions;
 use super::outbound::{
     ControlAckEnvelope, ControlErrorEnvelope, OutboundEvent, OutboundSender, OutboundSequence,
 };
-use super::probe::{RemoteProbeManager, RemoteProbeRunRequest};
-use super::reporter::{ReporterCommand, ReporterCommandSender};
-use super::shell::{RemoteShellManager, RemoteShellOpenRequest};
-use super::task::{RemoteTaskManager, RemoteTaskRunRequest};
 use crate::config::ConfigManager;
 use crate::config::manager::{validate_process_sampling_options, validate_socket_sampling_options};
 use crate::config::model::{AgentConfigPatch, ExportConfig};
+use crate::service::collector::{CollectorCommand, CollectorCommandSender};
+use crate::service::options::DiagnosticOptions;
+use crate::service::reporter::{ReporterCommand, ReporterCommandSender};
+use crate::service::{
+    probe::{RemoteProbeManager, RemoteProbeRunRequest},
+    shell::{RemoteShellManager, RemoteShellOpenRequest},
+    task::{RemoteTaskManager, RemoteTaskRunRequest},
+};
 use smalux_core::model::info::MetricLevel;
 use smalux_protocol::{Ack, ProtocolError};
 use tokio::sync::mpsc;

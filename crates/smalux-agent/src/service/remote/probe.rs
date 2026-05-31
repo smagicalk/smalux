@@ -3,9 +3,11 @@
 //! 该模块只处理协议无关的探测请求、频率保护和结果投递；Komari 或自有协议的
 //! 字段映射放在各自 adapter 中。
 
-use super::outbound::{OutboundEvent, OutboundSender, OutboundSequence, RemoteProbeResultEnvelope};
 use crate::collect::unix_timestamp_secs;
 use crate::config::ConfigManager;
+use crate::service::message::outbound::{
+    OutboundEvent, OutboundSender, OutboundSequence, RemoteProbeResultEnvelope,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use smalux_core::utils::validate::ensure_non_empty;
@@ -376,7 +378,7 @@ mod tests {
 
     use super::*;
     use crate::config::{AgentConfig, ConfigManager};
-    use crate::service::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
+    use crate::service::message::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
