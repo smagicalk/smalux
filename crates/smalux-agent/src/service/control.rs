@@ -1,4 +1,9 @@
 //! Server 控制消息处理。
+//!
+//! 入站控制消息有两条路径：优先解析稳定的 `smalux_protocol::ServerFrame`，这样可以
+//! 保留 server `sequence` 并回传 `ack/error`；如果不是 `ServerFrame`，再按 agent
+//! 当前兼容的 raw control JSON 解析，用于 `config_patch`、远程 task 等还没有提升到
+//! `smalux-protocol` 的命令。
 
 use super::probe::RemoteProbeRunRequest;
 use crate::config::model::AgentConfigPatch;
@@ -12,7 +17,11 @@ use smalux_protocol::{ServerPayload, decode_server_frame};
 use std::future::Future;
 use std::pin::Pin;
 
-/// 服务端下发给 agent 的控制消息。
+/// 服务端下发给 agent 的 raw 控制消息。
+///
+/// 这些消息可以放在 `binary_plain` 的 `PlainData` payload、`secure_psk` 解密后的
+/// `SecureData` payload，或本地调试用 WebSocket text 中。它们没有协议级
+/// `sequence`，因此调度后不会自动产生控制层 `ack/error`。
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ServerControlMessage {
@@ -68,8 +77,13 @@ impl ServiceControlListener {
         Self { commands }
     }
 
-    /// 解析一条 server 文本消息。
+    /// 解析一条 server 控制消息。
+    ///
+    /// WebSocket transport 已经在进入 listener 前完成 wire 解包和可选解密，这里收到的
+    /// 始终是 UTF-8 JSON 字符串。先尝试 `ServerFrame` 是为了保留 sequence；fallback
+    /// raw JSON 主要用于当前还没进入 `smalux-protocol` 的兼容命令。
     pub(crate) fn decode_message(msg: &str) -> anyhow::Result<Option<InboundCommandEnvelope>> {
+        // 标准 ServerFrame 成功解析时，保留 server sequence，后续调度器会据此回 ack/error。
         if let Ok(frame) = decode_server_frame(msg) {
             let command = match frame.payload {
                 ServerPayload::SnapshotRequest { request } => InboundCommand::SnapshotRequest {
@@ -98,6 +112,7 @@ impl ServiceControlListener {
             )));
         }
 
+        // 兼容 raw control JSON 没有 sequence，只能执行本地调度和日志，不回控制 ack。
         let message: ServerControlMessage = serde_json::from_str(msg)?;
 
         let command = match message {

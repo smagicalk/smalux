@@ -1,4 +1,8 @@
 //! 协议 frame 的 JSON 编解码。
+//!
+//! codec 只负责 `ClientFrame` / `ServerFrame` 和 JSON 字节之间的转换，不处理
+//! WebSocket binary wire、Noise 加密、HTTP 状态码或重连。这样 server 端可以复用
+//! 同一套 decode 逻辑接入不同 transport。
 
 use crate::frame::{
     Ack, ClientFrame, ClientPayload, OutboundReport, OutboundReportKind, ProtocolError,
@@ -14,6 +18,9 @@ pub fn encode_outbound_report_as_smalux_json(
 }
 
 /// 将内部上报语义编码为 smalux 默认 JSON bytes。
+///
+/// WebSocket binary wire 使用这个 bytes 版本：transport 会把返回值继续封装成
+/// `PlainData` 或 `SecureData`，而不是再做一次字符串转换。
 pub fn encode_outbound_report_as_smalux_json_bytes(
     outbound: &OutboundReport,
 ) -> serde_json::Result<Vec<u8>> {
@@ -123,6 +130,9 @@ pub fn encode_server_frame(frame: &ServerFrame) -> serde_json::Result<String> {
 }
 
 /// 解码 server 发往 agent 的 frame。
+///
+/// 这里只识别稳定 `ServerFrame`。agent 兼容的 raw control JSON 会在
+/// `ServiceControlListener` 中单独解析，不走这个函数。
 pub fn decode_server_frame(input: &str) -> serde_json::Result<ServerFrame> {
     serde_json::from_str(input)
 }

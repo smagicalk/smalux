@@ -1,4 +1,9 @@
 //! 传输无关的协议 frame。
+//!
+//! 本文件只描述 agent 和 server 都需要稳定理解的 JSON frame，不关心这些 frame 最后
+//! 是通过 WebSocket binary、HTTP body 还是后续 gRPC message 发送。Smalux agent 里
+//! 还有一层兼容控制消息，例如 `config_patch` 和 `remote_task_run`，这些目前属于
+//! agent adapter 的 raw control JSON，不属于本 crate 的稳定 `ServerPayload`。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -126,6 +131,10 @@ impl ClientFrame {
 }
 
 /// agent 发往 server 的 payload。
+///
+/// server 侧应先根据顶层 `ClientFrame.type` 分发，再处理对应 payload。`snapshot` 是
+/// 完整状态，`delta` 是采样组级替换语义，`heartbeat` 只更新在线状态；控制结果类
+/// payload 用来关联 server 之前下发的命令或任务。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientPayload {
@@ -203,25 +212,40 @@ impl ServerFrame {
 }
 
 /// server 发往 agent 的 payload。
+///
+/// 当前稳定 `ServerFrame` 只放需要协议级 `sequence` 和 agent `ack/error` 的少量命令。
+/// 配置 patch、一次性进程/socket 采集、远程 shell 和远程 task 现在由 agent 的
+/// `ServiceControlListener` 作为 raw control JSON 解析，后续如果需要统一 ack 语义，
+/// 再把这些命令提升到本 enum。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerPayload {
     /// 请求 agent 发送完整快照。
+    ///
+    /// server 在缺少完整状态、delta 基准不匹配或手动刷新时使用。agent 会受
+    /// `report.force_snapshot_min_interval` 限制，过快的重复请求可能被合并。
     SnapshotRequest {
         /// 请求原因。
         request: SnapshotRequest,
     },
     /// server 对 agent 消息的确认。
+    ///
+    /// 当前 agent 只记录日志，不依赖 server ack 驱动重发；server 可以先不实现下发 ack。
     Ack {
         /// 确认信息。
         ack: Ack,
     },
     /// server 返回协议级错误。
+    ///
+    /// 当前 agent 只记录日志，不会因为单条 server error 自动断开连接。
     Error {
         /// 错误信息。
         error: ProtocolError,
     },
     /// 请求 agent 执行一次远程网络探测。
+    ///
+    /// 该命令有协议级 sequence，因此 agent 调度成功会先回 `ack`，真实探测完成后再回
+    /// `remote_probe_result`；如果探测被禁用或限频，也会返回一个失败结果。
     RemoteProbeRun {
         /// 探测请求。
         request: RemoteProbeRequest,

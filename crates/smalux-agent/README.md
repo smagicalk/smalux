@@ -22,7 +22,7 @@
 - WebSocket：支持 `ws` / `wss`、额外 query、query token、bearer token、ping heartbeat、断线重连、server close 清理、Smalux binary wire 和 `secure_psk`。
 - HTTP：支持 JSON POST、请求超时、TLS 跳过校验开关；当前用于 Komari basic info 和 exec task result。
 - 协议层：`export.format` 当前支持 `smalux_json` 和 `komari`；`smalux_json` 可编码 `snapshot`、`delta`、业务级 `heartbeat`、控制层 `ack/error`、`remote_task_result` 和 `remote_probe_result`，通过 WebSocket binary wire 发送；`komari` 兼容实时 report、basic info、terminal、exec task result 和 ping result。
-- 控制消息：当前支持 server 通过 Smalux wire payload 或 WebSocket text 下发 `config_patch`、`snapshot_request`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 `remote_probe_run`；带 `sequence` 的 Smalux server frame 会收到控制层 `ack/error`。
+- 控制消息：当前支持 server 通过 Smalux wire payload 或 WebSocket text 下发控制 JSON；稳定 `ServerFrame` 当前包含 `snapshot_request` 和 `remote_probe_run`，带 `sequence` 时会收到控制层 `ack/error`；`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 目前是 raw control JSON，不带自动 ack。
 - 远程 shell：通过 CLI-only 参数启用；`smalux_json` 控制通道接收 `remote_shell_open`，每个会话使用独立临时 WebSocket stream 转发原始 PTY 输入、输出和 resize。
 - 远程 task：通过 CLI-only 参数启用；`remote_task_run` 执行非交互命令，受并发、超时和输出大小限制，结果通过主出站队列回传 `remote_task_result`。
 - 远程 probe：默认关闭，可通过启动参数给初始值，也可由 server `config_patch.remote_probe.enabled=true` 动态开启；支持 TCP / HTTP 探测，ICMP 当前返回 `value=-1`，所有探测受全局和同目标频率保护。
@@ -634,7 +634,7 @@ adapter 输出语义：
 - `secure_psk` 使用 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` 握手；`export.token` 只用于本地派生 PSK，完整 token 不会进入 URL 或 header。
 - `secure_psk` 下 `export.auth_mode` 必须为 `none`；如果需要额外路由参数，用 `export.query` 放非敏感字段。
 
-`smalux_json` 使用的 listener 是 `ServiceControlListener`，当前识别 `config_patch`、`snapshot_request`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 `remote_probe_run`，并统一转换成 `service::InboundCommandEnvelope` 投递给 `ControlDispatcher`；带 `sequence` 的 Smalux server frame 执行后会回传 `ack` 或 `error`。`komari` 当前使用 `KomariMessageListener`，把 terminal 消息转换成远程 shell 入站命令，把 exec 消息转换成远程 task 入站命令，把 ping 消息转换成远程 probe 入站命令，其它第三方 server 文本消息会安全忽略，避免把 Komari 的事件误解析成 smalux 控制消息。如果要兼容更多服务端控制消息，可以新增：
+`smalux_json` 使用的 listener 是 `ServiceControlListener`，当前识别两类 JSON：第一类是 `smalux_protocol::ServerFrame`，目前支持 `snapshot_request` 和 `remote_probe_run`，会保留 server `sequence` 并在调度后回传 `ack` 或 `error`；第二类是 raw control JSON，目前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 `remote_probe_run`，这类消息没有 `sequence`，不会自动回控制层 `ack/error`。`komari` 当前使用 `KomariMessageListener`，把 terminal 消息转换成远程 shell 入站命令，把 exec 消息转换成远程 task 入站命令，把 ping 消息转换成远程 probe 入站命令，其它第三方 server 文本消息会安全忽略，避免把 Komari 的事件误解析成 smalux 控制消息。如果要兼容更多服务端控制消息，可以新增：
 
 - 新的 `ExportMessageListener` 实现，解析第三方服务端控制消息。
 - 新的 message adapter，把第三方消息转换为 `InboundCommand`。
@@ -702,7 +702,7 @@ WebSocket HTTP Upgrade
   -> later business frames use WirePacket(SecureData, payload=noise ciphertext)
 ```
 
-server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id` 查 secret，使用同样 HKDF 参数派生 PSK，再用同一个 Noise pattern 作为 responder。握手成功后，server 下发 `config_patch`、`snapshot_request`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run`、`remote_probe_run` 等控制消息时，也应把标准 JSON bytes 加密后放入 `SecureData`；`binary_plain` 模式则放入 `PlainData`。
+server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id` 查 secret，使用同样 HKDF 参数派生 PSK，再用同一个 Noise pattern 作为 responder。握手成功后，server 下发控制消息时也走同一条业务 payload 通道：`ServerFrame` JSON 或 raw control JSON 都先编码成 UTF-8 bytes，`secure_psk` 模式加密后放入 `SecureData`，`binary_plain` 模式放入 `PlainData`。只有 `ServerFrame` 带协议级 `sequence`，agent 才会自动回控制层 `ack/error`。
 
 ### Server 自实现对接流程
 
@@ -733,12 +733,13 @@ server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id`
    -> delta 合并失败或 base_sequence 不匹配时，下发 snapshot_request
 
 5. 下发控制命令
-   -> 构造 ServerFrame，必须带 protocol_version、server sequence、sent_at、type
-   -> 按当前 wire_mode 封成 PlainData 或 SecureData
-   -> 等待 agent 回 ack/error；ack 只代表命令已被调度，不代表后续结果已经产生
+   -> 需要 ack/error 的命令优先构造 ServerFrame，必须带 protocol_version、server sequence、sent_at、type
+   -> 当前 raw control JSON 用于 config_patch / collect_* / remote_shell_open / remote_task_run，不会自动回 ack/error
+   -> 按当前 wire_mode 把 JSON bytes 封成 PlainData 或 SecureData
+   -> ServerFrame 的 ack 只代表命令已被调度，不代表后续结果已经产生
 ```
 
-建议 server 第一版只实现 `snapshot`、`heartbeat`、`snapshot_request` 和 `config_patch`，确认 agent 能稳定连接、上报和响应控制后，再接 `remote_task_result`、`remote_probe_result` 和 `remote_shell_open`。
+建议 server 第一版只实现 `snapshot`、`heartbeat`、`ServerFrame(type=snapshot_request)` 和 raw `config_patch`，确认 agent 能稳定连接、上报、请求完整快照和调整采样频率后，再接 `remote_task_result`、`remote_probe_result` 和 `remote_shell_open`。
 
 delta 合并规则要简单：server 不做字段级深度合并。`snapshot` 覆盖完整状态；`delta` 出现哪个顶层采样组，就整体覆盖该采样组；采样组为 `null` 时清空该组。server 如果没有对应 `base_sequence`，直接发 `snapshot_request`，不要尝试猜测补齐。
 
@@ -759,10 +760,11 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 - `ack/error`：用 `ack.sequence` 或 `error.sequence` 关联 server 之前下发的控制命令。
 - `remote_task_result`：用 `result.task_id` 关联任务记录，保存 status、exit_code、stdout/stderr、error 和 finished_at。
 - `remote_probe_result`：用 `result.task_id` 关联探测记录，保存 probe_type、target、value、duration_ms、error 和 finished_at。
-- `ServerFrame 下发`：每条控制命令生成 server 侧递增 `sequence`，填 `protocol_version=1`、`sent_at`、`type`，再按当前 wire mode 封包发送。
+- `ServerFrame 下发`：需要 ack/error 的稳定命令生成 server 侧递增 `sequence`，填 `protocol_version=1`、`sent_at`、`type`，再按当前 wire mode 封包发送。
+- `raw control JSON 下发`：当前 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 使用 raw JSON；它们可以走 wire payload，但没有协议级 sequence。
 - `config_patch`：只下发动态字段；不要下发日志字段、`diagnostics`、`remote_shell.enabled` 或 `remote_task.enabled`。
 - `snapshot_request`：当 server 缺完整状态、delta 基准不匹配或需要主动刷新时下发；短时间重复请求可以合并。
-- `第一版验收`：agent 能连接、server 能保存 snapshot、server 能下发 `config_patch`、agent 能回 `ack`，server 能下发 `snapshot_request` 并收到新的 snapshot。
+- `第一版验收`：agent 能连接、server 能保存 snapshot、server 能下发 raw `config_patch` 调整频率、server 能下发 `ServerFrame(type=snapshot_request)` 并收到 agent 的 `ack` 和新的 snapshot。
 
 可以后做的功能：`remote_shell_open`、`remote_task_run`、`remote_probe_run`、历史指标落库、Web UI、Komari server 兼容、真实 ICMP probe。
 
@@ -786,9 +788,11 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 
 ## Server Patch
 
-server 可以通过 Smalux `ServerFrame` 下发控制消息；本地调试和旧实现也可以在 `binary_plain` 模式下继续用 WebSocket text 发送 legacy JSON。legacy JSON 不带 server `sequence`，因此 agent 不会回传控制层 `ack/error`。如果需要确认控制命令是否被接收和调度，应使用带 `sequence` 的 Smalux `ServerFrame`。
+server 控制通道当前同时支持两种 JSON 外层：Smalux `ServerFrame` 和 raw control JSON。`ServerFrame` 带 server `sequence`，agent 调度后会回传控制层 `ack/error`；raw control JSON 不带 server `sequence`，因此只执行命令和记录日志，不会自动回 ack。本地调试和旧实现可以在 `binary_plain` 模式下直接用 WebSocket text 发送 raw JSON；自有 server 推荐始终把 JSON bytes 放进 Smalux binary wire payload。
 
-legacy 配置 patch：
+当前 `ServerFrame` 覆盖 `snapshot_request` 和 `remote_probe_run`。`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 仍是 raw control JSON；如果后续要让这些命令也有统一 ack 语义，需要先把它们提升到 `smalux-protocol::ServerPayload`。
+
+raw `config_patch`：
 
 ```json
 {
@@ -1044,7 +1048,7 @@ server text message: remote_shell_open
 远程非交互任务流程：
 
 ```text
-server text message: remote_task_run
+server control JSON: remote_task_run
   -> ServiceControlListener::on_message()
   -> InboundCommand::RemoteTaskRun
   -> ControlDispatcher::dispatch()
@@ -1060,7 +1064,7 @@ server text message: remote_task_run
      -> smalux_json: ClientFrame(type=remote_task_result)
      -> komari: POST /api/clients/task/result?token=...
 
-server text message: remote_probe_run / Komari ping
+server control JSON: remote_probe_run / Komari ping
   -> ServiceControlListener::on_message()
   -> InboundCommand::RemoteProbeRun
   -> ControlDispatcher::dispatch()
@@ -1112,7 +1116,12 @@ service 启动后会用共享 `TelemetryState` 连接三个循环：`collector_l
 
 ## 数据格式
 
-server 控制消息当前由 `smalux_json` 主 WebSocket 承载。Smalux 自有 server 应按当前 `export.wire_mode` 发送 binary wire payload；`binary_plain` 模式为了本地调试和兼容旧实现仍能接受 WebSocket text frame，`secure_psk` 模式会拒绝明文 text。当前支持配置 patch、按需完整 snapshot、一次性诊断采集、远程 shell 打开请求、远程 task 执行请求和远程 probe 探测请求：
+server 控制消息当前由 `smalux_json` 主 WebSocket 承载。Smalux 自有 server 应按当前 `export.wire_mode` 发送 binary wire payload；`binary_plain` 模式为了本地调试和兼容旧实现仍能接受 WebSocket text frame，`secure_psk` 模式会拒绝明文 text。控制 payload 分两类：
+
+- `ServerFrame`：稳定协议 frame，当前支持 `snapshot_request` 和 `remote_probe_run`，包含 server `sequence`，agent 调度后回 `ack/error`。
+- raw control JSON：当前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 raw `remote_probe_run`，没有 server `sequence`，agent 不会自动回控制 ack。
+
+raw `config_patch` 示例：
 
 ```json
 {

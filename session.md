@@ -442,3 +442,6 @@ cargo check
 - 已补充主代码注释覆盖，重点是 `service.rs`、`service/inbound.rs`、`service/export.rs`、`export.rs`、`export/router.rs`、`export/wire.rs`、`export/security.rs`、`export/ws/client.rs`、`service/probe.rs`、`service/task.rs` 和 server 日志常量。
 - 已完成注释缺口收尾：`collect/socket.rs` 的 cfg 分支采样函数、`export/wire.rs` 和 `export/ws/config.rs` 的转换错误类型、`smalux-core/src/flow.rs` 的 `Display::fmt` 都已补充相邻中文注释。
 - 已验证注释扫描结果为 `MISSING_COUNT=0`，并通过 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、core/protocol/agent/server 的 `cargo rustdoc ... -D missing_docs`、`cargo test --workspace`。
+- 已补充协议和 server 对接文档：`crates/smalux-protocol/README.md` 新增消息分层、Frame 字段、Server 对接流程和兼容边界；`crates/smalux-server/README.md` 新增 WebSocket/wire 交换流程、Frame 分发语义和控制消息边界。
+- 已修正 agent README 的控制消息说明：当前 `ServerFrame` 只覆盖 `snapshot_request` 和 `remote_probe_run`，带 `sequence` 时回 `ack/error`；`config_patch`、`collect_*`、`remote_shell_open`、`remote_task_run` 仍是 raw control JSON，不自动回 ack。相关代码注释同步补在 `smalux-protocol/src/frame.rs`、`codec.rs` 和 `smalux-agent/src/service/control.rs`。
+- 本轮验证通过：`cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`cargo rustdoc -p smalux-protocol --lib -- -D missing_docs`、`cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs`。
