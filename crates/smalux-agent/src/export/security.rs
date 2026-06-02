@@ -192,6 +192,21 @@ mod tests {
         assert_eq!(first.psk, second.psk);
     }
 
+    /// 固化 HKDF 测试向量，方便 server 实现时确认参数和字节拼接完全一致。
+    #[test]
+    fn secure_psk_hkdf_test_vector_is_stable() {
+        let key = parse_secure_token(&test_token("agent-key")).unwrap();
+
+        // hex: a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2
+        assert_eq!(
+            key.psk,
+            [
+                166, 91, 42, 255, 18, 182, 126, 157, 37, 250, 231, 9, 75, 36, 36, 129, 51, 160, 67,
+                161, 242, 242, 186, 22, 21, 114, 121, 128, 107, 45, 98, 162,
+            ]
+        );
+    }
+
     /// 验证 token 格式错误会被拒绝。
     #[test]
     fn secure_token_rejects_invalid_format() {

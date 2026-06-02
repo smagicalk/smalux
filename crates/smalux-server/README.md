@@ -50,7 +50,7 @@ src/
 ```text
 GET /ws
   -> WebSocket upgrade
-  -> 按 query token / bearer token 做连接级识别
+  -> 按 wire mode 做连接级识别；binary_plain 可用 query/bearer，secure_psk 不使用明文 token
   -> 接收 smalux binary wire frame；开发兼容模式可接收 text frame
   -> binary_plain: WirePacket(PlainData).payload 得到 JSON bytes
   -> secure_psk: Hello + Noise 握手后，WirePacket(SecureData).payload 解密得到 JSON bytes
@@ -73,7 +73,9 @@ server 第一版按下面流程写，能覆盖 agent 当前自有协议闭环：
 
 ```text
 agent connects /ws
-  -> server 校验连接凭证
+  -> server 按 wire mode 选择连接识别方式
+     -> binary_plain: 可按 query token / bearer token / none 识别
+     -> secure_psk: 先只接收 Hello，Noise 握手成功后才算认证通过
   -> server 按 wire_mode 解包 JSON bytes
   -> server decode ClientFrame
   -> server 按 ClientFrame.type 分发
@@ -88,14 +90,43 @@ agent connects /ws
 
 `secure_psk` 模式下，server 需要保存 `key_id -> secret`。收到 agent 的 `Hello` 后，用同样 HKDF-SHA256 参数派生 32 字节 PSK，再以 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` responder 身份回复第二条 handshake。握手成功后，所有业务 JSON 都必须先加密再放入 `SecureData`。
 
+server 必须使用下面的精确参数派生 PSK：
+
+```text
+input secret      = base64url_decode(secret_base64url)  # 兼容带 padding 和不带 padding
+secret min length = 32 bytes
+HKDF hash         = SHA-256
+HKDF salt         = "smalux secure psk v1 salt"
+HKDF info         = "smalux secure psk v1 " + key_id
+output length     = 32 bytes
+Noise psk slot    = psk(0, derived_psk)
+Noise pattern     = Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
+Noise payload      = empty bytes during both handshake messages
+```
+
+HKDF 测试向量，server 第一版必须覆盖：
+
+```text
+key_id                = "agent-key"
+secret bytes          = 32 bytes of 0x07
+secret_base64url      = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+token                 = "smx1.agent-key.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+derived_psk_hex       = "a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2"
+derived_psk_base64url = "plsq_xK2fp0l-ucJSyQkgTOgQ6Hy8roWFXJ5gGstYqI"
+```
+
+server 测试时不要直接拿 token 里的 secret 当 Noise PSK。正确流程是：从 Hello 读取 `key_id`，查询 server 保存的 `secret_base64url`，base64url 解码出原始 secret bytes，再按上面 HKDF 参数派生 `derived_psk`，最后放入 Noise `psk(0)`。
+
+`key_id` 只用于查 secret 和参与 HKDF info，不能当成认证已通过。只有 Noise 握手能用派生 PSK 成功完成时，server 才能把连接状态切到 ready。server 日志只能记录 `key_id`、wire kind、session id 和错误码，不要打印完整 token、secret、PSK、Authorization header 或带 token 的 URL。
+
 ### 连接状态机
 
 server 侧可以把每条 agent 主连接按下面状态管理：
 
 ```text
 accepted
-  -> authenticating        # 校验 query token / bearer token / 后续自定义认证
-  -> wire_negotiating      # binary_plain 直接进入 ready；secure_psk 等 Hello + Handshake
+  -> authenticating        # binary_plain 校验 query/bearer/none；secure_psk 校验是否允许该 wire mode
+  -> wire_negotiating      # binary_plain 直接进入 ready；secure_psk 用 key_id 查 secret 并完成 Noise 握手
   -> ready                 # 可以收 ClientFrame，也可以下发控制消息
   -> closing               # 收到 close、读写失败或协议错误
   -> disconnected          # 清理内存连接态，latest snapshot 可保留
@@ -121,7 +152,10 @@ on_binary(bytes):
   if mode == secure_psk:
     if state == waiting_hello:
       assert packet.kind == Hello
+      assert packet.sequence == 0
       hello = json_decode(packet.payload)
+      assert hello.pattern == "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
+      session_id = packet.session_id
       secret = lookup_secret(hello.key_id)
       psk = hkdf_sha256(secret, key_id=hello.key_id)
       start_noise_responder(psk)
@@ -129,13 +163,16 @@ on_binary(bytes):
 
     else if state == waiting_handshake:
       assert packet.kind == Handshake
-      read_noise_msg1(packet.payload)
-      msg2 = write_noise_msg2()
+      assert packet.session_id == session_id
+      assert packet.sequence == 1
+      read_noise_msg1(packet.payload, handshake_payload=b"")
+      msg2 = write_noise_msg2(handshake_payload=b"")
       send WirePacket(kind=Handshake, same session_id, payload=msg2)
       state = ready
 
     else if state == ready:
       assert packet.kind == SecureData
+      assert packet.session_id == session_id
       json_bytes = noise_decrypt(packet.payload)
 
   text = utf8(json_bytes)
@@ -143,6 +180,21 @@ on_binary(bytes):
 ```
 
 `binary_plain` 开发期可以允许 WebSocket text frame 直接进入 `route_json()`；`secure_psk` 不允许 text frame，因为 text 会绕过业务加密。
+
+WirePacket 固定头和 agent 一致，所有整数都是 big-endian：
+
+```text
+magic       4 bytes   "SMX1"
+version     1 byte    当前固定 1
+kind        1 byte    1 PlainData, 2 Hello, 3 Handshake, 4 SecureData, 5 Close
+flags       2 bytes   当前保留，写 0
+session_id 16 bytes   当前连接或 stream 的随机 session id
+sequence    8 bytes   业务消息序号；Hello=0，首个 Handshake=1
+payload_len 4 bytes   payload 长度
+payload     N bytes   明文 JSON、Noise 握手消息或密文
+```
+
+`payload_len` 最大为 `1 MiB`，超过应按连接级错误处理。`flags` 当前固定写 `0`；首版 server 可以拒绝非 0 flags，后续如果 wire 版本扩展再放宽。`session_id` 在同一条连接内必须一致：Hello 建立 session，Handshake、SecureData 和 server 回握手包都沿用同一个 `session_id`。
 
 ### 消息格式
 
@@ -237,7 +289,7 @@ on_delta(frame):
 - `report.disk.value.disks=[]` 和 `report.network.value.networks=[]` 是合法状态，表示只上报汇总。
 - `report.processes.value.level` / `report.sockets.value.level` 可能为 `count`、`light` 或 `details`；server 需要按字段是否存在处理 `light/details`，不要假设每次都有明细。
 
-认证和授权后续单独设计。当前可以先只支持本地开发无认证，或临时使用 WebSocket 握手里的 query/bearer token 做简单识别。
+认证和授权后续单独设计。当前实现应明确分成三类：`none` 只用于本地开发或可信内网；query/bearer 只用于 `binary_plain` 这类兼容明文识别；`secure_psk` 通过 `key_id -> secret` 和 Noise 握手完成认证，不能再叠加 query/bearer token。
 
 ### 错误处理
 
@@ -417,6 +469,7 @@ server 需要把三类数据分开处理：
 
 - 生产环境优先使用 `wss`；如果用 `ws`，至少限制在可信内网。
 - `secure_psk` 模式下不要同时使用 query/bearer token，agent 当前也会拒绝这种组合，避免 token 明文出现在 URL 或 header。
+- 如果 agent 当前 `export.secure_required=true`，server 不要下发关闭 `secure_required`、切到 `binary_plain` 或切到 `komari` 的 patch；agent 会拒绝这类降级。
 - server 日志不要打印完整 token、secure secret、PSK、Authorization header、带 token 的 URL。
 - `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
 - raw `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
@@ -431,8 +484,17 @@ server 第一版建议至少覆盖这些测试：
 | --- | --- | --- |
 | wire | `PlainData` 正常解包 | 得到 JSON bytes |
 | wire | magic/version/payload_len 错误 | 拒绝 frame，不 panic |
+| wire | payload 超过 `1 MiB` | 关闭连接或拒绝 frame |
+| wire | flags 非 0 | 首版拒绝，避免未知语义 |
+| secure | HKDF 测试向量 | 派生 PSK 等于 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2` |
+| secure | Hello pattern 不支持 | 关闭连接，不能进入 ready |
 | secure | Hello key_id 不存在 | 关闭连接或返回协议错误 |
+| secure | Handshake / SecureData 的 session_id 不匹配 | 关闭连接 |
+| secure | secret base64url 解码失败或不足 32 字节 | 拒绝配置或拒绝连接 |
 | secure | PSK 不匹配 | Noise 握手失败，不能进入 ready |
+| secure | `SecureData` AEAD 解密失败 | 关闭连接 |
+| secure | secure_psk 收到 text frame | 拒绝并关闭连接 |
+| secure | server 下发控制 JSON | 先 Noise encrypt，再封 `WirePacket(kind=SecureData)` |
 | frame | `snapshot` 写入 | latest state 被完整覆盖 |
 | frame | `delta.base_sequence` 匹配 | 顶层采集组整体替换 |
 | frame | `delta.base_sequence` 不匹配 | 不修改 latest，发送 `snapshot_request` |

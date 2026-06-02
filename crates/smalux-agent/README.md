@@ -115,7 +115,7 @@ CliArgs::parse()
 | `export.server_url` | `ws://127.0.0.1:9000/ws` | `--server-url` / `-s` | `export.server_url` | 导出地址；`smalux_json` 支持 `ws` / `wss`，`komari` 支持 `ws` / `wss` / `http` / `https` |
 | `export.format` | `smalux_json` | `--format` / `-f` | `export.format` | 导出数据编码格式；当前支持 `smalux_json` / `komari` |
 | `export.wire_mode` | `binary_plain` | `--wire-mode` | `export.wire_mode` | Smalux 自有 wire 模式；`binary_plain` 明文 JSON bytes，`secure_psk` 使用 Noise PSK 加密 |
-| `export.secure_required` | `false` | `--secure-required true|false` | `export.secure_required` | 为 `true` 时必须使用 `secure_psk`，避免 server patch 降级到明文 |
+| `export.secure_required` | `false` | `--secure-required true|false` | `export.secure_required` | 为 `true` 时必须使用 `smalux_json + secure_psk`；当前配置一旦为 `true`，server patch 不能关闭它 |
 | `export.auth_mode` | `none` | `--auth` / `-a` | `export.auth_mode` | `none` / `query` / `bearer` |
 | `export.token` | 空 | `--token` / `-t` | `export.token` | `query` / `bearer` 模式作为传输认证 token；`secure_psk` 模式必须是 `smx1.<key_id>.<secret_base64url>`，且不会明文发送 |
 | `export.query_token_param` | `token` | `--query-token-param` / `-k` | `export.query_token_param` | query token 参数名 |
@@ -316,7 +316,7 @@ CliArgs::parse()
     "server_url": "ws://127.0.0.1:9000/ws", // 导出地址；smalux_json 支持 ws/wss，komari 支持 ws/wss/http/https
     "format": "smalux_json", // 导出数据编码格式；支持 smalux_json / komari
     "wire_mode": "binary_plain", // Smalux wire 模式；binary_plain | secure_psk
-    "secure_required": false, // true 时要求 wire_mode=secure_psk
+    "secure_required": false, // true 时要求 smalux_json + secure_psk；当前配置为 true 后 server patch 不能关闭
     "token": "dev-token", // query/bearer 认证 token；secure_psk 时格式为 smx1.<key_id>.<secret_base64url>
     "auth_mode": "bearer", // none | query | bearer；secure_psk 时必须为 none，避免 token 明文泄露
     "query_token_param": "token", // query token 参数名，仅 auth_mode=query 时使用
@@ -713,6 +713,8 @@ payload_len 4 bytes   payload 长度
 payload     N bytes   明文 JSON、Noise 握手消息或密文
 ```
 
+`payload_len` 最大为 `1 MiB`，超过会被拒绝；`flags` 当前始终写 `0`，首版 server 可以把非 0 flags 视为不支持。`session_id` 在同一条 WebSocket 连接或 remote shell stream 内必须保持一致，server 回握手包时也必须沿用 agent Hello 的 `session_id`。
+
 `secure_psk` token 格式：
 
 ```text
@@ -723,6 +725,44 @@ smx1.<key_id>.<secret_base64url>
 - `secret_base64url` 必须解码出至少 32 字节；agent 使用 `HKDF-SHA256` 派生 32 字节 PSK。
 - 完整 token 和 secret 不会发送给 server，也不会进入 URL、header 或日志。
 - `secure_psk` 模式下 `export.auth_mode` 必须为 `none`；否则配置校验会拒绝。
+
+PSK 派生精确参数：
+
+```text
+input secret      = base64url_decode(secret_base64url)  # 兼容带 padding 和不带 padding
+secret min length = 32 bytes
+HKDF hash         = SHA-256
+HKDF salt         = "smalux secure psk v1 salt"
+HKDF info         = "smalux secure psk v1 " + key_id
+output length     = 32 bytes
+Noise psk slot    = psk(0, derived_psk)
+Noise pattern     = Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
+Noise payload      = empty bytes during both handshake messages
+```
+
+HKDF 测试向量，server 实现时建议做成单元测试：
+
+```text
+key_id                = "agent-key"
+secret bytes          = 32 bytes of 0x07
+secret_base64url      = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+token                 = "smx1.agent-key.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+derived_psk_hex       = "a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2"
+derived_psk_base64url = "plsq_xK2fp0l-ucJSyQkgTOgQ6Hy8roWFXJ5gGstYqI"
+```
+
+如果 server 用同样 `key_id` 和 secret 派生出的 PSK 不等于上面值，说明 HKDF salt、info 拼接、base64url 解码或 UTF-8 字节处理有误，不能继续写 Noise 握手。
+
+`key_id` 会参与 HKDF info，因此不同 agent 即使误用同一个 secret，也会派生出不同 PSK。server 实现时必须使用 UTF-8 字节拼接 `info_prefix + key_id`，不要对 `key_id` 再做 JSON 转义、base64 或大小写转换。
+
+Hello payload 是 UTF-8 JSON bytes：
+
+```json
+{
+  "key_id": "agent-secure-1",
+  "pattern": "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
+}
+```
 
 agent 侧 secure 握手流程：
 
@@ -736,7 +776,28 @@ WebSocket HTTP Upgrade
   -> later business frames use WirePacket(SecureData, payload=noise ciphertext)
 ```
 
-server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id` 查 secret，使用同样 HKDF 参数派生 PSK，再用同一个 Noise pattern 作为 responder。握手成功后，server 下发控制消息时也走同一条业务 payload 通道：`ServerFrame` JSON 或 raw control JSON 都先编码成 UTF-8 bytes，`secure_psk` 模式加密后放入 `SecureData`，`binary_plain` 模式放入 `PlainData`。只有 `ServerFrame` 带协议级 `sequence`，agent 才会自动回控制层 `ack/error`。
+server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id` 查 secret，校验 `pattern` 是否等于当前支持的 Noise pattern，使用上面的 HKDF 参数派生 PSK，再用 `psk(0, derived_psk)` 构造 Noise responder。握手成功后，server 下发控制消息时也走同一条业务 payload 通道：`ServerFrame` JSON 或 raw control JSON 都先编码成 UTF-8 bytes，`secure_psk` 模式加密后放入 `SecureData`，`binary_plain` 模式放入 `PlainData`。只有 `ServerFrame` 带协议级 `sequence`，agent 才会自动回控制层 `ack/error`。
+
+server 侧 secure_psk 最小实现步骤：
+
+```text
+1. 收到 WirePacket(kind=Hello, sequence=0)
+   -> decode JSON
+   -> 校验 pattern
+   -> 保存 session_id，后续 Handshake/SecureData 必须匹配
+   -> 用 key_id 查询本地 secret
+   -> 按固定 HKDF 参数派生 32 字节 PSK
+2. 收到 WirePacket(kind=Handshake, sequence=1)
+   -> 校验 session_id 与 Hello 一致
+   -> 创建 Noise responder，psk slot=0
+   -> read initiator msg1，握手 payload 为空字节
+   -> write responder msg2，握手 payload 为空字节
+   -> 回发 WirePacket(kind=Handshake, same session_id, payload=msg2)
+3. 握手完成后进入 transport mode
+   -> agent 上报：校验 session_id 后，WirePacket(kind=SecureData).payload 先 Noise decrypt，再 decode ClientFrame JSON
+   -> server 下发：ServerFrame/raw control JSON 先 Noise encrypt，再封 WirePacket(kind=SecureData, same session_id)
+4. 任意 magic/version/session/pattern/PSK/AEAD 校验失败都关闭连接，不进入 ready 状态
+```
 
 ### Server 自实现对接流程
 
@@ -744,7 +805,8 @@ server 后续实现时要按这个流程反向处理：先从 Hello 取 `key_id`
 
 ```text
 1. WebSocket /ws 接入
-   -> 校验 query 或 Authorization，具体取决于 agent 的 export.auth_mode
+   -> binary_plain 按 export.auth_mode 校验 none/query/bearer
+   -> secure_psk 要求 export.auth_mode=none，后续 Noise 握手成功才算认证通过
    -> 如果 export.wire_mode=binary_plain，只接收 WebSocket binary frame
    -> 如果 export.wire_mode=secure_psk，先完成 Hello + Noise responder 握手
 
@@ -783,7 +845,7 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 
 第一版 server 只要完成下面这些，就能和当前 agent 跑通自有协议闭环：
 
-- `WebSocket /ws`：接受 agent 主连接；按 `export.auth_mode` 校验 `none` / query token / bearer token。
+- `WebSocket /ws`：接受 agent 主连接；`binary_plain` 按 `export.auth_mode` 校验 `none` / query token / bearer token，`secure_psk` 要求 `auth_mode=none` 并通过 Noise 握手认证。
 - `WirePacket`：读取固定头，校验 magic、version、kind、sequence、payload_len；开发期至少实现 `PlainData`，正式加密模式实现 `Hello`、`Handshake` 和 `SecureData`。
 - `secure_psk`：保存 `key_id -> secret`；收到 Hello 后按 `key_id` 查 secret，用同样 HKDF-SHA256 派生 PSK，并作为 Noise responder 返回 handshake message。
 - `ClientFrame` 解析：payload JSON 先按 `protocol_version` 和 `type` 分发；不认识的 `type` 记录日志并忽略，不要断开主连接。
@@ -901,7 +963,7 @@ raw `config_patch`：
 }
 ```
 
-patch 只更新传入字段。`export.query`、`network.include_interfaces` 和 `network.exclude_interfaces` 是整体替换语义；如果需要清空网卡筛选，server 可以下发空列表。`jobs.realtime_report`、`jobs.basic_info`、`remote_shell`、`remote_task` 和 `remote_probe` 是局部 patch，未出现的对象或字段保持当前值；如果下发值和当前配置完全相同，`ConfigManager` 会直接忽略，不通知运行任务重建。`remote_shell.program` 有三态语义：字段缺省表示不修改，`null` 表示清空为平台默认 shell，字符串表示覆盖 shell 程序。网卡名称会在应用 patch 时做 trim、过滤空字符串并去重。网络筛选优先级为：`include_interfaces` 非空时只统计 include 列表，`exclude_interfaces` 不参与过滤；`include_interfaces` 为空时才应用 `exclude_interfaces`。server patch 打开 `processes.level=details` 需要启动时传 `--allow-process-details true`，打开 `sockets.level=details` 需要 `--allow-socket-details true`；否则控制消息会被拒绝。`diagnostics`、`remote_shell.enabled` 和 `remote_task.enabled` 不在 patch 模型中，不能通过 server 动态下发；`remote_probe.enabled` 在 patch 模型中，允许动态开启或关闭。
+patch 只更新传入字段。`export.query`、`network.include_interfaces` 和 `network.exclude_interfaces` 是整体替换语义；如果需要清空网卡筛选，server 可以下发空列表。`jobs.realtime_report`、`jobs.basic_info`、`remote_shell`、`remote_task` 和 `remote_probe` 是局部 patch，未出现的对象或字段保持当前值；如果下发值和当前配置完全相同，`ConfigManager` 会直接忽略，不通知运行任务重建。`export.secure_required=true` 是单向安全闸：它要求 `export.format=smalux_json` 且 `export.wire_mode=secure_psk`，并且当前配置一旦为 `true`，server patch 不能再把它改回 `false`。`remote_shell.program` 有三态语义：字段缺省表示不修改，`null` 表示清空为平台默认 shell，字符串表示覆盖 shell 程序。网卡名称会在应用 patch 时做 trim、过滤空字符串并去重。网络筛选优先级为：`include_interfaces` 非空时只统计 include 列表，`exclude_interfaces` 不参与过滤；`include_interfaces` 为空时才应用 `exclude_interfaces`。server patch 打开 `processes.level=details` 需要启动时传 `--allow-process-details true`，打开 `sockets.level=details` 需要 `--allow-socket-details true`；否则控制消息会被拒绝。`diagnostics`、`remote_shell.enabled` 和 `remote_task.enabled` 不在 patch 模型中，不能通过 server 动态下发；`remote_probe.enabled` 在 patch 模型中，允许动态开启或关闭。
 
 推荐配置组合：
 
@@ -916,7 +978,7 @@ patch 只更新传入字段。`export.query`、`network.include_interfaces` 和 
 
 - 只下发变化字段，不要每次都发送完整配置。
 - 不要把日志字段放进 patch；日志只在启动阶段初始化。
-- 修改 `export.server_url`、`export.format`、`export.wire_mode`、`export.auth_mode` 或 `export.token` 会触发导出连接重建，server 应避免高频下发这些字段。
+- 修改 `export.server_url`、`export.format`、`export.wire_mode`、`export.auth_mode` 或 `export.token` 会触发导出连接重建，server 应避免高频下发这些字段；当前 `export.secure_required=true` 时不要下发任何降级组合，agent 会拒绝。
 - 修改采样 interval 会让对应采集循环按新频率继续运行，但已经产生的最新状态不会被清空。
 - 如果 server 切换 `report.delta_enabled`，建议立即发送一次 `snapshot_request`，让双方重新建立 delta 基准。
 

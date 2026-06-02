@@ -152,7 +152,7 @@ server 按下面顺序实现，最容易先跑通闭环：
 ```text
 1. 连接建立
    -> WebSocket / HTTP upgrade
-   -> 按 transport 层规则校验 query / Authorization
+   -> 按 transport 层规则识别连接；binary_plain 可校验 query/Authorization，secure_psk 通过后续 Noise 握手认证
 
 2. wire 解包
    -> binary_plain: 读取 WirePacket(kind=PlainData)
@@ -175,6 +175,8 @@ server 按下面顺序实现，最容易先跑通闭环：
    -> config_patch / collect_* / remote_shell_open / remote_task_run 当前走 raw control JSON
    -> 按当前 wire_mode 封成 PlainData 或 SecureData
 ```
+
+`smalux-protocol` 只定义解密后的 JSON frame，不定义 WebSocket wire header 和 Noise 状态机。`secure_psk` 的精确实现参数在 agent/server README 中维护：token 使用 `smx1.<key_id>.<secret_base64url>`，HKDF-SHA256 salt 是 `smalux secure psk v1 salt`，info 是 `smalux secure psk v1 ` 加 UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`，pattern 是 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`。server 对接前应先跑 agent/server README 里的 HKDF 测试向量，确认派生结果为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`。
 
 ## 兼容边界
 

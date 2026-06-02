@@ -7,7 +7,7 @@
 ## 快速恢复
 
 - 功能基线提交：`35106f5 refactor: regroup agent service modules`，已推送到远端 `dev`。
-- 最近 session 保存提交：`884d9dd docs: update session handoff`，后续恢复时以 `git log --oneline -1` 为准。
+- 最近 session 保存提交：`b4be1df docs: compress session handoff`，后续恢复时以 `git log --oneline -1` 为准。
 - 恢复后先执行：
 
 ```powershell
@@ -24,7 +24,7 @@ cargo check --workspace --all-targets
 - `crates/smalux-core`：共享模型、单位转换、日志初始化和通用校验。
 - `crates/smalux-protocol`：agent/server 共享 frame、payload 和 JSON codec。
 - `crates/smalux-server`：server crate 仍是骨架，README 已写好 WebSocket/wire/ingest/存储建议。
-- 根目录 `src/main.rs` 当前不属于 workspace package 的有效入口，仍是占位代码。
+- 根目录 `src/main.rs` 是历史占位入口，不属于 workspace package；当前工作区存在该文件删除状态，提交前需确认是否保留删除。
 
 ## Agent 当前状态
 
@@ -67,7 +67,9 @@ crates/smalux-agent/src/
 - `smalux_json` 使用 `smalux-protocol::ClientFrame`，可编码 `snapshot`、`delta`、业务 `heartbeat`、`ack/error`、`remote_task_result`、`remote_probe_result`。
 - `export.wire_mode=binary_plain` 时，WebSocket binary 承载 `WirePacket(kind=PlainData)`。
 - `export.wire_mode=secure_psk` 时，使用 `smx1.<key_id>.<secret_base64url>` token 派生 PSK，Noise 模式为 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`；secret 不通过 URL/header 明文发送。
+- `secure_psk` 的 HKDF 参数已写入 README：SHA-256，salt 为 `smalux secure psk v1 salt`，info 为 `smalux secure psk v1 ` + UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`；README 还包含 `agent-key` / 32 字节 `0x07` secret 的测试向量，派生 PSK hex 为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`；wire payload 上限 `1 MiB`，同一连接的 `session_id` 必须一致。
 - `secure_psk` 模式要求 `export.auth_mode=none`，并拒绝 WebSocket text 控制消息。
+- `export.secure_required=true` 是单向安全闸：要求 `smalux_json + secure_psk`，当前配置一旦为 `true`，server patch 不能关闭它或降级到明文/Komari。
 - `ack/error` 只表示带 `sequence` 的 `ServerFrame` 已被调度或拒绝，不表示 remote task/probe 已完成。
 - raw control JSON 当前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run`，没有自动 ack。
 

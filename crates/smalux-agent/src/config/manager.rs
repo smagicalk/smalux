@@ -47,6 +47,7 @@ impl ConfigManager {
     /// 应用 server 下发的配置 patch。
     pub(crate) fn apply_patch(&self, patch: AgentConfigPatch) -> anyhow::Result<AgentConfig> {
         let current = self.current();
+        ensure_secure_required_not_downgraded(&current, &patch)?;
         let mut next = current.clone();
         patch.apply_to(&mut next);
 
@@ -60,6 +61,28 @@ impl ConfigManager {
         tracing::info!("service config updated");
         Ok(next)
     }
+}
+
+/// 防止 server patch 在运行中关闭启动时已经要求的安全通道。
+fn ensure_secure_required_not_downgraded(
+    current: &AgentConfig,
+    patch: &AgentConfigPatch,
+) -> anyhow::Result<()> {
+    if !current.export.secure_required {
+        return Ok(());
+    }
+
+    if matches!(
+        patch
+            .export
+            .as_ref()
+            .and_then(|export| export.secure_required),
+        Some(false)
+    ) {
+        anyhow::bail!("export.secure_required cannot be disabled by server patch once enabled");
+    }
+
+    Ok(())
 }
 
 /// 校验 agent 配置。
@@ -208,6 +231,10 @@ fn ensure_level_interval(name: &str, level: MetricLevel, interval: Duration) -> 
 
 /// 校验特定导出格式的约束。
 fn validate_export_format_constraints(config: &AgentConfig) -> anyhow::Result<()> {
+    if config.export.secure_required && !matches!(config.export.format, ExportFormat::SmaluxJson) {
+        anyhow::bail!("export.format must be smalux_json when export.secure_required is true");
+    }
+
     match config.export.format {
         ExportFormat::SmaluxJson => validate_smalux_json_config(config),
         ExportFormat::Komari => validate_komari_config(config),
@@ -341,6 +368,24 @@ mod tests {
         config.export.server_url = "wss://example.com/api/clients/report".to_string();
         config.export.auth_mode = ExportAuthMode::Query;
         config.export.token = Some("secret-token".to_string());
+        config
+    }
+
+    /// 构造测试用 secure_psk token。
+    fn secure_test_token(byte: u8) -> String {
+        format!(
+            "smx1.agent-key.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])
+        )
+    }
+
+    /// 构造一份要求 secure_psk 的合法配置。
+    fn valid_secure_config() -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.export.wire_mode = ExportWireMode::SecurePsk;
+        config.export.secure_required = true;
+        config.export.auth_mode = ExportAuthMode::None;
+        config.export.token = Some(secure_test_token(1));
         config
     }
 
@@ -865,15 +910,55 @@ mod tests {
     fn validate_rejects_secure_psk_with_transport_token_auth() {
         let mut config = AgentConfig::default();
         config.export.wire_mode = ExportWireMode::SecurePsk;
-        config.export.token = Some(format!(
-            "smx1.agent-key.{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8; 32])
-        ));
+        config.export.token = Some(secure_test_token(1));
         config.export.auth_mode = ExportAuthMode::Query;
 
         let error = validate_config(&config).unwrap_err();
 
         assert!(error.to_string().contains("auth_mode must be none"));
+    }
+
+    /// 验证 secure_required 一旦启用，server patch 不能降级关闭。
+    #[test]
+    fn apply_patch_rejects_disabling_secure_required_once_enabled() {
+        let manager = ConfigManager::new(valid_secure_config()).unwrap();
+
+        let error = manager
+            .apply_patch(AgentConfigPatch {
+                export: Some(ExportConfigPatch {
+                    wire_mode: Some(ExportWireMode::BinaryPlain),
+                    secure_required: Some(false),
+                    ..ExportConfigPatch::default()
+                }),
+                ..AgentConfigPatch::default()
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("secure_required cannot be disabled")
+        );
+        assert!(manager.current().export.secure_required);
+        assert_eq!(
+            manager.current().export.wire_mode,
+            ExportWireMode::SecurePsk
+        );
+    }
+
+    /// 验证 secure_required 不能搭配第三方兼容格式。
+    #[test]
+    fn validate_rejects_secure_required_with_komari_format() {
+        let mut config = valid_komari_config();
+        config.export.secure_required = true;
+
+        let error = validate_config(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("export.format must be smalux_json")
+        );
     }
 
     /// 验证 secure_psk token 格式会在配置阶段校验。
