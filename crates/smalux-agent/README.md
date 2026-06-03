@@ -44,7 +44,8 @@ src/
   config/
     defaults.rs    # 默认值
     model.rs       # AgentConfig / AgentConfigPatch
-    cli.rs         # 启动参数解析
+    cli.rs         # CLI 模块入口和测试
+    cli/           # args / startup / value：参数定义、启动转换和 CLI 枚举转换
     manager.rs     # watch 动态配置管理
   collect.rs       # 本机采集入口，持有 sysinfo 长生命周期对象
   collect/         # CPU / memory / disk / network / process / socket 具体映射逻辑
@@ -60,6 +61,130 @@ src/
   export/          # WebSocket、HTTP、Komari、rustls 和 transport worker 适配
   export/komari/   # Komari model、URL、server message、terminal/exec 消息解析
 ```
+
+## 扩展边界
+
+这一节不是描述“当前实现细节”，而是约束后续扩展时应该把代码放在哪里、哪些 seam 允许扩、哪些耦合暂时保留。
+
+### 导出格式边界
+
+- `ExportFormat` / `ExportAdapter` 只负责把内部语义转换成外部消息格式：
+  - 输入是 `OutboundReport`、`remote_task_result`、`remote_probe_result`、控制层 `ack/error`
+  - 输出是一个或多个 `TransportRequest`
+- `ExportAdapter` 不负责：
+  - 采集系统数据
+  - 决定调度频率
+  - 管理重连
+  - 管理 transport 生命周期
+- 新增导出格式时，优先修改：
+  - `src/export/adapter.rs`
+  - `src/export/plan.rs`
+  - 必要时新增 `src/export/<format>.rs`
+- 不要让某个格式 adapter 直接操作 `TelemetryState`、`ConfigManager` 或远程能力执行器。
+
+### TransportHub 边界
+
+- `TransportHub` 只负责 transport 生命周期和投递：
+  - 创建 transport worker
+  - 连接长连接 transport
+  - 为主实时通道绑定 listener
+  - 把 `TransportRequest` 投递给对应 worker
+- `TransportHub` 不负责：
+  - 业务级重试策略
+  - pending 缓存
+  - snapshot / delta / heartbeat 选择
+  - 远程任务结果编码
+- 这些逻辑固定放在：
+  - `src/service/export.rs`
+  - `src/service/export/jobs.rs`
+  - `src/service/export/pending.rs`
+  - `src/service/export/pipeline.rs`
+
+### InboundCommand 边界
+
+- `InboundCommand` 是 agent 内部唯一的控制语言。
+- 所有外部协议都必须先翻译成 `InboundCommand`，再进入 `ControlDispatcher`：
+  - Smalux server 控制消息：`src/service/message/listener.rs`
+  - Komari 兼容消息：`src/export/komari/message.rs`
+- 协议解析层不要直接调用：
+  - `RemoteShellManager`
+  - `RemoteTaskManager`
+  - `RemoteProbeManager`
+  - `ConfigManager`
+- 新增控制协议或新兼容层时，优先新增“协议消息 -> InboundCommand”的翻译代码，而不是在协议层复制一套业务逻辑。
+
+### CLI-only 与运行时配置边界
+
+- `ServiceOptions` 保存 CLI-only 静态能力开关：
+  - `remote_shell.enabled`
+  - `remote_task.enabled`
+  - 诊断级 details 授权
+- 这些字段不进入 `AgentConfigPatch`，server 运行时不能开启它们。
+- `AgentConfig` 保存运行时可热更新参数：
+  - 采样频率
+  - 上报策略
+  - export 参数
+  - remote shell / task / probe 的运行限制
+- 新增配置项时，先判断它属于哪一类：
+  - “是否允许执行某能力”一般属于 `ServiceOptions`
+  - “已启用能力的限制和频率”一般属于 `AgentConfig`
+
+### CLI 模块边界
+
+- `src/config/cli.rs` 只作为 CLI 模块入口和测试承载文件，避免重新堆回一个超长文件。
+- `src/config/cli/args.rs` 只放 clap 参数结构、参数解析器和 CLI 原始输入类型：
+  - 新增启动参数时先放这里
+  - 只做字符串到基础类型的解析，不做业务配置校验
+- `src/config/cli/startup.rs` 只负责把 CLI 输入转换成启动期结果：
+  - `AgentConfig::default()` + CLI patch
+  - `ServiceOptions::default()` + CLI-only 静态能力
+  - `validate_config()` 和 `ServiceOptions::validate()`
+- `src/config/cli/value.rs` 只负责 CLI enum 和运行时 enum 的映射：
+  - CLI 可读值保持 snake_case，例如 `smalux_json`、`secure_psk`
+  - 不在这里处理 transport、adapter 或配置校验
+- CLI 测试继续放在 `src/config/cli.rs`，因为它们验证的是完整启动参数行为，而不是某个子模块的内部实现。
+
+### Remote Shell Stream 边界
+
+- 当前 remote shell stream 的编码方式仍然跟随 `export.format`：
+  - `smalux_json` -> Smalux binary wire
+  - `komari` -> WebSocket text
+- 这是当前刻意保留的耦合，因为现在只有两种 stream 模式。
+- 如果后续出现下面任一情况，再把它独立抽象出来：
+  - shell stream 想独立于主 export 格式配置
+  - 新增第三种 shell stream 协议
+  - 需要 direct shell / relay shell 并存
+  - shell stream 想走 gRPC 或单独 binary/text mode
+- 那时优先考虑新增 `ShellStreamMode` 或 `ShellStreamAdapter`，而不是继续在 `RemoteShellStreamEncoding::from_export_format()` 上堆分支。
+
+### 新功能接入建议
+
+- 新增采集项：
+  - 一般会同时修改 `collect`、`config/model`、`telemetry/state`、`telemetry/aggregator` 和文档
+  - 这是正常 spread，不代表架构有问题
+- 新增导出格式：
+  - 优先走 `ExportAdapter` seam
+  - 如有新 transport，再补 `TransportHub` / `worker` 接入
+- 新增远程能力：
+  - 先增加 `InboundCommand`
+  - 再补 listener 翻译
+  - 最后加独立 manager，并通过出站队列回传结果
+- 新增 server 控制消息：
+  - 先决定是否需要 `ack/error`
+  - 需要时复用现有控制响应链路，不新造第二套回包机制
+
+### 什么时候再拆文件
+
+当前不建议为了行数继续硬拆。出现下面情况时再拆更合适：
+
+- `config/cli/args.rs`
+  - 新增 2 到 3 组参数，并且参数分组开始明显挤压阅读
+- `config/cli/startup.rs`
+  - 出现第二个独立转换目标，不再只是 `CLI -> config/service_options/config_patch`
+- `service/remote/shell/manager.rs`
+  - 增加权限、审计、文件传输、多 backend、direct mode 等新生命周期
+- `export/plan.rs`
+  - 导出 job 增长到明显超过当前几类，周期 job 和即时结果 job 开始互相挤压
 
 ## 配置来源
 

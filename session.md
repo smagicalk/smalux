@@ -7,7 +7,7 @@
 ## 快速恢复
 
 - 功能基线提交：`35106f5 refactor: regroup agent service modules`，已推送到远端 `dev`。
-- 最近 session 保存提交：`b4be1df docs: compress session handoff`，后续恢复时以 `git log --oneline -1` 为准。
+- 最近提交以后续恢复时 `git log --oneline -1` 为准；当前文档对应 agent 导出、service/export 和 CLI 模块拆分后的状态。
 - 恢复后先执行：
 
 ```powershell
@@ -18,13 +18,15 @@ cargo check --workspace --all-targets
 
 预期 `git status --short` 为空。若不为空，先确认是否是其他机器或用户的新改动，不要直接回滚。
 
+忽略文件可能包含本地验证重新生成的 `target/` 或运行日志；恢复时以 `git status --short` 判断源码是否干净。
+
 ## 项目概况
 
 - `crates/smalux-agent`：监控 agent，负责系统采集、动态配置、导出、Komari 兼容和远程能力。
 - `crates/smalux-core`：共享模型、单位转换、日志初始化和通用校验。
 - `crates/smalux-protocol`：agent/server 共享 frame、payload 和 JSON codec。
 - `crates/smalux-server`：server crate 仍是骨架，README 已写好 WebSocket/wire/ingest/存储建议。
-- 根目录 `src/main.rs` 是历史占位入口，不属于 workspace package；当前工作区存在该文件删除状态，提交前需确认是否保留删除。
+- 根目录 `src/main.rs` 是历史占位入口，不属于 workspace package，已在 `59caa61` 删除。
 
 ## Agent 当前状态
 
@@ -44,6 +46,8 @@ crates/smalux-agent/src/
   main.rs          # CLI、日志、ConfigManager、service 启动入口
   config.rs        # 配置入口
   config/          # defaults、model、cli、manager
+    cli.rs         # CLI 模块入口和测试
+    cli/           # args / startup / value：参数定义、启动转换和 CLI enum
   collect.rs       # 本机采集入口，持有 sysinfo 长生命周期对象
   collect/         # CPU / memory / disk / network / process / socket
   telemetry.rs     # latest state、ReportEvent、TelemetryAggregator
@@ -110,7 +114,15 @@ cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs
 cargo rustdoc -p smalux-protocol --lib -- -D missing_docs
 ```
 
-最新测试结果：agent `248 passed / 4 ignored`，core `10 passed`，protocol `11 passed`，server `0 tests`。当前 `cargo check --workspace --all-targets` 无 warning。
+本轮文档和模块拆分后验证通过：
+
+```powershell
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace
+```
+
+测试结果：agent `251 passed / 4 ignored`，core `10 passed`，protocol `11 passed`，server `0 tests`；`cargo check --workspace` 无 warning。
 
 ## 下一步建议
 
