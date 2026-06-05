@@ -45,7 +45,7 @@ pub(crate) enum InboundCommand {
     /// 服务配置增量更新。
     ConfigPatch {
         /// 需要应用的配置 patch。
-        patch: AgentConfigPatch,
+        patch: Box<AgentConfigPatch>,
     },
     /// 立即采集一次进程信息。
     CollectProcessesOnce {
@@ -157,29 +157,44 @@ pub(crate) struct ControlDispatcher {
     diagnostics: DiagnosticOptions,
 }
 
+/// 创建控制调度器所需的依赖集合。
+///
+/// 把依赖集中到结构体里，后续新增远程能力或队列时可以按字段扩展，避免构造函数参数
+/// 继续增长导致调用点难以阅读。
+pub(crate) struct ControlDispatcherParts {
+    /// 动态配置管理器。
+    pub(crate) config_manager: ConfigManager,
+    /// 远程 shell 会话管理器。
+    pub(crate) remote_shell: RemoteShellManager,
+    /// 远程非交互任务管理器。
+    pub(crate) remote_task: RemoteTaskManager,
+    /// 远程网络探测管理器。
+    pub(crate) remote_probe: RemoteProbeManager,
+    /// 采集控制命令发送端。
+    pub(crate) collector_commands: CollectorCommandSender,
+    /// reporter 控制命令发送端。
+    pub(crate) reporter_commands: ReporterCommandSender,
+    /// 出站事件发送端，用于控制命令 ack/error。
+    pub(crate) outbound_tx: OutboundSender,
+    /// 全局出站序号。
+    pub(crate) sequence: OutboundSequence,
+    /// 诊断采集静态权限。
+    pub(crate) diagnostics: DiagnosticOptions,
+}
+
 impl ControlDispatcher {
     /// 创建入站命令调度器。
-    pub(crate) fn new(
-        config_manager: ConfigManager,
-        remote_shell: RemoteShellManager,
-        remote_task: RemoteTaskManager,
-        remote_probe: RemoteProbeManager,
-        collector_commands: CollectorCommandSender,
-        reporter_commands: ReporterCommandSender,
-        outbound_tx: OutboundSender,
-        sequence: OutboundSequence,
-        diagnostics: DiagnosticOptions,
-    ) -> Self {
+    pub(crate) fn new(parts: ControlDispatcherParts) -> Self {
         Self {
-            config_manager,
-            remote_shell,
-            remote_task,
-            remote_probe,
-            collector_commands,
-            reporter_commands,
-            outbound_tx,
-            sequence,
-            diagnostics,
+            config_manager: parts.config_manager,
+            remote_shell: parts.remote_shell,
+            remote_task: parts.remote_task,
+            remote_probe: parts.remote_probe,
+            collector_commands: parts.collector_commands,
+            reporter_commands: parts.reporter_commands,
+            outbound_tx: parts.outbound_tx,
+            sequence: parts.sequence,
+            diagnostics: parts.diagnostics,
         }
     }
 
@@ -199,7 +214,7 @@ impl ControlDispatcher {
     /// 执行不带响应处理的单条命令。
     fn dispatch_command(&self, command: InboundCommand) -> anyhow::Result<()> {
         match command {
-            InboundCommand::ConfigPatch { patch } => self.apply_config_patch(patch),
+            InboundCommand::ConfigPatch { patch } => self.apply_config_patch(*patch),
             InboundCommand::CollectProcessesOnce { level, limit } => {
                 self.collect_processes_once(level, limit)
             }
@@ -342,29 +357,25 @@ impl ControlDispatcher {
         }
     }
 
-    /// 检查 server patch 是否试图打开未授权的 details 采集。
+    /// 检查 server patch 是否试图超过启动时授权的远程采样级别。
     fn ensure_config_patch_allowed(&self, patch: &AgentConfigPatch) -> anyhow::Result<()> {
         let current = self.config_manager.current();
         let mut next = current.clone();
         patch.apply_to(&mut next);
 
-        if details_becomes_enabled(
-            current.processes.enabled,
-            current.processes.level,
-            next.processes.enabled,
-            next.processes.level,
-        ) && !self.diagnostics.allow_process_details
-        {
-            anyhow::bail!("process details collection is not allowed by startup options");
+        if patch.processes.is_some() && next.processes.enabled {
+            ensure_remote_metric_permission(
+                "process",
+                next.processes.level,
+                self.diagnostics.process_permission,
+            )?;
         }
-        if details_becomes_enabled(
-            current.sockets.enabled,
-            current.sockets.level,
-            next.sockets.enabled,
-            next.sockets.level,
-        ) && !self.diagnostics.allow_socket_details
-        {
-            anyhow::bail!("socket details collection is not allowed by startup options");
+        if patch.sockets.is_some() && next.sockets.enabled {
+            ensure_remote_metric_permission(
+                "socket",
+                next.sockets.level,
+                self.diagnostics.socket_permission,
+            )?;
         }
 
         Ok(())
@@ -381,9 +392,7 @@ impl ControlDispatcher {
         let limit = limit.unwrap_or(current.processes.limit);
         validate_process_sampling_options(level, limit, None)?;
 
-        if matches!(level, MetricLevel::Details) && !self.diagnostics.allow_process_details {
-            anyhow::bail!("process details collection is not allowed by startup options");
-        }
+        ensure_remote_metric_permission("process", level, self.diagnostics.process_permission)?;
 
         Ok(CollectorCommand::SampleProcessesOnce { level, limit })
     }
@@ -399,9 +408,7 @@ impl ControlDispatcher {
         let limit = limit.unwrap_or(current.sockets.limit);
         validate_socket_sampling_options(level, limit, None)?;
 
-        if matches!(level, MetricLevel::Details) && !self.diagnostics.allow_socket_details {
-            anyhow::bail!("socket details collection is not allowed by startup options");
-        }
+        ensure_remote_metric_permission("socket", level, self.diagnostics.socket_permission)?;
 
         Ok(CollectorCommand::SampleSocketsOnce { level, limit })
     }
@@ -459,14 +466,28 @@ pub(crate) async fn inbound_command_loop(
     tracing::debug!("inbound command loop stopped");
 }
 
-/// 判断 patch 后是否新打开了 details 采集。
-fn details_becomes_enabled(
-    current_enabled: bool,
-    current_level: MetricLevel,
-    next_enabled: bool,
-    next_level: MetricLevel,
-) -> bool {
-    next_enabled
-        && matches!(next_level, MetricLevel::Details)
-        && !(current_enabled && matches!(current_level, MetricLevel::Details))
+/// 检查 server 远程采样请求是否超过启动授权级别。
+fn ensure_remote_metric_permission(
+    kind: &str,
+    requested: MetricLevel,
+    allowed: crate::service::RemoteMetricPermission,
+) -> anyhow::Result<()> {
+    if allowed.allows(requested) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{kind} {} collection is not allowed by startup options; allowed level is {}",
+        metric_level_name(requested),
+        allowed.as_str()
+    )
+}
+
+/// 采样级别名称，用于稳定错误信息。
+fn metric_level_name(level: MetricLevel) -> &'static str {
+    match level {
+        MetricLevel::Count => "count",
+        MetricLevel::Light => "light",
+        MetricLevel::Details => "details",
+    }
 }

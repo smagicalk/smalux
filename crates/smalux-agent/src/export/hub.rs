@@ -2,7 +2,7 @@
 
 use super::worker::{TransportEventSender, TransportWorkerHandle};
 use super::{
-    EncodedExportMessage, ExportJobId, ExportMessageListener, ExportProtocol, ExportTransport,
+    EncodedExportMessage, ExportDeliveryId, ExportMessageListener, ExportProtocol, ExportTransport,
     TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
 };
 
@@ -181,7 +181,7 @@ impl TransportHub {
     /// 投递单条 transport request 到对应 transport worker。
     pub(crate) fn enqueue(
         &mut self,
-        job_id: ExportJobId,
+        delivery_id: ExportDeliveryId,
         sequence: u64,
         request: TransportRequest,
     ) -> anyhow::Result<()> {
@@ -193,7 +193,7 @@ impl TransportHub {
             );
         };
 
-        entry.worker.send(job_id, sequence, request)
+        entry.worker.send(delivery_id, sequence, request)
     }
 
     /// 关闭所有 transport。

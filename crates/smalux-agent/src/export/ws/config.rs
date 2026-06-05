@@ -83,12 +83,12 @@ impl WebSocketConfig {
     }
 }
 
-impl TryFrom<&ExportConfig> for WebSocketConfig {
-    // 配置转换失败统一返回 anyhow，便于携带具体字段上下文。
-    type Error = anyhow::Error;
-
-    /// 把 agent 导出配置转换为 WebSocket 握手配置。
-    fn try_from(config: &ExportConfig) -> Result<Self, Self::Error> {
+impl WebSocketConfig {
+    /// 使用 adapter 已经派生好的 endpoint 构造 WebSocket 握手配置。
+    pub(crate) fn from_export_endpoint(
+        config: &ExportConfig,
+        endpoint_url: String,
+    ) -> anyhow::Result<Self> {
         let effective_wire_mode = match config.format {
             ExportFormat::SmaluxJson => config.wire_mode,
             ExportFormat::Komari => ExportWireMode::BinaryPlain,
@@ -102,7 +102,6 @@ impl TryFrom<&ExportConfig> for WebSocketConfig {
             );
         }
 
-        let url = config.server_url.clone();
         let heartbeat = config.heartbeat.as_secs();
         let auth = match config.auth_mode {
             ExportAuthMode::None => WebSocketAuth::None,
@@ -120,7 +119,7 @@ impl TryFrom<&ExportConfig> for WebSocketConfig {
             ExportWireMode::SecurePsk => Some(parse_secure_token(&required_token(config)?)?),
         };
 
-        let mut websocket_config = Self::new(url)
+        let mut websocket_config = Self::new(endpoint_url)
             .with_auth(auth)
             .with_wire_security(effective_wire_mode, secure_key)
             .with_unsafe_cert(config.unsafe_cert)

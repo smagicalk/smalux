@@ -122,7 +122,7 @@ mod tests {
     /// 启动一个 echo WebSocket server。
     async fn spawn_echo_server() -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = server_url(listener.local_addr().unwrap());
+        let url = websocket_url(listener.local_addr().unwrap());
         let (received_tx, received_rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -160,9 +160,11 @@ mod tests {
     }
 
     /// 启动只检查握手信息的 WebSocket server。
+    // tungstenite 的握手 callback 签名固定使用较大的 Response 错误类型，测试 helper 不改变库接口。
+    #[allow(clippy::result_large_err)]
     async fn spawn_handshake_server() -> (String, oneshot::Receiver<HandshakeCapture>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = server_url(listener.local_addr().unwrap());
+        let url = websocket_url(listener.local_addr().unwrap());
         let (capture_tx, capture_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -200,7 +202,7 @@ mod tests {
     /// 启动连接后立即由服务端主动关闭的 WebSocket server。
     async fn spawn_server_close_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = server_url(listener.local_addr().unwrap());
+        let url = websocket_url(listener.local_addr().unwrap());
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -214,7 +216,7 @@ mod tests {
     /// 启动支持 Smalux secure_psk 的 echo WebSocket server。
     async fn spawn_secure_echo_server(token: String) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = server_url(listener.local_addr().unwrap());
+        let url = websocket_url(listener.local_addr().unwrap());
         let (received_tx, received_rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -316,7 +318,7 @@ mod tests {
     }
 
     /// 将本地监听地址转换为 ws URL。
-    fn server_url(addr: SocketAddr) -> String {
+    fn websocket_url(addr: SocketAddr) -> String {
         format!("ws://{addr}")
     }
 
@@ -421,7 +423,7 @@ mod tests {
     #[test]
     fn export_config_converts_to_query_token_websocket_config() {
         let mut export = ExportConfig {
-            server_url: "ws://127.0.0.1:8080/ws".to_string(),
+            base_url: "http://127.0.0.1:8080".to_string(),
             format: ExportFormat::SmaluxJson,
             wire_mode: crate::config::model::ExportWireMode::BinaryPlain,
             secure_required: false,
@@ -437,7 +439,9 @@ mod tests {
             .query
             .insert("agent_id".to_string(), "agent-1".to_string());
 
-        let config = WebSocketConfig::try_from(&export).unwrap();
+        let config =
+            WebSocketConfig::from_export_endpoint(&export, "ws://127.0.0.1:8080/ws".to_string())
+                .unwrap();
         let url = build_connect_url(&config).unwrap();
 
         assert!(url.contains("agent_id=agent-1"));
@@ -454,7 +458,9 @@ mod tests {
             ..ExportConfig::default()
         };
 
-        let error = WebSocketConfig::try_from(&export).unwrap_err();
+        let error =
+            WebSocketConfig::from_export_endpoint(&export, "ws://127.0.0.1:8080/ws".to_string())
+                .unwrap_err();
 
         assert!(error.to_string().contains("export.token is required"));
     }
@@ -463,7 +469,7 @@ mod tests {
     #[test]
     fn komari_websocket_config_ignores_smalux_wire_mode() {
         let export = ExportConfig {
-            server_url: "wss://example.com/api/clients/report".to_string(),
+            base_url: "https://example.com".to_string(),
             format: ExportFormat::Komari,
             wire_mode: ExportWireMode::SecurePsk,
             token: Some("komari-token".to_string()),
@@ -471,7 +477,11 @@ mod tests {
             ..ExportConfig::default()
         };
 
-        let config = WebSocketConfig::try_from(&export).unwrap();
+        let config = WebSocketConfig::from_export_endpoint(
+            &export,
+            "wss://example.com/api/clients/report".to_string(),
+        )
+        .unwrap();
 
         assert_eq!(config.wire_mode, ExportWireMode::BinaryPlain);
         assert!(config.secure_key.is_none());

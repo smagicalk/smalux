@@ -212,21 +212,20 @@ impl Default for LocalCollector {
 ///
 /// 这些字段大多来自 `sysinfo::System` 的静态方法，不需要持有可刷新的 `System` 实例。
 pub(crate) fn get_info() -> SystemInfo {
-    let mut res_system_info = SystemInfo::default();
-    res_system_info.name = System::name().unwrap_or("unknown".to_string());
-    res_system_info.kernel_version = System::kernel_version().unwrap_or("unknown".to_string());
-    res_system_info.kernel_long_version = System::kernel_long_version();
-    res_system_info.os_version = System::os_version().unwrap_or("unknown".to_string());
-    res_system_info.long_os_version = System::long_os_version().unwrap_or("unknown".to_string());
-    res_system_info.hostname = System::host_name().unwrap_or("unknown".to_string());
-    res_system_info.distribution_id = System::distribution_id();
-    res_system_info.uptime = System::uptime();
-    res_system_info.boot_time = System::boot_time();
-    res_system_info.supported = sysinfo::IS_SUPPORTED_SYSTEM;
-    res_system_info.core_num = sysinfo::System::physical_core_count().unwrap_or(0);
-    res_system_info.cpu_arch = System::cpu_arch();
-
-    res_system_info
+    SystemInfo {
+        name: System::name().unwrap_or("unknown".to_string()),
+        kernel_version: System::kernel_version().unwrap_or("unknown".to_string()),
+        kernel_long_version: System::kernel_long_version(),
+        os_version: System::os_version().unwrap_or("unknown".to_string()),
+        long_os_version: System::long_os_version().unwrap_or("unknown".to_string()),
+        hostname: System::host_name().unwrap_or("unknown".to_string()),
+        distribution_id: System::distribution_id(),
+        uptime: System::uptime(),
+        boot_time: System::boot_time(),
+        supported: sysinfo::IS_SUPPORTED_SYSTEM,
+        core_num: sysinfo::System::physical_core_count().unwrap_or(0),
+        cpu_arch: System::cpu_arch(),
+    }
 }
 
 /// 采集系统 1/5/15 分钟平均负载。
@@ -266,35 +265,35 @@ async fn resolve_public_ip(network_info: &NetworkInfo, config: &PublicIpConfig) 
 
     let attempted_at = unix_timestamp_secs();
 
-    if config.prefer_interface_candidate {
-        if let Some(ip) = network::interface_public_ip_candidate(network_info) {
-            tracing::info!(ip = %ip, "Public IP resolved from interface candidate");
-            let sampled_at = unix_timestamp_secs();
-            let mut public_ip =
-                PublicIpInfo::ready(ip, PublicIpSource::InterfaceCandidate, sampled_at, None);
+    if config.prefer_interface_candidate
+        && let Some(ip) = network::interface_public_ip_candidate(network_info)
+    {
+        tracing::info!(ip = %ip, "Public IP resolved from interface candidate");
+        let sampled_at = unix_timestamp_secs();
+        let mut public_ip =
+            PublicIpInfo::ready(ip, PublicIpSource::InterfaceCandidate, sampled_at, None);
 
-            if config.verify_interface_candidate {
-                if let Ok(verified_ip) = lookup_external_public_ip(config).await {
-                    if Some(verified_ip) != public_ip.ip {
-                        tracing::info!(
-                            interface_ip = %ip,
-                            verified_ip = %verified_ip,
-                            "Interface public IP candidate replaced by external verification"
-                        );
-                        public_ip = PublicIpInfo::ready(
-                            verified_ip,
-                            PublicIpSource::ExternalHttp,
-                            sampled_at,
-                            Some(unix_timestamp_secs()),
-                        );
-                    } else {
-                        public_ip.verified_at = Some(unix_timestamp_secs());
-                    }
-                }
+        if config.verify_interface_candidate
+            && let Ok(verified_ip) = lookup_external_public_ip(config).await
+        {
+            if Some(verified_ip) != public_ip.ip {
+                tracing::info!(
+                    interface_ip = %ip,
+                    verified_ip = %verified_ip,
+                    "Interface public IP candidate replaced by external verification"
+                );
+                public_ip = PublicIpInfo::ready(
+                    verified_ip,
+                    PublicIpSource::ExternalHttp,
+                    sampled_at,
+                    Some(unix_timestamp_secs()),
+                );
+            } else {
+                public_ip.verified_at = Some(unix_timestamp_secs());
             }
-
-            return public_ip;
         }
+
+        return public_ip;
     }
 
     match lookup_external_public_ip(config).await {
@@ -317,7 +316,7 @@ async fn resolve_public_ip(network_info: &NetworkInfo, config: &PublicIpConfig) 
 
 /// 通过外部服务获取公网 IP。
 async fn lookup_external_public_ip(config: &PublicIpConfig) -> anyhow::Result<std::net::IpAddr> {
-    let (v4, v6) = tokio::time::timeout(config.startup_timeout, async {
+    let (v4, v6) = tokio::time::timeout(config.lookup_timeout, async {
         futures_util::future::join(
             network::get_public_network_v4_with_concurrency(config.max_concurrency),
             network::get_public_network_v6_with_concurrency(config.max_concurrency),

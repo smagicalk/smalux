@@ -8,10 +8,10 @@
 //! - HTTP basic info：`POST https://host/api/clients/uploadBasicInfo?token=TOKEN`
 //! - HTTP task result：`POST https://host/api/clients/task/result?token=TOKEN`
 //!
-//! 官方 agent 常用的 `https://host` 基础 endpoint 会自动派生为 WebSocket report。
+//! 配置 `export.base_url=https://host` 时会自动派生为 WebSocket report endpoint。
 //!
-//! token 必须作为 query 参数发送，可以直接写在 `server_url`，也可以放在 `export.query`
-//! 中，或者使用 `auth_mode=query` + `export.token` 由 adapter 追加。Komari 不支持
+//! token 必须作为 query 参数发送，可以放在 `export.query` 中，也可以使用
+//! `auth_mode=query` + `export.token` 由 adapter 追加。Komari 不支持
 //! `Authorization: Bearer ...`，因此 `auth_mode=bearer` 会在配置校验阶段被拒绝。
 //!
 //! report 请求体是直接 JSON 对象，不包 `type` / `data` 外壳。当前映射字段包括
@@ -27,7 +27,7 @@
 //!
 //! - 只消费完整 snapshot；delta 和业务级 heartbeat 不发送。
 //! - WebSocket 模式要求 `report.interval <= 10s`，避免第三方服务认为连接空闲。
-//! - basic info 默认 5 分钟刷新一次，首次 snapshot 会立即发送。
+//! - basic info 由 reporter 生成 `OutboundEvent::BasicInfo`，默认 5 分钟刷新一次。
 //! - Komari terminal 消息会转给 remote shell manager。
 //! - Komari exec 消息会转给 remote task manager，结果按 task/result HTTP 接口回传。
 //! - 其它 Komari server 消息安全忽略。
@@ -42,21 +42,20 @@ mod terminal;
 mod url;
 
 use super::{
-    ExportAdapter, ExportJobFailurePolicy, ExportJobId, ExportJobSpec, ExportMessageListener,
-    TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
+    ExportAdapter, ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec,
+    ExportMessageListener, TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
 };
 use crate::config::ConfigManager;
 use crate::config::model::ExportConfig;
 use crate::service::InboundCommandSender;
-use crate::service::outbound::{RemoteProbeResultEnvelope, RemoteTaskResultEnvelope};
+use crate::service::outbound::{
+    BasicInfoEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
+};
 use model::{BasicInfo, PingResult, Report, TaskResult};
 use smalux_protocol::{OutboundReport, OutboundReportKind};
 use url::{
     komari_basic_info_url, komari_report_websocket_url, komari_task_result_url, redact_komari_url,
 };
-
-/// Komari basic info 默认刷新间隔，单位秒；官方 agent 默认约 5 分钟。
-const BASIC_INFO_INTERVAL_SECS: u64 = 5 * 60;
 
 /// Komari 兼容 adapter。
 #[derive(Debug)]
@@ -78,13 +77,13 @@ impl Default for KomariAdapter {
 }
 
 impl ExportAdapter for KomariAdapter {
-    /// 根据 server_url 生成 Komari transport plan。
+    /// 根据 base_url 生成 Komari transport plan。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan> {
         self.basic_info_url = Some(komari_basic_info_url(config)?);
         self.task_result_url = Some(komari_task_result_url(config)?);
         let websocket_config = komari_websocket_config(config)?;
 
-        Ok(TransportPlan::with_jobs(
+        Ok(TransportPlan::with_deliveries(
             vec![
                 TransportSpec::WebSocket {
                     id: TransportId::RealtimeReport,
@@ -92,53 +91,32 @@ impl ExportAdapter for KomariAdapter {
                     connect_on_start: false,
                 },
                 TransportSpec::Http {
-                    id: TransportId::BasicInfo,
+                    id: TransportId::AuxiliaryHttp,
                     config: http::HttpConfig::default().with_unsafe_cert(config.unsafe_cert),
                 },
             ],
             vec![
-                ExportJobSpec::interval(
-                    ExportJobId::BasicInfo,
-                    std::time::Duration::from_secs(BASIC_INFO_INTERVAL_SECS),
-                    ExportJobFailurePolicy::LogAndContinue,
+                ExportDeliverySpec::event_driven(
+                    ExportDeliveryId::BasicInfo,
+                    ExportDeliveryFailurePolicy::LogAndContinue,
                 ),
-                ExportJobSpec::on_latest_report(ExportJobId::RealtimeReport),
+                ExportDeliverySpec::on_latest_report(ExportDeliveryId::RealtimeReport),
             ],
         ))
     }
 
-    /// 按 job 将完整 snapshot 映射成 Komari 请求。
+    /// 按 delivery 将完整 snapshot 映射成 Komari 请求。
     fn encode_report(
         &mut self,
-        job_id: ExportJobId,
+        delivery_id: ExportDeliveryId,
         outbound: &OutboundReport,
     ) -> anyhow::Result<Vec<TransportRequest>> {
         let OutboundReportKind::Snapshot { report } = &outbound.kind else {
             return Ok(vec![]);
         };
 
-        match job_id {
-            ExportJobId::BasicInfo => {
-                let url = self
-                    .basic_info_url
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("komari basic info url is not initialized"))?;
-                let redacted_url = redact_komari_url(&url);
-                let basic_info_body = serde_json::to_value(BasicInfo::from_agent_report(report))?;
-                tracing::info!(
-                    created_at = outbound.created_at,
-                    url = %redacted_url,
-                    body = %basic_info_body,
-                    "komari basic info request encoded"
-                );
-                Ok(vec![TransportRequest::HttpJson {
-                    transport: TransportId::BasicInfo,
-                    method: http::HttpMethod::Post,
-                    url,
-                    body: basic_info_body,
-                }])
-            }
-            ExportJobId::RealtimeReport => {
+        match delivery_id {
+            ExportDeliveryId::RealtimeReport => {
                 let report_body = serde_json::to_string(&Report::from_agent_report(report))?;
                 tracing::debug!(
                     created_at = outbound.created_at,
@@ -150,11 +128,39 @@ impl ExportAdapter for KomariAdapter {
                     body: report_body,
                 }])
             }
-            ExportJobId::RemoteTaskResult
-            | ExportJobId::RemoteProbeResult
-            | ExportJobId::ControlAck
-            | ExportJobId::ControlError => Ok(vec![]),
+            ExportDeliveryId::BasicInfo => Ok(vec![]),
+            ExportDeliveryId::RemoteTaskResult
+            | ExportDeliveryId::RemoteProbeResult
+            | ExportDeliveryId::ControlAck
+            | ExportDeliveryId::ControlError => Ok(vec![]),
         }
+    }
+
+    /// 将内部 basic info 事件映射为 Komari uploadBasicInfo HTTP POST。
+    fn encode_basic_info(
+        &mut self,
+        info: &BasicInfoEnvelope,
+    ) -> anyhow::Result<Vec<TransportRequest>> {
+        let url = self
+            .basic_info_url
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("komari basic info url is not initialized"))?;
+        let redacted_url = redact_komari_url(&url);
+        let body = serde_json::to_value(BasicInfo::from_agent_report(&info.report))?;
+        tracing::info!(
+            sequence = info.sequence,
+            created_at = info.created_at,
+            url = %redacted_url,
+            body = %body,
+            "komari basic info request encoded"
+        );
+
+        Ok(vec![TransportRequest::HttpJson {
+            transport: TransportId::AuxiliaryHttp,
+            method: http::HttpMethod::Post,
+            url,
+            body,
+        }])
     }
 
     /// 将内部 remote task result 映射为 Komari task/result HTTP POST。
@@ -177,7 +183,7 @@ impl ExportAdapter for KomariAdapter {
         );
 
         Ok(vec![TransportRequest::HttpJson {
-            transport: TransportId::BasicInfo,
+            transport: TransportId::AuxiliaryHttp,
             method: http::HttpMethod::Post,
             url,
             body,
@@ -207,11 +213,10 @@ impl ExportAdapter for KomariAdapter {
     }
 }
 
-/// 构造 Komari WebSocket 配置；基础 endpoint 会先规范化为 report WebSocket URL。
+/// 构造 Komari WebSocket 配置；base_url 会先派生为 report WebSocket URL。
 fn komari_websocket_config(config: &ExportConfig) -> anyhow::Result<ws::WebSocketConfig> {
-    let mut websocket_export = config.clone();
-    websocket_export.server_url = komari_report_websocket_url(config)?;
-    ws::WebSocketConfig::try_from(&websocket_export)
+    let endpoint = komari_report_websocket_url(config)?;
+    ws::WebSocketConfig::from_export_endpoint(config, endpoint)
 }
 
 /// 构造 Komari server 消息监听器。
@@ -228,15 +233,15 @@ mod tests {
 
     use super::*;
     use crate::config::model::ExportAuthMode;
-    use crate::export::ExportJobTrigger;
+    use crate::export::ExportDeliveryTrigger;
     use crate::service::outbound::{RemoteProbeResultEnvelope, RemoteTaskResultEnvelope};
     use smalux_core::model::info::AgentReport;
     use smalux_protocol::{RemoteProbeResult, RemoteProbeType, RemoteTaskResult, RemoteTaskStatus};
 
     /// 构造 Komari 测试配置。
-    fn komari_config(server_url: &str) -> ExportConfig {
+    fn komari_config(base_url: &str) -> ExportConfig {
         ExportConfig {
-            server_url: server_url.to_string(),
+            base_url: base_url.to_string(),
             auth_mode: ExportAuthMode::Query,
             token: Some("secret-token".to_string()),
             ..ExportConfig::default()
@@ -246,22 +251,6 @@ mod tests {
     /// 验证 WebSocket 模式会同时声明 report WS 和 basic info HTTP。
     #[test]
     fn komari_plan_uses_websocket_report_and_http_basic_info() {
-        let mut adapter = KomariAdapter::default();
-        let plan = adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
-            .unwrap();
-
-        assert_eq!(plan.transports.len(), 2);
-        assert!(matches!(
-            plan.transports[0],
-            TransportSpec::WebSocket { .. }
-        ));
-        assert!(matches!(plan.transports[1], TransportSpec::Http { .. }));
-    }
-
-    /// 验证官方风格基础 endpoint 会自动使用 WebSocket report。
-    #[test]
-    fn komari_plan_uses_websocket_report_for_base_endpoint() {
         let mut adapter = KomariAdapter::default();
         let plan = adapter
             .transport_plan(&komari_config("https://example.com"))
@@ -275,12 +264,12 @@ mod tests {
         assert!(matches!(plan.transports[1], TransportSpec::Http { .. }));
     }
 
-    /// 验证显式 HTTPS report endpoint 仍按标准 agent 协议使用 WebSocket report。
+    /// 验证 base_url 根地址会自动使用 WebSocket report。
     #[test]
-    fn komari_plan_uses_websocket_report_for_https_report_endpoint() {
+    fn komari_plan_uses_websocket_report_for_base_url() {
         let mut adapter = KomariAdapter::default();
         let plan = adapter
-            .transport_plan(&komari_config("https://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
 
         assert_eq!(plan.transports.len(), 2);
@@ -291,10 +280,24 @@ mod tests {
         assert!(matches!(plan.transports[1], TransportSpec::Http { .. }));
     }
 
+    /// 验证带 path 的 URL 会被拒绝，避免配置混入 endpoint。
+    #[test]
+    fn komari_plan_rejects_base_url_with_path() {
+        let mut adapter = KomariAdapter::default();
+        let error = match adapter
+            .transport_plan(&komari_config("https://example.com/api/clients/report"))
+        {
+            Ok(_) => panic!("expected base_url with path to be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("path"));
+    }
+
     /// 验证 HTTP transport 会继承 unsafe_cert 配置。
     #[test]
     fn komari_http_transport_uses_unsafe_cert_config() {
-        let mut config = komari_config("https://example.com/api/clients/report");
+        let mut config = komari_config("https://example.com");
         config.unsafe_cert = true;
         let mut adapter = KomariAdapter::default();
         let plan = adapter.transport_plan(&config).unwrap();
@@ -306,60 +309,66 @@ mod tests {
         assert!(config.unsafe_cert);
     }
 
-    /// 验证 Komari plan 显式声明 report 和 basic info 两个 job。
+    /// 验证 Komari plan 显式声明 report 和 basic info 两个 delivery。
     #[test]
-    fn komari_plan_declares_report_and_basic_info_jobs() {
+    fn komari_plan_declares_report_and_basic_info_deliveries() {
         let mut adapter = KomariAdapter::default();
         let plan = adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
 
-        assert_eq!(plan.jobs.len(), 2);
-        assert_eq!(plan.jobs[0].id, ExportJobId::BasicInfo);
+        assert_eq!(plan.deliveries.len(), 2);
+        assert_eq!(plan.deliveries[0].id, ExportDeliveryId::BasicInfo);
         assert_eq!(
-            plan.jobs[0].trigger,
-            ExportJobTrigger::Interval(std::time::Duration::from_secs(BASIC_INFO_INTERVAL_SECS))
+            plan.deliveries[0].trigger,
+            ExportDeliveryTrigger::EventDriven
         );
         assert_eq!(
-            plan.jobs[0].failure_policy,
-            ExportJobFailurePolicy::LogAndContinue
+            plan.deliveries[0].failure_policy,
+            ExportDeliveryFailurePolicy::LogAndContinue
         );
-        assert_eq!(plan.jobs[1].id, ExportJobId::RealtimeReport);
-        assert_eq!(plan.jobs[1].trigger, ExportJobTrigger::OnLatestReport);
+        assert_eq!(plan.deliveries[1].id, ExportDeliveryId::RealtimeReport);
+        assert_eq!(
+            plan.deliveries[1].trigger,
+            ExportDeliveryTrigger::OnLatestReport
+        );
     }
 
-    /// 验证 basic info job 会生成 HTTP POST。
+    /// 验证 basic info 事件会生成 HTTP POST。
     #[test]
-    fn komari_adapter_encodes_basic_info_job() {
+    fn komari_adapter_encodes_basic_info_event() {
         let mut adapter = KomariAdapter::default();
         adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = OutboundReport::snapshot(1, 100, report);
 
         let requests = adapter
-            .encode_report(ExportJobId::BasicInfo, &outbound)
+            .encode_basic_info(&BasicInfoEnvelope {
+                sequence: 1,
+                created_at: 100,
+                report,
+            })
             .unwrap();
 
         assert_eq!(requests.len(), 1);
         assert!(matches!(requests[0], TransportRequest::HttpJson { .. }));
     }
 
-    /// 验证 report job 会生成 WebSocket text。
+    /// 验证 report delivery 会生成 WebSocket text。
     #[test]
-    fn komari_adapter_encodes_websocket_report_job() {
+    fn komari_adapter_encodes_websocket_report_delivery() {
         let mut adapter = KomariAdapter::default();
         adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = OutboundReport::snapshot(1, 100, report);
 
         let requests = adapter
-            .encode_report(ExportJobId::RealtimeReport, &outbound)
+            .encode_report(ExportDeliveryId::RealtimeReport, &outbound)
             .unwrap();
 
         assert_eq!(requests.len(), 1);
@@ -374,16 +383,16 @@ mod tests {
     fn komari_adapter_skips_non_snapshot_report() {
         let mut adapter = KomariAdapter::default();
         adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let outbound =
             OutboundReport::heartbeat("agent-1", 1, 100, smalux_protocol::Heartbeat::default());
 
         let basic_info = adapter
-            .encode_report(ExportJobId::BasicInfo, &outbound)
+            .encode_report(ExportDeliveryId::BasicInfo, &outbound)
             .unwrap();
         let realtime_report = adapter
-            .encode_report(ExportJobId::RealtimeReport, &outbound)
+            .encode_report(ExportDeliveryId::RealtimeReport, &outbound)
             .unwrap();
 
         assert!(basic_info.is_empty());
@@ -395,7 +404,7 @@ mod tests {
     fn komari_adapter_encodes_remote_task_result() {
         let mut adapter = KomariAdapter::default();
         adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let result = RemoteTaskResultEnvelope {
             agent_id: "agent-1".to_string(),
@@ -437,7 +446,7 @@ mod tests {
     fn komari_adapter_encodes_remote_probe_result() {
         let mut adapter = KomariAdapter::default();
         adapter
-            .transport_plan(&komari_config("wss://example.com/api/clients/report"))
+            .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let result = RemoteProbeResultEnvelope {
             agent_id: "agent-1".to_string(),

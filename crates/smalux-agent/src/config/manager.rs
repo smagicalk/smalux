@@ -1,7 +1,7 @@
 //! Agent 动态配置管理。
 
 use super::model::{AgentConfig, AgentConfigPatch, ExportAuthMode, ExportFormat, ExportWireMode};
-use crate::export::security::parse_secure_token;
+use crate::export::{parse_export_base_url, security::parse_secure_token};
 use smalux_core::model::info::MetricLevel;
 use smalux_core::utils::validate::{ensure_interval_at_least, ensure_non_empty};
 use std::time::Duration;
@@ -100,10 +100,7 @@ pub(crate) fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     ensure_config_interval("network.interval", config.network.interval)?;
     ensure_config_interval("processes.interval", config.processes.interval)?;
     ensure_config_interval("sockets.interval", config.sockets.interval)?;
-    ensure_config_interval(
-        "public_ip.startup_timeout",
-        config.public_ip.startup_timeout,
-    )?;
+    ensure_config_interval("public_ip.lookup_timeout", config.public_ip.lookup_timeout)?;
     ensure_config_interval("public_ip.retry_interval", config.public_ip.retry_interval)?;
     ensure_config_interval(
         "public_ip.refresh_interval",
@@ -120,10 +117,9 @@ pub(crate) fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
         config.report.force_snapshot_min_interval,
     )?;
     ensure_config_interval(
-        "jobs.realtime_report.interval",
-        config.jobs.realtime_report.interval,
+        "outbound.basic_info.refresh_interval",
+        config.outbound.basic_info.refresh_interval,
     )?;
-    ensure_config_interval("jobs.basic_info.interval", config.jobs.basic_info.interval)?;
     config.remote_shell.validate()?;
     config.remote_task.validate()?;
     config.remote_probe.validate()?;
@@ -147,7 +143,8 @@ pub(crate) fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
         Some(config.sockets.interval),
     )?;
 
-    ensure_non_empty("export.server_url", &config.export.server_url)?;
+    ensure_non_empty("export.base_url", &config.export.base_url)?;
+    parse_export_base_url(&config.export.base_url)?;
     if let Some(token) = &config.export.token {
         ensure_non_empty("export.token", token)?;
     }
@@ -164,7 +161,7 @@ pub(crate) fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
         anyhow::bail!("export.token is required when export.auth_mode is not none");
     }
     ensure_non_empty("export.query_token_param", &config.export.query_token_param)?;
-    for (key, _value) in &config.export.query {
+    for key in config.export.query.keys() {
         ensure_non_empty("export.query key", key)?;
     }
     for interface in &config.network.include_interfaces {
@@ -286,36 +283,16 @@ fn validate_komari_config(config: &AgentConfig) -> anyhow::Result<()> {
     if matches!(config.export.auth_mode, ExportAuthMode::Bearer) {
         anyhow::bail!("export.auth_mode=bearer is not supported when export.format is komari");
     }
-    if komari_uses_websocket_report(&config.export.server_url)
-        && (config.report.interval > KOMARI_MAX_WEBSOCKET_REPORT_INTERVAL
-            || config.jobs.realtime_report.interval > KOMARI_MAX_WEBSOCKET_REPORT_INTERVAL)
-    {
+    if config.report.interval > KOMARI_MAX_WEBSOCKET_REPORT_INTERVAL {
         anyhow::bail!(
-            "report.interval and jobs.realtime_report.interval must be at most 10s when export.format is komari over websocket"
+            "report.interval must be at most 10s when export.format is komari over websocket"
         );
     }
     if !komari_query_token_configured(config) {
-        anyhow::bail!(
-            "komari export requires query token in export.token, export.query, or server_url"
-        );
+        anyhow::bail!("komari export requires query token in export.token or export.query");
     }
 
     Ok(())
-}
-
-/// 判断 Komari report 是否会走 WebSocket。
-///
-/// `https://host` 这类官方基础 endpoint 会在 Komari adapter 中派生为 WebSocket
-/// report；显式传入 HTTPS report endpoint 时也会规范化为 WebSocket report。
-fn komari_uses_websocket_report(server_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(server_url) else {
-        return false;
-    };
-
-    match url.scheme() {
-        "ws" | "wss" | "http" | "https" => true,
-        _ => false,
-    }
 }
 
 /// 判断 Komari query token 是否已配置。
@@ -334,19 +311,13 @@ fn komari_query_token_configured(config: &AgentConfig) -> bool {
     if config
         .export
         .query
-        .contains_key(&config.export.query_token_param)
+        .get(&config.export.query_token_param)
+        .is_some_and(|token| !token.trim().is_empty())
     {
         return true;
     }
 
-    reqwest::Url::parse(&config.export.server_url)
-        .ok()
-        .map(|url| {
-            url.query_pairs().any(|(key, value)| {
-                key == config.export.query_token_param && !value.trim().is_empty()
-            })
-        })
-        .unwrap_or(false)
+    false
 }
 
 #[cfg(test)]
@@ -365,7 +336,7 @@ mod tests {
     fn valid_komari_config() -> AgentConfig {
         let mut config = AgentConfig::default();
         config.export.format = ExportFormat::Komari;
-        config.export.server_url = "wss://example.com/api/clients/report".to_string();
+        config.export.base_url = "https://example.com".to_string();
         config.export.auth_mode = ExportAuthMode::Query;
         config.export.token = Some("secret-token".to_string());
         config
@@ -444,7 +415,10 @@ mod tests {
 
         let updated = manager
             .apply_patch(AgentConfigPatch {
-                agent_id: Some(current.agent_id.clone()),
+                core: Some(GroupConfigPatch {
+                    interval: Some(current.core.interval),
+                    ..GroupConfigPatch::default()
+                }),
                 ..AgentConfigPatch::default()
             })
             .unwrap();
@@ -499,26 +473,19 @@ mod tests {
         );
     }
 
-    /// 验证实时上报 job 间隔过小会被拒绝。
+    /// 验证 basic info delivery 间隔过小会被拒绝。
     #[test]
-    fn validate_rejects_too_small_realtime_report_job_interval() {
+    fn validate_rejects_too_small_basic_info_refresh_interval() {
         let mut config = AgentConfig::default();
-        config.jobs.realtime_report.interval = Duration::from_millis(1);
+        config.outbound.basic_info.refresh_interval = Duration::from_millis(1);
 
         let error = validate_config(&config).unwrap_err();
 
-        assert!(error.to_string().contains("jobs.realtime_report.interval"));
-    }
-
-    /// 验证 basic info job 间隔过小会被拒绝。
-    #[test]
-    fn validate_rejects_too_small_basic_info_job_interval() {
-        let mut config = AgentConfig::default();
-        config.jobs.basic_info.interval = Duration::from_millis(1);
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(error.to_string().contains("jobs.basic_info.interval"));
+        assert!(
+            error
+                .to_string()
+                .contains("outbound.basic_info.refresh_interval")
+        );
     }
 
     /// 验证 server patch 可以动态调整远程 shell 运行限制。
@@ -585,7 +552,6 @@ mod tests {
                     timeout: Some(Duration::from_secs(45)),
                     max_stdout_bytes: Some(1024),
                     max_stderr_bytes: Some(2048),
-                    ..RemoteTaskConfigPatch::default()
                 }),
                 ..AgentConfigPatch::default()
             })
@@ -861,8 +827,10 @@ mod tests {
     /// 验证日志滚动保留数量必须大于 0。
     #[test]
     fn validate_rejects_zero_log_retention_files() {
-        let mut config = AgentConfig::default();
-        config.log_retention_files = 0;
+        let config = AgentConfig {
+            log_retention_files: 0,
+            ..AgentConfig::default()
+        };
 
         let error = validate_config(&config).unwrap_err();
 
@@ -876,8 +844,10 @@ mod tests {
     /// 验证日志大小滚动阈值必须大于 0。
     #[test]
     fn validate_rejects_zero_log_max_size_mb() {
-        let mut config = AgentConfig::default();
-        config.log_max_size_mb = 0;
+        let config = AgentConfig {
+            log_max_size_mb: 0,
+            ..AgentConfig::default()
+        };
 
         let error = validate_config(&config).unwrap_err();
 
@@ -1017,22 +987,10 @@ mod tests {
         assert!(error.to_string().contains("report.interval"));
     }
 
-    /// 验证 Komari WebSocket 上报 job 间隔不能超过兼容上限。
-    #[test]
-    fn validate_rejects_komari_websocket_job_interval_above_limit() {
-        let mut config = valid_komari_config();
-        config.jobs.realtime_report.interval = Duration::from_secs(11);
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(error.to_string().contains("jobs.realtime_report.interval"));
-    }
-
-    /// 验证 Komari 官方风格 HTTPS 基础 endpoint 也按 WebSocket 上报间隔限制校验。
+    /// 验证 Komari base URL 也按 WebSocket 上报间隔限制校验。
     #[test]
     fn validate_rejects_komari_base_endpoint_interval_above_websocket_limit() {
         let mut config = valid_komari_config();
-        config.export.server_url = "https://example.com".to_string();
         config.report.interval = Duration::from_secs(11);
 
         let error = validate_config(&config).unwrap_err();
@@ -1040,27 +998,28 @@ mod tests {
         assert!(error.to_string().contains("report.interval"));
     }
 
-    /// 验证显式 HTTPS report endpoint 仍按 WebSocket report 间隔限制校验。
+    /// 验证 base_url 不能包含 path。
     #[test]
-    fn validate_rejects_komari_https_report_endpoint_interval_above_websocket_limit() {
+    fn validate_rejects_export_base_url_with_path() {
         let mut config = valid_komari_config();
-        config.export.server_url = "https://example.com/api/clients/report".to_string();
-        config.report.interval = Duration::from_secs(60);
+        config.export.base_url = "https://example.com/api/clients/report".to_string();
 
         let error = validate_config(&config).unwrap_err();
 
-        assert!(error.to_string().contains("report.interval"));
+        assert!(error.to_string().contains("export.base_url"));
+        assert!(error.to_string().contains("path"));
     }
 
-    /// 验证 Komari token 可以直接放在 URL query 中。
+    /// 验证 base_url 不能包含 query。
     #[test]
-    fn validate_accepts_komari_token_from_server_url() {
-        let mut config = AgentConfig::default();
-        config.export.format = ExportFormat::Komari;
-        config.export.server_url =
-            "wss://example.com/api/clients/report?token=from-url".to_string();
+    fn validate_rejects_export_base_url_with_query() {
+        let mut config = valid_komari_config();
+        config.export.base_url = "https://example.com?token=from-url".to_string();
 
-        validate_config(&config).unwrap();
+        let error = validate_config(&config).unwrap_err();
+
+        assert!(error.to_string().contains("export.base_url"));
+        assert!(error.to_string().contains("query"));
     }
 
     /// 验证 Komari token 可以放在 export.query 中。
@@ -1068,7 +1027,7 @@ mod tests {
     fn validate_accepts_komari_token_from_export_query() {
         let mut config = AgentConfig::default();
         config.export.format = ExportFormat::Komari;
-        config.export.server_url = "wss://example.com/api/clients/report".to_string();
+        config.export.base_url = "https://example.com".to_string();
         config
             .export
             .query

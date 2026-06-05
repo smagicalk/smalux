@@ -2,9 +2,9 @@
 
 use super::super::control::ServiceControlListener;
 use super::super::inbound::InboundCommandSender;
-use super::jobs::{RuntimeJob, runtime_jobs_from_plan};
+use super::delivery::{RuntimeDelivery, runtime_deliveries_from_plan};
 use crate::config::ConfigManager;
-use crate::config::model::{ExportConfig, ExportFormat, JobsConfig};
+use crate::config::model::{ExportConfig, ExportFormat, OutboundConfig};
 use crate::export::{
     ExportMessageListener, ExportRouter, TransportEventReceiver, TransportHub,
     build_export_adapter, build_komari_message_listener, transport_event_channel,
@@ -14,15 +14,15 @@ use tokio::time::sleep;
 /// 已连接导出 pipeline 的运行时状态。
 ///
 /// 这个 tuple 只在 export supervisor 内部流转，代表“当前 adapter + transport hub +
-/// job 调度状态”的一整套连接。export 配置变更时整体重建，单纯 jobs 变更时只重建
-/// `RuntimeJob`，避免不必要断开 WebSocket。
+/// delivery 调度状态”的一整套连接。export 配置变更时整体重建，单纯 outbound 变更时
+/// 只重建 `RuntimeDelivery`，避免不必要断开 WebSocket。
 pub(super) type ConnectedExportPipeline = (
     TransportHub,
     TransportEventReceiver,
     ExportRouter,
     ExportConfig,
-    JobsConfig,
-    Vec<RuntimeJob>,
+    OutboundConfig,
+    Vec<RuntimeDelivery>,
 );
 
 /// 使用当前配置创建 adapter、transport plan，并连接导出 transport。
@@ -33,13 +33,13 @@ pub(super) async fn connect_export_pipeline(
     loop {
         let config = config_manager.current();
         let export_config = config.export.clone();
-        let jobs_config = config.jobs.clone();
+        let outbound_config = config.outbound.clone();
         let reconnect_interval = export_config.reconnect_interval;
         let format = export_config.format.as_str();
         let mut router = ExportRouter::new(build_export_adapter(export_config.format));
         let mut transport_plan = router.transport_plan(&export_config)?;
-        transport_plan.apply_job_config(&jobs_config);
-        let jobs = runtime_jobs_from_plan(&transport_plan);
+        transport_plan.apply_outbound_config(&outbound_config);
+        let deliveries = runtime_deliveries_from_plan(&transport_plan);
         let (transport_event_tx, transport_events) = transport_event_channel();
         let mut transport_hub = TransportHub::from_plan(transport_plan, transport_event_tx)?;
         let transport_summary = transport_hub.summary();
@@ -61,8 +61,8 @@ pub(super) async fn connect_export_pipeline(
                     transport_events,
                     router,
                     export_config,
-                    jobs_config,
-                    jobs,
+                    outbound_config,
+                    deliveries,
                 ));
             }
             Err(err) => {
@@ -80,15 +80,15 @@ pub(super) async fn connect_export_pipeline(
     }
 }
 
-/// 重新读取 adapter job plan 并应用运行时 jobs 配置。
-pub(super) fn rebuild_runtime_jobs(
+/// 重新读取 adapter delivery plan 并应用运行时 outbound 配置。
+pub(super) fn rebuild_runtime_deliveries(
     router: &mut ExportRouter,
     export_config: &ExportConfig,
-    jobs_config: &JobsConfig,
-) -> anyhow::Result<Vec<RuntimeJob>> {
+    outbound_config: &OutboundConfig,
+) -> anyhow::Result<Vec<RuntimeDelivery>> {
     let mut transport_plan = router.transport_plan(export_config)?;
-    transport_plan.apply_job_config(jobs_config);
-    Ok(runtime_jobs_from_plan(&transport_plan))
+    transport_plan.apply_outbound_config(outbound_config);
+    Ok(runtime_deliveries_from_plan(&transport_plan))
 }
 
 /// 根据导出格式创建服务端消息监听器。

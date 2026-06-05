@@ -32,13 +32,16 @@ async fn main() -> anyhow::Result<()> {
         log_file = %current_config.log_file,
         log_retention_files = current_config.log_retention_files,
         log_max_size_mb = current_config.log_max_size_mb,
-        server_url = %current_config.export.server_url,
+        base_url = %current_config.export.base_url,
         core_interval_ms = current_config.core.interval.as_millis(),
         disk_interval_ms = current_config.disk.interval.as_millis(),
         network_interval_ms = current_config.network.interval.as_millis(),
         report_interval_ms = current_config.report.interval.as_millis(),
-        realtime_report_job_interval_ms = current_config.jobs.realtime_report.interval.as_millis(),
-        basic_info_job_interval_ms = current_config.jobs.basic_info.interval.as_millis(),
+        basic_info_refresh_interval_ms = current_config
+            .outbound
+            .basic_info
+            .refresh_interval
+            .as_millis(),
         remote_shell_enabled = service_options.remote_shell.enabled,
         remote_shell_max_sessions = current_config.remote_shell.max_sessions,
         remote_task_enabled = service_options.remote_task.enabled,

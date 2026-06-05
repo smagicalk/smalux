@@ -3,6 +3,34 @@
 use std::future::Future;
 use std::pin::Pin;
 
+/// endpoint URL 的目标传输类型。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ExportEndpointScheme {
+    /// HTTP/HTTPS endpoint。
+    Http,
+    /// WebSocket endpoint。
+    WebSocket,
+}
+
+/// 当前可用的导出 transport 协议。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ExportProtocol {
+    /// WebSocket 导出协议。
+    WebSocket,
+    /// HTTP 导出协议。
+    Http,
+}
+
+impl ExportProtocol {
+    /// 协议名称，用于结构化日志。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WebSocket => "websocket",
+            Self::Http => "http",
+        }
+    }
+}
+
 /// 已编码完成、可以交给 transport 发送的导出消息。
 ///
 /// `Binary` 的 body 是业务 payload，不一定是最终 WebSocket frame。Smalux 自有协议会在
@@ -35,36 +63,67 @@ pub(crate) fn inbound_message_into_string(msg: ExportInboundMessage) -> anyhow::
     }
 }
 
-/// 当前可用的导出协议。
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ExportProtocol {
-    /// WebSocket 导出协议。
-    WebSocket,
-    /// HTTP 导出协议。
-    Http,
+/// 解析并校验 export base URL。
+///
+/// base URL 是用户唯一需要配置的 server 根地址，不能包含 path/query/fragment。
+pub(crate) fn parse_export_base_url(base_url: &str) -> anyhow::Result<reqwest::Url> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("export.base_url cannot be empty");
+    }
+
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|err| anyhow::anyhow!("export.base_url must be a valid URL: {err}"))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        other => anyhow::bail!("export.base_url must use http or https scheme, got {other}"),
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("export.base_url must include a host");
+    }
+    if !matches!(url.path(), "" | "/") {
+        anyhow::bail!("export.base_url must not include a path");
+    }
+    if url.query().is_some() {
+        anyhow::bail!("export.base_url must not include query parameters");
+    }
+    if url.fragment().is_some() {
+        anyhow::bail!("export.base_url must not include a fragment");
+    }
+
+    Ok(url)
 }
 
-impl ExportProtocol {
-    /// 根据导出地址推断协议类型。
-    pub(crate) fn from_server_url(server_url: &str) -> anyhow::Result<Self> {
-        let Some((scheme, _rest)) = server_url.trim().split_once(':') else {
-            anyhow::bail!("export.server_url must include a protocol scheme");
-        };
+/// 根据 base URL 和协议内固定 path 构造真实 endpoint。
+pub(crate) fn build_export_endpoint(
+    base_url: &str,
+    scheme: ExportEndpointScheme,
+    path: &str,
+) -> anyhow::Result<String> {
+    let mut url = parse_export_base_url(base_url)?;
+    let next_scheme = match (url.scheme(), scheme) {
+        ("http", ExportEndpointScheme::Http) => "http",
+        ("https", ExportEndpointScheme::Http) => "https",
+        ("http", ExportEndpointScheme::WebSocket) => "ws",
+        ("https", ExportEndpointScheme::WebSocket) => "wss",
+        _ => unreachable!("parse_export_base_url only allows http/https"),
+    };
+    url.set_scheme(next_scheme)
+        .map_err(|_| anyhow::anyhow!("failed to set export endpoint scheme"))?;
+    url.set_path(normalize_endpoint_path(path)?);
+    Ok(url.to_string())
+}
 
-        match scheme.to_ascii_lowercase().as_str() {
-            "ws" | "wss" => Ok(Self::WebSocket),
-            "http" | "https" => Ok(Self::Http),
-            other => anyhow::bail!("unsupported export protocol: {other}"),
-        }
+/// 校验并规范化协议内部固定 path。
+fn normalize_endpoint_path(path: &str) -> anyhow::Result<&str> {
+    if !path.starts_with('/') {
+        anyhow::bail!("export endpoint path must start with /");
     }
-
-    /// 协议名称，用于结构化日志。
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::WebSocket => "websocket",
-            Self::Http => "http",
-        }
+    if path.trim() != path || path.trim().is_empty() {
+        anyhow::bail!("export endpoint path cannot be empty or padded");
     }
+    Ok(path)
 }
 
 /// 可动态分发的消息监听器。

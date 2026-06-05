@@ -31,7 +31,7 @@ cargo check --workspace --all-targets
 ## Agent 当前状态
 
 - 采集：identity、system、CPU、单核 CPU、内存、swap、load average、磁盘、网络、公网 IP、进程、TCP/UDP socket。
-- 采样控制：core、disk、network、processes、sockets、public_ip、report、export jobs 都有独立频率。
+- 采样控制：core、disk、network、processes、sockets、public_ip、report、outbound delivery 都有独立频率。
 - 进程和 socket：支持 `count`、`light`、`details` 三层；总数字段在任一级别都会上报，除非对应采样组关闭。
 - 公网 IP：默认可选，启动会尝试获取，失败会上报状态而不是阻塞第一包；成功后低频刷新，默认 `24h`。
 - 上报：支持完整 `snapshot`、可选 `delta`、可选业务 `heartbeat`、server `snapshot_request` 强制完整快照。
@@ -81,7 +81,7 @@ crates/smalux-agent/src/
 
 - Komari 兼容代码保留在 `crates/smalux-agent/src/export/komari/`，方便后续整体删除或替换。
 - Komari report 走 WebSocket `/api/clients/report?token=...`。
-- Komari basic info 走 HTTP `POST /api/clients/uploadBasicInfo?token=...`，默认 `jobs.basic_info.interval=5m`。
+- Komari basic info 走 HTTP `POST /api/clients/uploadBasicInfo?token=...`，默认 `outbound.basic_info.refresh_interval=5m`。
 - Komari task result 走 HTTP `POST /api/clients/task/result?token=...`。
 - Komari `terminal` 复用 remote shell，`exec` 复用 remote task，`ping` 复用 remote probe。
 - Komari 只消费 snapshot；开启 delta 或业务 heartbeat 会被配置校验拒绝。
@@ -114,15 +114,16 @@ cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs
 cargo rustdoc -p smalux-protocol --lib -- -D missing_docs
 ```
 
-本轮文档和模块拆分后验证通过：
+本轮 outbound/delivery 命名清理和文档同步后验证通过：
 
 ```powershell
 cargo fmt --all --check
-cargo check --workspace
+cargo check --workspace --all-targets
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-测试结果：agent `251 passed / 4 ignored`，core `10 passed`，protocol `11 passed`，server `0 tests`；`cargo check --workspace` 无 warning。
+测试结果：agent `260 passed / 4 ignored`，core `10 passed`，protocol `11 passed`，server `0 tests`，doc-tests `0 tests`；`cargo check --workspace --all-targets` 无 warning，严格 clippy 无 warning。提交前还执行了旧字段残留扫描和 `git diff --check`，仅有 Windows LF/CRLF 提示。
 
 ## 下一步建议
 

@@ -6,8 +6,8 @@ mod agent;
 mod disk;
 mod export;
 mod group;
-mod job;
 mod network;
+mod outbound;
 mod process;
 mod public_ip;
 mod remote;
@@ -25,9 +25,12 @@ pub(crate) use export::{
 #[allow(unused_imports)]
 pub(crate) use group::GroupConfigPatch;
 #[allow(unused_imports)]
-pub(crate) use job::{JobConfig, JobConfigPatch, JobsConfig, JobsConfigPatch};
-#[allow(unused_imports)]
 pub(crate) use network::{NetworkConfig, NetworkConfigPatch};
+#[allow(unused_imports)]
+pub(crate) use outbound::{
+    BasicInfoOutputConfig, BasicInfoOutputConfigPatch, OutboundConfig, OutboundConfigPatch,
+    RealtimeReportOutputConfig, RealtimeReportOutputConfigPatch,
+};
 #[allow(unused_imports)]
 pub(crate) use process::{ProcessConfig, ProcessConfigPatch};
 #[allow(unused_imports)]
@@ -38,7 +41,7 @@ pub(crate) use remote::{
     RemoteTaskConfig, RemoteTaskConfigPatch,
 };
 #[allow(unused_imports)]
-pub(crate) use report::ReportConfigPatch;
+pub(crate) use report::{ReportConfig, ReportConfigPatch};
 #[allow(unused_imports)]
 pub(crate) use socket::{SocketConfig, SocketConfigPatch};
 
@@ -61,9 +64,9 @@ mod tests {
                 "sockets": { "interval": "60s", "level": "details", "limit": 100 },
                 "public_ip": { "refresh_interval": "12h" },
                 "report": { "interval": "5s" },
-                "jobs": {
-                    "realtime_report": { "interval": "5s" },
-                    "basic_info": { "interval": "5m" }
+                "outbound": {
+                    "realtime_report": { "enabled": true, "send_on_start": false },
+                    "basic_info": { "refresh_interval": "5m" }
                 },
                 "remote_shell": {
                     "max_sessions": 2,
@@ -81,6 +84,7 @@ mod tests {
                 "export": {
                     "format": "smalux_json",
                     "reconnect_interval": "15s",
+                    "base_url": "https://example.com",
                     "query": { "agent_id": "agent-1" }
                 }
             }"#,
@@ -112,18 +116,17 @@ mod tests {
             Some(Duration::from_secs(12 * 60 * 60))
         );
         assert_eq!(patch.report.unwrap().interval, Some(Duration::from_secs(5)));
+        let realtime_report = patch.outbound.as_ref().unwrap().realtime_report.unwrap();
+        assert_eq!(realtime_report.enabled, Some(true));
+        assert_eq!(realtime_report.send_on_start, Some(false));
         assert_eq!(
             patch
-                .jobs
+                .outbound
                 .as_ref()
                 .unwrap()
-                .realtime_report
+                .basic_info
                 .unwrap()
-                .interval,
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(
-            patch.jobs.as_ref().unwrap().basic_info.unwrap().interval,
+                .refresh_interval,
             Some(Duration::from_secs(5 * 60))
         );
         let remote_shell = patch.remote_shell.unwrap();
@@ -158,6 +161,10 @@ mod tests {
             Some(ExportFormat::SmaluxJson)
         );
         assert_eq!(
+            patch.export.as_ref().unwrap().base_url.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
             patch
                 .export
                 .unwrap()
@@ -169,26 +176,35 @@ mod tests {
         );
     }
 
-    /// 验证 server patch 中的日志字段不会修改启动期日志配置。
+    /// 验证 server patch 拒绝启动期日志字段，避免无效字段被静默忽略。
     #[test]
-    fn config_patch_ignores_startup_only_log_fields() {
-        let patch: AgentConfigPatch = serde_json::from_str(
+    fn config_patch_rejects_startup_only_log_fields() {
+        let error = serde_json::from_str::<AgentConfigPatch>(
             r#"{
                 "log_file": "logs/server.log",
                 "log_retention_files": 1,
                 "log_max_size_mb": 1
             }"#,
         )
-        .unwrap();
-        let mut config = AgentConfig::default();
-        let log_file = config.log_file.clone();
-        let log_retention_files = config.log_retention_files;
-        let log_max_size_mb = config.log_max_size_mb;
+        .unwrap_err();
 
-        patch.apply_to(&mut config);
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("log_file"));
+    }
 
-        assert_eq!(config.log_file, log_file);
-        assert_eq!(config.log_retention_files, log_retention_files);
-        assert_eq!(config.log_max_size_mb, log_max_size_mb);
+    /// 验证 realtime report 没有 refresh_interval 字段，server 下发时会直接拒绝。
+    #[test]
+    fn config_patch_rejects_unknown_realtime_report_field() {
+        let error = serde_json::from_str::<AgentConfigPatch>(
+            r#"{
+                "outbound": {
+                    "realtime_report": { "refresh_interval": "5s" }
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("refresh_interval"));
     }
 }

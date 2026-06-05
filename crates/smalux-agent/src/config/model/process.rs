@@ -37,6 +37,7 @@ impl ProcessConfig {
 
 /// 进程采集配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProcessConfigPatch {
     /// 是否启用进程采样。
     pub enabled: Option<bool>,

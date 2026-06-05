@@ -1,8 +1,8 @@
 //! 导出连接配置模型。
 
 use super::super::defaults::{
-    DEFAULT_EXPORT_HEARTBEAT, DEFAULT_EXPORT_RECONNECT_INTERVAL, DEFAULT_QUERY_TOKEN_PARAM,
-    DEFAULT_SERVER_URL,
+    DEFAULT_BASE_URL, DEFAULT_EXPORT_HEARTBEAT, DEFAULT_EXPORT_RECONNECT_INTERVAL,
+    DEFAULT_QUERY_TOKEN_PARAM,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -84,8 +84,8 @@ impl Default for ExportAuthMode {
 /// 导出连接配置。
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ExportConfig {
-    /// server 导出地址。
-    pub server_url: String,
+    /// server 根地址；具体 endpoint 由导出格式 adapter 派生。
+    pub base_url: String,
     /// 导出数据编码格式。
     pub format: ExportFormat,
     /// Smalux 自有协议 wire 模式；Komari 不使用该字段。
@@ -115,7 +115,7 @@ impl Default for ExportConfig {
     /// 默认导出配置支持本地开发无参数启动。
     fn default() -> Self {
         Self {
-            server_url: DEFAULT_SERVER_URL.to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
             format: ExportFormat::default(),
             wire_mode: ExportWireMode::default(),
             secure_required: false,
@@ -132,9 +132,10 @@ impl Default for ExportConfig {
 
 /// 导出连接配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExportConfigPatch {
-    /// server 导出地址。
-    pub server_url: Option<String>,
+    /// server 根地址。
+    pub base_url: Option<String>,
     /// 导出数据编码格式。
     pub format: Option<ExportFormat>,
     /// Smalux 自有协议 wire 模式。
@@ -149,8 +150,6 @@ pub(crate) struct ExportConfigPatch {
     pub query_token_param: Option<String>,
     /// 额外 query 参数；下发后整体替换当前额外 query 集合。
     pub query: Option<BTreeMap<String, String>>,
-    /// 是否跳过 TLS 证书校验。
-    pub unsafe_cert: Option<bool>,
     /// WebSocket 心跳间隔。
     #[serde(default, with = "humantime_serde")]
     pub heartbeat: Option<Duration>,
@@ -162,8 +161,8 @@ pub(crate) struct ExportConfigPatch {
 impl ExportConfigPatch {
     /// 应用导出配置 patch。
     pub(crate) fn apply_to(&self, config: &mut ExportConfig) {
-        if let Some(server_url) = self.server_url.clone() {
-            config.server_url = server_url;
+        if let Some(base_url) = self.base_url.clone() {
+            config.base_url = base_url;
         }
         if let Some(format) = self.format {
             config.format = format;
@@ -185,9 +184,6 @@ impl ExportConfigPatch {
         }
         if let Some(query) = self.query.clone() {
             config.query = query;
-        }
-        if let Some(unsafe_cert) = self.unsafe_cert {
-            config.unsafe_cert = unsafe_cert;
         }
         if let Some(heartbeat) = self.heartbeat {
             config.heartbeat = heartbeat;

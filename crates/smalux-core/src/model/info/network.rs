@@ -108,7 +108,7 @@ impl Network {
             if ip.ip.is_loopback() || ip.ip.is_unspecified() {
                 continue;
             }
-            ips.push(ip.ip.clone());
+            ips.push(ip.ip);
         }
         ips
     }

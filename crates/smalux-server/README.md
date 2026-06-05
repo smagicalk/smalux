@@ -48,7 +48,7 @@ src/
 建议首版使用 WebSocket：
 
 ```text
-GET /ws
+GET /api/agents/connect
   -> WebSocket upgrade
   -> 按 wire mode 做连接级识别；binary_plain 可用 query/bearer，secure_psk 不使用明文 token
   -> 接收 smalux binary wire frame；开发兼容模式可接收 text frame
@@ -72,7 +72,7 @@ gRPC adapter      ┘
 server 第一版按下面流程写，能覆盖 agent 当前自有协议闭环：
 
 ```text
-agent connects /ws
+agent connects /api/agents/connect
   -> server 按 wire mode 选择连接识别方式
      -> binary_plain: 可按 query token / bearer token / none 识别
      -> secure_psk: 先只接收 Hello，Noise 握手成功后才算认证通过
@@ -336,7 +336,7 @@ server 通过同一条 Smalux WebSocket 控制通道下发 JSON。当前有两�
 - `remote_task_run`：执行一次非交互命令，前提是 agent 启动时显式开启。
 - `remote_probe_run`：执行一次 TCP/HTTP 探测；默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
 
-server 如果要远程打开 `processes.level=details` 或 `sockets.level=details`，agent 必须启动时带对应 CLI-only 授权：`--allow-process-details true` 或 `--allow-socket-details true`。一次性 details 采集同样受这个限制。
+server 如果要远程打开 `processes.level=details` 或 `sockets.level=details`，agent 必须启动时带对应 CLI-only 授权：`--allow-process-level details` 或 `--allow-socket-level details`。一次性 details 采集同样受这个限制。
 
 控制消息发送规则：
 
@@ -369,8 +369,9 @@ server 如果要远程打开 `processes.level=details` 或 `sockets.level=detail
     "core": { "interval": "2s" },
     "network": { "interval": "10s" },
     "report": { "interval": "10s" },
-    "jobs": {
-      "realtime_report": { "interval": "10s" }
+    "outbound": {
+      "realtime_report": { "send_on_start": true },
+      "basic_info": { "refresh_interval": "5m" }
     }
   }
 }
@@ -473,7 +474,7 @@ server 需要把三类数据分开处理：
 - server 日志不要打印完整 token、secure secret、PSK、Authorization header、带 token 的 URL。
 - `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
 - raw `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
-- server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-details` 或 `--allow-socket-details`。
+- server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-level details` 或 `--allow-socket-level details`。
 - 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_run` 和未来的 remote task。
 
 ### 测试清单
@@ -623,7 +624,7 @@ GET /agents/{agent_id}
 
 | 端点 | 方法 | 作用 | 首版是否需要 |
 | --- | --- | --- | --- |
-| `/ws` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
+| `/api/agents/connect` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
 | `/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
 | `/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
 | `/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_run` | 可后做 |
@@ -633,7 +634,7 @@ GET /agents/{agent_id}
 
 端点职责建议：
 
-- `/ws` 不直接做复杂查询，只负责连接、解包、分发和发送控制消息。
+- `/api/agents/connect` 不直接做复杂查询，只负责连接、解包、分发和发送控制消息。
 - 查询端点只读 storage，不直接访问 WebSocket sink。
 - 创建控制命令时先写 `pending_commands`，再投递到当前在线连接；如果 agent 离线，按命令类型决定是拒绝、排队还是只保存 desired config。
 - `config_patch` 更像 desired config，不建议作为普通一次性命令长期排队；agent 重连后 server 可以比较 desired config 和当前 effective 状态后再下发。
@@ -689,7 +690,7 @@ handle_client_json(connection, json_bytes):
 1. 在 `storage.rs` 定义 latest-only 存储 trait 和内存实现。
 2. 在 `ingest.rs` 实现 `validate_report()` 和 `handle_report()`。
 3. 在 `ingest.rs` 实现 `apply_snapshot()` / `apply_delta()` / `apply_heartbeat()`。
-4. 在 `http.rs` 增加 `/ws` WebSocket handler。
+4. 在 `http.rs` 增加 `/api/agents/connect` WebSocket handler。
 5. 实现 `binary_plain` wire 解包和 `ClientFrame` 分发。
 6. 增加本地测试：合法 report 写入成功、schema 不匹配失败、同 agent 覆盖旧快照、delta base 不匹配会请求 snapshot。
 7. 再补 `GET /agents` 和 `GET /agents/{agent_id}` 查询接口。

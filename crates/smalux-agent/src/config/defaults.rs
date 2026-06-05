@@ -18,18 +18,16 @@ pub(crate) const DEFAULT_SOCKETS_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const DEFAULT_SOCKETS_LIMIT: usize = 200;
 /// 默认上报间隔。
 pub(crate) const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(5);
-/// 默认实时上报导出 job 间隔。
-pub(crate) const DEFAULT_REALTIME_REPORT_JOB_INTERVAL: Duration = DEFAULT_REPORT_INTERVAL;
-/// 默认 Komari basic info 导出 job 间隔。
-pub(crate) const DEFAULT_BASIC_INFO_JOB_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// 默认 basic info 刷新事件生成间隔。
+pub(crate) const DEFAULT_BASIC_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// 默认业务心跳间隔；仅在 report.heartbeat_enabled=true 时生效。
 pub(crate) const DEFAULT_REPORT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// 默认完整快照刷新间隔；仅在 report.delta_enabled=true 时生效。
 pub(crate) const DEFAULT_REPORT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// 默认 server 强制 snapshot 最小间隔，避免控制消息刷爆完整上报。
 pub(crate) const DEFAULT_REPORT_FORCE_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(10);
-/// 公网 IP 单轮启动探测超时。
-pub(crate) const DEFAULT_PUBLIC_IP_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// 公网 IP 单轮外部探测超时。
+pub(crate) const DEFAULT_PUBLIC_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// 公网 IP 失败重试间隔。
 pub(crate) const DEFAULT_PUBLIC_IP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// 公网 IP 成功后的低频刷新间隔。
@@ -40,8 +38,8 @@ pub(crate) const DEFAULT_PUBLIC_IP_MAX_CONCURRENCY: usize = 2;
 pub(crate) const DEFAULT_EXPORT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// WebSocket 断线或连接失败后的默认重连间隔。
 pub(crate) const DEFAULT_EXPORT_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
-/// 默认 WebSocket server 地址，便于本地开发无参数启动。
-pub(crate) const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:9000/ws";
+/// 默认 server 根地址，adapter 会根据导出格式派生具体 endpoint。
+pub(crate) const DEFAULT_BASE_URL: &str = "http://127.0.0.1:9000";
 /// 默认 token query 参数名。
 pub(crate) const DEFAULT_QUERY_TOKEN_PARAM: &str = "token";
 /// 默认日志文件前缀；滚动策略会按日期和序号生成实际文件。

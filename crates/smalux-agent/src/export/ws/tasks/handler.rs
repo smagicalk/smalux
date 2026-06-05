@@ -38,11 +38,13 @@ pub(super) async fn handle_incoming_message(
                 ExportInboundMessage::Text(msg_bytes.to_string()),
                 "text",
                 msg_bytes.len(),
-                write,
-                listener_lock,
-                listener_tx,
-                close_requested,
-                close_timeout.as_mut(),
+                IncomingDataContext {
+                    write,
+                    listener_lock,
+                    listener_tx,
+                    close_requested,
+                    close_timeout: close_timeout.as_mut(),
+                },
             )
             .await
         }
@@ -51,27 +53,32 @@ pub(super) async fn handle_incoming_message(
             // binary frame 始终先按 Smalux wire 解包；payload 才是后续解析
             // ServerFrame 或 raw control JSON 的 UTF-8 JSON bytes。
             match decode_binary_payload(bytes.as_ref(), wire_state) {
-                Ok((packet, payload)) => handle_data_message(
-                    ExportInboundMessage::Binary(payload),
-                    "binary",
-                    len,
-                    write,
-                    listener_lock,
-                    listener_tx,
-                    close_requested,
-                    close_timeout.as_mut(),
-                )
-                .await
-                .then(|| {
-                    tracing::debug!(
-                        packet_kind = packet.kind.as_str(),
-                        sequence = packet.sequence,
-                        payload_bytes = packet.payload.len(),
-                        "websocket binary wire packet received"
-                    );
-                    true
-                })
-                .unwrap_or(false),
+                Ok((packet, payload)) => {
+                    let handled = handle_data_message(
+                        ExportInboundMessage::Binary(payload),
+                        "binary",
+                        len,
+                        IncomingDataContext {
+                            write,
+                            listener_lock,
+                            listener_tx,
+                            close_requested,
+                            close_timeout: close_timeout.as_mut(),
+                        },
+                    )
+                    .await;
+
+                    if handled {
+                        tracing::debug!(
+                            packet_kind = packet.kind.as_str(),
+                            sequence = packet.sequence,
+                            payload_bytes = packet.payload.len(),
+                            "websocket binary wire packet received"
+                        );
+                    }
+
+                    handled
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "websocket binary packet decode failed");
                     false
@@ -238,19 +245,29 @@ fn decode_binary_payload(
     Ok((packet, payload))
 }
 
+/// 单条入站数据消息处理所需的读循环上下文。
+struct IncomingDataContext<'a> {
+    /// WebSocket 写半边，用于队列满或关闭时主动发送 close frame。
+    write: &'a mut WebSocketWriter,
+    /// 当前业务 listener 快照来源。
+    listener_lock: &'a Arc<RwLock<Option<Arc<dyn ExportMessageListener>>>>,
+    /// listener 串行执行队列。
+    listener_tx: &'a mpsc::Sender<InboundMessageEvent>,
+    /// 当前连接是否已经进入关闭握手。
+    close_requested: &'a mut bool,
+    /// 关闭握手超时计时器。
+    close_timeout: std::pin::Pin<&'a mut tokio::time::Sleep>,
+}
+
 /// 处理服务端数据消息。
 async fn handle_data_message(
     payload: ExportInboundMessage,
     message_kind: &'static str,
     bytes: usize,
-    write: &mut WebSocketWriter,
-    listener_lock: &Arc<RwLock<Option<Arc<dyn ExportMessageListener>>>>,
-    listener_tx: &mpsc::Sender<InboundMessageEvent>,
-    close_requested: &mut bool,
-    mut close_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
+    mut ctx: IncomingDataContext<'_>,
 ) -> bool {
     tracing::debug!(bytes, message_kind, "websocket data message received");
-    if *close_requested {
+    if *ctx.close_requested {
         tracing::debug!(
             bytes,
             message_kind,
@@ -260,7 +277,7 @@ async fn handle_data_message(
     }
 
     // 只在锁内克隆当前 listener 快照，业务回调不持有锁。
-    let listener = listener_lock.read().await.clone();
+    let listener = ctx.listener_lock.read().await.clone();
     let Some(listener) = listener else {
         tracing::warn!(
             bytes,
@@ -274,22 +291,22 @@ async fn handle_data_message(
 
     // listener 回调放进独立有界队列串行执行。WebSocket 读循环只负责收包和解包；
     // 如果业务处理变慢，背压会在这里显式表现为队列满，而不是无界占用内存。
-    match listener_tx.try_send(event) {
+    match ctx.listener_tx.try_send(event) {
         Ok(()) => true,
         Err(TrySendError::Full(_event)) => {
             tracing::warn!(
                 queue_capacity = LISTENER_QUEUE_CAPACITY,
                 "listener queue full; closing websocket"
             );
-            if let Err(e) = write.send(tungstenite::Message::Close(None)).await {
+            if let Err(e) = ctx.write.send(tungstenite::Message::Close(None)).await {
                 tracing::debug!(
                     error = %e,
                     "failed to send close frame after listener queue full"
                 );
                 return false;
             }
-            *close_requested = true;
-            close_timeout
+            *ctx.close_requested = true;
+            ctx.close_timeout
                 .as_mut()
                 .reset(Instant::now() + CLOSE_HANDSHAKE_TIMEOUT);
             true

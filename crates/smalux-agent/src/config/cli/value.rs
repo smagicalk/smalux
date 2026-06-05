@@ -1,6 +1,7 @@
 //! CLI 枚举值和运行时配置枚举的转换。
 
 use super::super::model::{ExportAuthMode, ExportFormat, ExportWireMode};
+use crate::service::RemoteMetricPermission;
 use clap::builder::PossibleValue;
 use smalux_core::model::info::MetricLevel;
 
@@ -106,6 +107,48 @@ impl From<CliMetricLevel> for MetricLevel {
             CliMetricLevel::Count => Self::Count,
             CliMetricLevel::Light => Self::Light,
             CliMetricLevel::Details => Self::Details,
+        }
+    }
+}
+
+/// CLI 远程采样权限等级。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CliRemoteMetricPermission {
+    /// 禁止 server 远程触发该类采样。
+    None,
+    /// 只允许 count。
+    Count,
+    /// 允许 count/light。
+    Light,
+    /// 允许 count/light/details。
+    Details,
+}
+
+impl clap::ValueEnum for CliRemoteMetricPermission {
+    /// 当前可用的远程采样权限。
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::None, Self::Count, Self::Light, Self::Details]
+    }
+
+    /// 使用短小稳定的 snake_case 名称。
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        match self {
+            Self::None => Some(PossibleValue::new("none")),
+            Self::Count => Some(PossibleValue::new("count")),
+            Self::Light => Some(PossibleValue::new("light")),
+            Self::Details => Some(PossibleValue::new("details")),
+        }
+    }
+}
+
+impl From<CliRemoteMetricPermission> for RemoteMetricPermission {
+    /// 转换为运行时远程采样权限。
+    fn from(value: CliRemoteMetricPermission) -> Self {
+        match value {
+            CliRemoteMetricPermission::None => Self::None,
+            CliRemoteMetricPermission::Count => Self::Count,
+            CliRemoteMetricPermission::Light => Self::Light,
+            CliRemoteMetricPermission::Details => Self::Details,
         }
     }
 }

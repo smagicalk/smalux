@@ -1,14 +1,22 @@
 //! Service 内部上报构建。
 
 use crate::config::AgentConfig;
-use crate::service::outbound::{OutboundEvent, OutboundSender, OutboundSequence, ReportEnvelope};
+use crate::config::model::ExportFormat;
+use crate::service::outbound::{
+    BasicInfoEnvelope, OutboundEvent, OutboundSender, OutboundSequence, ReportEnvelope,
+};
 #[cfg(test)]
 use crate::telemetry::ReportEvent;
-use crate::telemetry::{TelemetryAggregator, TelemetryState};
+#[cfg(test)]
+use crate::telemetry::TelemetryUpdate;
+use crate::telemetry::{LatestTelemetry, TelemetryAggregator};
 use smalux_protocol::OutboundReport;
-use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
+
+use super::message::TelemetryUpdateReceiver;
+#[cfg(test)]
+use super::message::telemetry_update_channel;
 
 /// reporter 控制命令队列容量。
 const REPORTER_COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -40,7 +48,7 @@ pub(crate) enum ReporterCommand {
 /// 测试和单次构建使用的辅助函数，默认序号为 0；循环发送时会使用真实递增序号。
 #[cfg(test)]
 pub(crate) fn reporter_tick_once(
-    state: &TelemetryState,
+    state: &LatestTelemetry,
     agent_version: &str,
 ) -> anyhow::Result<OutboundReport> {
     let mut aggregator = TelemetryAggregator::default();
@@ -52,27 +60,70 @@ pub(crate) fn reporter_tick_once(
         .ok_or_else(|| anyhow::anyhow!("No report event generated"))
 }
 
+/// reporter loop 的运行依赖。
+pub(crate) struct ReporterLoopParts {
+    /// reporter 持有的最新遥测状态。
+    pub(crate) state: LatestTelemetry,
+    /// agent 版本号，写入每份 report metadata。
+    pub(crate) agent_version: &'static str,
+    /// 动态配置订阅。
+    pub(crate) config_rx: watch::Receiver<AgentConfig>,
+    /// 服务关闭信号。
+    pub(crate) shutdown: watch::Receiver<bool>,
+    /// 出站事件队列。
+    pub(crate) outbound_tx: OutboundSender,
+    /// 全局出站序号。
+    pub(crate) sequence: OutboundSequence,
+    /// 采集更新队列。
+    pub(crate) telemetry_updates: TelemetryUpdateReceiver,
+    /// reporter 控制命令队列。
+    pub(crate) reporter_commands: ReporterCommandReceiver,
+}
+
 /// 按配置频率构建 report，并放入导出队列。
-pub(crate) async fn reporter_loop(
-    state: Arc<RwLock<TelemetryState>>,
-    agent_version: &'static str,
-    mut config_rx: watch::Receiver<AgentConfig>,
-    mut shutdown: watch::Receiver<bool>,
-    outbound_tx: OutboundSender,
-    sequence: OutboundSequence,
-    mut reporter_commands: ReporterCommandReceiver,
-) {
+pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
+    let ReporterLoopParts {
+        mut state,
+        agent_version,
+        mut config_rx,
+        mut shutdown,
+        outbound_tx,
+        sequence,
+        mut telemetry_updates,
+        mut reporter_commands,
+    } = parts;
+
     let mut config = config_rx.borrow().clone();
+    state.configure_metric_groups(
+        config.core.enabled,
+        config.disk.enabled,
+        config.network.enabled,
+        config.processes.enabled,
+        config.sockets.enabled,
+    );
     let mut report_tick = interval(config.report.interval);
     report_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut basic_info_tick = delayed_interval(config.outbound.basic_info.refresh_interval);
     let mut force_snapshot_tick = interval(FORCE_SNAPSHOT_CHECK_INTERVAL);
     force_snapshot_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut config_rx_open = true;
+    let mut telemetry_updates_open = true;
     let mut reporter_commands_open = true;
     let mut aggregator = TelemetryAggregator::default();
     let mut force_snapshot_pending = false;
     let mut force_snapshot_reason = None;
     let mut last_forced_snapshot_at = None;
+    let mut basic_info_initial_sent = !basic_info_should_send_on_start(&config);
+    if !basic_info_initial_sent {
+        match queue_basic_info_if_ready(&state, agent_version, &outbound_tx, &sequence).await {
+            Ok(true) => basic_info_initial_sent = true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(error = ?err, "reporter loop stopping");
+                return;
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -110,6 +161,16 @@ pub(crate) async fn reporter_loop(
                     break;
                 }
             }
+            _ = basic_info_tick.tick(), if basic_info_enabled(&config) => {
+                match queue_basic_info_if_ready(&state, agent_version, &outbound_tx, &sequence).await {
+                    Ok(true) => basic_info_initial_sent = true,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "reporter loop stopping");
+                        break;
+                    }
+                }
+            }
             _ = force_snapshot_tick.tick(), if config.report.enabled && force_snapshot_pending => {
                 if !force_snapshot_due(last_forced_snapshot_at, config.report.force_snapshot_min_interval) {
                     continue;
@@ -128,6 +189,45 @@ pub(crate) async fn reporter_loop(
                         last_forced_snapshot_at = Some(Instant::now());
                     }
                     Err(err) => tracing::debug!(error = ?err, "forced agent snapshot not ready"),
+                }
+            }
+            update = telemetry_updates.recv(), if telemetry_updates_open => {
+                let Some(update) = update else {
+                    telemetry_updates_open = false;
+                    tracing::debug!("Telemetry update channel closed");
+                    continue;
+                };
+                let kind = update.kind();
+                state.apply_update(update);
+                tracing::debug!(kind, "Telemetry update applied");
+                if !config.report.enabled {
+                    continue;
+                }
+                if let Err(err) = queue_next_report(
+                    &state,
+                    agent_version,
+                    &config,
+                    &outbound_tx,
+                    &sequence,
+                    &mut aggregator,
+                ).await {
+                    tracing::warn!(error = ?err, "reporter loop stopping");
+                    break;
+                }
+                if !basic_info_initial_sent && basic_info_should_send_on_start(&config) {
+                    match queue_basic_info_if_ready(
+                        &state,
+                        agent_version,
+                        &outbound_tx,
+                        &sequence,
+                    ).await {
+                        Ok(true) => basic_info_initial_sent = true,
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(error = ?err, "reporter loop stopping");
+                            break;
+                        }
+                    }
                 }
             }
             command = reporter_commands.recv(), if reporter_commands_open => {
@@ -176,11 +276,47 @@ pub(crate) async fn reporter_loop(
                 }
 
                 let next = config_rx.borrow().clone();
+                let previous_basic_info = config.outbound.basic_info;
+                let previous_format = config.export.format;
                 if next.report.interval != config.report.interval {
                     report_tick = interval(next.report.interval);
                     report_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 }
+                if next.outbound.basic_info.refresh_interval
+                    != config.outbound.basic_info.refresh_interval
+                {
+                    basic_info_tick = delayed_interval(next.outbound.basic_info.refresh_interval);
+                }
                 config = next;
+                state.configure_metric_groups(
+                    config.core.enabled,
+                    config.disk.enabled,
+                    config.network.enabled,
+                    config.processes.enabled,
+                    config.sockets.enabled,
+                );
+                if previous_format != config.export.format
+                    || previous_basic_info.enabled != config.outbound.basic_info.enabled
+                    || previous_basic_info.send_on_start
+                        != config.outbound.basic_info.send_on_start
+                {
+                    basic_info_initial_sent = !basic_info_should_send_on_start(&config);
+                }
+                if !basic_info_initial_sent && basic_info_should_send_on_start(&config) {
+                    match queue_basic_info_if_ready(
+                        &state,
+                        agent_version,
+                        &outbound_tx,
+                        &sequence,
+                    ).await {
+                        Ok(true) => basic_info_initial_sent = true,
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(error = ?err, "reporter loop stopping");
+                            break;
+                        }
+                    }
+                }
                 tracing::info!("Reporter config updated");
             }
             changed = shutdown.changed() => {
@@ -193,6 +329,23 @@ pub(crate) async fn reporter_loop(
     }
 }
 
+/// 创建第一次触发延后到 interval 之后的 tick。
+fn delayed_interval(duration: std::time::Duration) -> tokio::time::Interval {
+    let mut tick = interval_at(Instant::now() + duration, duration);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick
+}
+
+/// 判断当前格式是否需要 reporter 产生 basic info 事件。
+fn basic_info_enabled(config: &AgentConfig) -> bool {
+    config.outbound.basic_info.enabled && config.export.format == ExportFormat::Komari
+}
+
+/// 判断是否需要在第一份 ready state 出现后立即发送 basic info。
+fn basic_info_should_send_on_start(config: &AgentConfig) -> bool {
+    basic_info_enabled(config) && config.outbound.basic_info.send_on_start
+}
+
 /// 判断强制 snapshot 是否已经超过最小间隔。
 fn force_snapshot_due(previous: Option<Instant>, min_interval: std::time::Duration) -> bool {
     previous
@@ -200,19 +353,40 @@ fn force_snapshot_due(previous: Option<Instant>, min_interval: std::time::Durati
         .unwrap_or(true)
 }
 
+/// 如果当前状态已经 ready，则构建并投递 basic info 事件。
+async fn queue_basic_info_if_ready(
+    state: &LatestTelemetry,
+    agent_version: &str,
+    outbound_tx: &OutboundSender,
+    sequence: &OutboundSequence,
+) -> anyhow::Result<bool> {
+    let report = match state.build_report(agent_version) {
+        Ok(report) => report,
+        Err(err) => {
+            tracing::debug!(error = ?err, "basic info report not ready");
+            return Ok(false);
+        }
+    };
+    let sequence = sequence.next();
+    let event = OutboundEvent::BasicInfo(Box::new(BasicInfoEnvelope::new(sequence, report)));
+    outbound_tx
+        .send(event)
+        .await
+        .map_err(|_| anyhow::anyhow!("outbound event queue is closed"))?;
+    tracing::debug!(sequence, "basic info queued");
+    Ok(true)
+}
+
 /// 构建并投递普通上报事件。
 async fn queue_next_report(
-    state: &Arc<RwLock<TelemetryState>>,
+    state: &LatestTelemetry,
     agent_version: &str,
     config: &AgentConfig,
     outbound_tx: &OutboundSender,
     sequence: &OutboundSequence,
     aggregator: &mut TelemetryAggregator,
 ) -> anyhow::Result<()> {
-    let event = {
-        let state = state.read().await;
-        aggregator.next_report_event(&state, agent_version, config, || sequence.next())
-    };
+    let event = aggregator.next_report_event(state, agent_version, config, || sequence.next());
 
     match event {
         Ok(Some(event)) => queue_report_event(outbound_tx, event.into_outbound()).await,
@@ -229,18 +403,16 @@ async fn queue_next_report(
 
 /// 构建并投递 server 请求的完整 snapshot。
 async fn queue_forced_snapshot(
-    state: &Arc<RwLock<TelemetryState>>,
+    state: &LatestTelemetry,
     agent_version: &str,
     outbound_tx: &OutboundSender,
     sequence: &OutboundSequence,
     aggregator: &mut TelemetryAggregator,
     reason: Option<&str>,
 ) -> anyhow::Result<()> {
-    let outbound = {
-        let state = state.read().await;
-        aggregator.force_snapshot_event(&state, agent_version, || sequence.next())?
-    }
-    .into_outbound();
+    let outbound = aggregator
+        .force_snapshot_event(state, agent_version, || sequence.next())?
+        .into_outbound();
     let sequence = outbound.sequence;
     queue_report_event(outbound_tx, outbound).await?;
     tracing::info!(sequence, reason, "Forced agent snapshot queued");
@@ -276,8 +448,8 @@ mod tests {
     use std::time::Duration;
 
     /// 构造已经满足上报条件的 telemetry 状态。
-    fn ready_state() -> TelemetryState {
-        let mut state = TelemetryState::default();
+    fn ready_state() -> LatestTelemetry {
+        let mut state = LatestTelemetry::default();
         state.set_identity(IdentityInfo {
             agent_id: "agent-test".to_string(),
             ..IdentityInfo::default()
@@ -314,24 +486,26 @@ mod tests {
     /// 验证 reporter loop 会把 ready state 组装为最新内部上报。
     #[tokio::test]
     async fn reporter_loop_updates_latest_report() {
-        let state = Arc::new(RwLock::new(ready_state()));
+        let state = ready_state();
         let mut config = AgentConfig::default();
         config.report.interval = Duration::from_millis(100);
         let (_config_tx, config_rx) = watch::channel(config);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, mut outbound_rx) = outbound_channel();
         let sequence = OutboundSequence::default();
+        let (_telemetry_tx, telemetry_rx) = telemetry_update_channel();
         let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
 
-        let task = tokio::spawn(reporter_loop(
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
             state,
-            "0.1.0-test",
+            agent_version: "0.1.0-test",
             config_rx,
-            shutdown_rx,
+            shutdown: shutdown_rx,
             outbound_tx,
             sequence,
-            reporter_command_rx,
-        ));
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
 
         let event = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
             .await
@@ -352,10 +526,185 @@ mod tests {
         assert_eq!(report.sequence, 1);
     }
 
+    /// 验证 Komari basic info 在启动 ready 时会立即进入出站队列。
+    #[tokio::test]
+    async fn reporter_loop_queues_komari_basic_info_on_start() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.export.format = ExportFormat::Komari;
+        config.report.interval = Duration::from_secs(60);
+        let (_config_tx, config_rx) = watch::channel(config);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outbound_tx, mut outbound_rx) = outbound_channel();
+        let sequence = OutboundSequence::default();
+        let (_telemetry_tx, telemetry_rx) = telemetry_update_channel();
+        let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
+
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
+            state,
+            agent_version: "0.1.0-test",
+            config_rx,
+            shutdown: shutdown_rx,
+            outbound_tx,
+            sequence,
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown_tx.send_replace(true);
+        task.await.unwrap();
+
+        let OutboundEvent::BasicInfo(info) = event else {
+            panic!("expected basic info event");
+        };
+        assert_eq!(info.sequence, 1);
+        assert_eq!(info.report.meta.agent_version, "0.1.0-test");
+        assert_eq!(info.report.identity.agent_id, "agent-test");
+    }
+
+    /// 验证 send_on_start=false 时 basic info 等待自己的 refresh_interval。
+    #[tokio::test]
+    async fn reporter_loop_queues_komari_basic_info_on_interval() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.export.format = ExportFormat::Komari;
+        config.report.enabled = false;
+        config.outbound.basic_info.send_on_start = false;
+        config.outbound.basic_info.refresh_interval = Duration::from_millis(50);
+        let (_config_tx, config_rx) = watch::channel(config);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outbound_tx, mut outbound_rx) = outbound_channel();
+        let sequence = OutboundSequence::default();
+        let (_telemetry_tx, telemetry_rx) = telemetry_update_channel();
+        let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
+
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
+            state,
+            agent_version: "0.1.0-test",
+            config_rx,
+            shutdown: shutdown_rx,
+            outbound_tx,
+            sequence,
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), outbound_rx.recv())
+                .await
+                .is_err()
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown_tx.send_replace(true);
+        task.await.unwrap();
+
+        assert!(matches!(event, OutboundEvent::BasicInfo(_)));
+    }
+
+    /// 验证关闭 basic info 出站事件后不会产生 basic info 事件。
+    #[tokio::test]
+    async fn reporter_loop_skips_disabled_basic_info() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.export.format = ExportFormat::Komari;
+        config.report.interval = Duration::from_secs(60);
+        config.outbound.basic_info.enabled = false;
+        let (_config_tx, config_rx) = watch::channel(config);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outbound_tx, mut outbound_rx) = outbound_channel();
+        let sequence = OutboundSequence::default();
+        let (_telemetry_tx, telemetry_rx) = telemetry_update_channel();
+        let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
+
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
+            state,
+            agent_version: "0.1.0-test",
+            config_rx,
+            shutdown: shutdown_rx,
+            outbound_tx,
+            sequence,
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown_tx.send_replace(true);
+        task.await.unwrap();
+
+        assert!(matches!(event, OutboundEvent::Report(_)));
+    }
+
+    /// 验证采集 update 会驱动 reporter 立即生成下一条上报。
+    #[tokio::test]
+    async fn reporter_loop_queues_report_when_metric_update_arrives() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.report.interval = Duration::from_secs(60);
+        config.report.delta_enabled = true;
+        let (_config_tx, config_rx) = watch::channel(config);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outbound_tx, mut outbound_rx) = outbound_channel();
+        let sequence = OutboundSequence::default();
+        let (telemetry_tx, telemetry_rx) = telemetry_update_channel();
+        let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
+
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
+            state,
+            agent_version: "0.1.0-test",
+            config_rx,
+            shutdown: shutdown_rx,
+            outbound_tx,
+            sequence,
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
+
+        let _initial = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        telemetry_tx
+            .send(TelemetryUpdate::Core(CoreSample {
+                sampled_at: 99,
+                value: CoreInfo::default(),
+            }))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown_tx.send_replace(true);
+        task.await.unwrap();
+
+        let OutboundEvent::Report(report) = event else {
+            panic!("expected report event");
+        };
+        match &report.outbound.kind {
+            smalux_protocol::OutboundReportKind::Delta { delta } => {
+                assert_eq!(
+                    delta.core.as_ref().unwrap().as_ref().unwrap().sampled_at,
+                    99
+                );
+            }
+            _ => panic!("expected delta report"),
+        }
+    }
+
     /// 验证 server 强制 snapshot 请求会绕过普通 tick 立即进入出站队列。
     #[tokio::test]
     async fn reporter_loop_queues_forced_snapshot() {
-        let state = Arc::new(RwLock::new(ready_state()));
+        let state = ready_state();
         let mut config = AgentConfig::default();
         config.report.interval = Duration::from_secs(60);
         config.report.force_snapshot_min_interval = Duration::from_millis(100);
@@ -363,17 +712,19 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, mut outbound_rx) = outbound_channel();
         let sequence = OutboundSequence::default();
+        let (_telemetry_tx, telemetry_rx) = telemetry_update_channel();
         let (reporter_command_tx, reporter_command_rx) = reporter_command_channel();
 
-        let task = tokio::spawn(reporter_loop(
+        let task = tokio::spawn(reporter_loop(ReporterLoopParts {
             state,
-            "0.1.0-test",
+            agent_version: "0.1.0-test",
             config_rx,
-            shutdown_rx,
+            shutdown: shutdown_rx,
             outbound_tx,
             sequence,
-            reporter_command_rx,
-        ));
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
 
         let _first = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
             .await

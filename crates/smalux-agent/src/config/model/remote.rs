@@ -86,6 +86,7 @@ impl RemoteShellConfig {
 
 /// 远程交互式 shell 配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteShellConfigPatch {
     /// 最大并发 shell 会话数。
     pub max_sessions: Option<usize>,
@@ -166,6 +167,7 @@ impl RemoteTaskConfig {
 
 /// 远程非交互任务配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteTaskConfigPatch {
     /// 最大并发任务数。
     pub max_concurrent: Option<usize>,
@@ -250,6 +252,7 @@ impl RemoteProbeConfig {
 
 /// 远程网络探测配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteProbeConfigPatch {
     /// 是否启用远程探测。
     pub enabled: Option<bool>,

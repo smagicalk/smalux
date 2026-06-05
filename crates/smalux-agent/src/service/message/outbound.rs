@@ -4,6 +4,7 @@
 //! 根据当前导出格式编码和投递到具体 transport。
 
 use crate::collect::unix_timestamp_secs;
+use smalux_core::model::info::AgentReport;
 use smalux_protocol::{Ack, OutboundReport, ProtocolError, RemoteProbeResult, RemoteTaskResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,6 +57,28 @@ impl ReportEnvelope {
             sequence: outbound.sequence,
             created_at: outbound.created_at,
             outbound,
+        }
+    }
+}
+
+/// 待导出的低频基础信息。
+#[derive(Debug, Clone)]
+pub(crate) struct BasicInfoEnvelope {
+    /// 出站 frame 序号。
+    pub(crate) sequence: u64,
+    /// basic info 构建时间，Unix 时间戳，单位秒。
+    pub(crate) created_at: u64,
+    /// 完整 agent report，用于兼容协议抽取基础信息。
+    pub(crate) report: AgentReport,
+}
+
+impl BasicInfoEnvelope {
+    /// 创建 basic info envelope。
+    pub(crate) fn new(sequence: u64, report: AgentReport) -> Self {
+        Self {
+            sequence,
+            created_at: unix_timestamp_secs(),
+            report,
         }
     }
 }
@@ -165,6 +188,8 @@ impl ControlErrorEnvelope {
 pub(crate) enum OutboundEvent {
     /// 监控上报事件。
     Report(ReportEnvelope),
+    /// 低频基础信息事件。
+    BasicInfo(Box<BasicInfoEnvelope>),
     /// 控制命令确认。
     ControlAck(ControlAckEnvelope),
     /// 控制命令错误。
@@ -180,6 +205,7 @@ impl OutboundEvent {
     pub(crate) fn sequence(&self) -> u64 {
         match self {
             Self::Report(report) => report.sequence,
+            Self::BasicInfo(info) => info.sequence,
             Self::ControlAck(ack) => ack.sequence,
             Self::ControlError(error) => error.sequence,
             Self::RemoteTaskResult(result) => result.sequence,
@@ -191,6 +217,7 @@ impl OutboundEvent {
     pub(crate) fn created_at(&self) -> u64 {
         match self {
             Self::Report(report) => report.created_at,
+            Self::BasicInfo(info) => info.created_at,
             Self::ControlAck(ack) => ack.created_at,
             Self::ControlError(error) => error.created_at,
             Self::RemoteTaskResult(result) => result.created_at,
@@ -202,6 +229,7 @@ impl OutboundEvent {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Report(_report) => "report",
+            Self::BasicInfo(_info) => "basic_info",
             Self::ControlAck(_ack) => "control_ack",
             Self::ControlError(_error) => "control_error",
             Self::RemoteTaskResult(_result) => "remote_task_result",

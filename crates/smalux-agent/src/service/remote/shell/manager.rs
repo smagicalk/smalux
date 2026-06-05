@@ -380,9 +380,7 @@ fn shell_stream_config(
     export_config: &ExportConfig,
     stream_url: &str,
 ) -> anyhow::Result<WebSocketConfig> {
-    let mut stream_export = export_config.clone();
-    stream_export.server_url = stream_url.to_string();
-    WebSocketConfig::try_from(&stream_export)
+    WebSocketConfig::from_export_endpoint(export_config, stream_url.to_string())
 }
 
 /// 启动本地 PTY shell。
@@ -651,10 +649,12 @@ mod tests {
     /// 验证 stream 配置会复用主导出认证和 TLS 选项。
     #[test]
     fn shell_stream_config_reuses_export_options() {
-        let mut export = ExportConfig::default();
-        export.server_url = "ws://127.0.0.1/main".to_string();
-        export.unsafe_cert = true;
-        export.heartbeat = Duration::from_secs(9);
+        let export = ExportConfig {
+            base_url: "http://127.0.0.1".to_string(),
+            unsafe_cert: true,
+            heartbeat: Duration::from_secs(9),
+            ..ExportConfig::default()
+        };
 
         let config = shell_stream_config(&export, "ws://127.0.0.1/shell").unwrap();
 
@@ -751,8 +751,10 @@ mod tests {
 
         let manager = RemoteShellManager::new(RemoteShellOptions { enabled: true });
 
-        let mut export = ExportConfig::default();
-        export.format = ExportFormat::Komari;
+        let export = ExportConfig {
+            format: ExportFormat::Komari,
+            ..ExportConfig::default()
+        };
 
         manager
             .open(

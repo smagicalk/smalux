@@ -1,7 +1,8 @@
 //! Service 运行参数和运行状态。
 
 use super::{shell::RemoteShellOptions, task::RemoteTaskOptions};
-use crate::telemetry::TelemetryState;
+use crate::telemetry::LatestTelemetry;
+use smalux_core::model::info::MetricLevel;
 
 /// Agent 运行入口参数。
 #[derive(Debug, Clone)]
@@ -38,15 +39,83 @@ impl ServiceOptions {
     }
 }
 
+/// 远程采样权限等级。
+///
+/// 权限等级只限制 server 远程触发或调整采样级别，不影响 agent 启动时本地配置的采样级别。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RemoteMetricPermission {
+    /// server 不能远程触发该类采样。
+    None,
+    /// server 只能触发 count 级别。
+    Count,
+    /// server 可以触发 count/light 级别。
+    Light,
+    /// server 可以触发 count/light/details 级别。
+    Details,
+}
+
+impl Default for RemoteMetricPermission {
+    /// 默认允许低成本 count 级别，避免 server 无法获取基础汇总。
+    fn default() -> Self {
+        Self::Count
+    }
+}
+
+impl RemoteMetricPermission {
+    /// 判断当前权限是否允许指定采样级别。
+    pub(crate) fn allows(self, level: MetricLevel) -> bool {
+        self.rank() >= Self::rank_for_metric_level(level)
+    }
+
+    /// 权限名称，用于错误信息和日志。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Count => "count",
+            Self::Light => "light",
+            Self::Details => "details",
+        }
+    }
+
+    /// 权限排序值。
+    fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Count => 1,
+            Self::Light => 2,
+            Self::Details => 3,
+        }
+    }
+
+    /// 采样级别对应的最低权限排序值。
+    fn rank_for_metric_level(level: MetricLevel) -> u8 {
+        match level {
+            MetricLevel::Count => 1,
+            MetricLevel::Light => 2,
+            MetricLevel::Details => 3,
+        }
+    }
+}
+
 /// 远程诊断采集静态权限。
 ///
-/// 这些开关只能由启动参数设置，避免 server 在运行时直接打开高成本明细采集。
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// 这些权限只能由启动参数设置，避免 server 在运行时直接扩大采样范围。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DiagnosticOptions {
-    /// 是否允许 server 触发进程 details 采集。
-    pub allow_process_details: bool,
-    /// 是否允许 server 触发 Socket details 采集。
-    pub allow_socket_details: bool,
+    /// server 允许触发的最高进程采样级别。
+    pub process_permission: RemoteMetricPermission,
+    /// server 允许触发的最高 Socket 采样级别。
+    pub socket_permission: RemoteMetricPermission,
+}
+
+impl Default for DiagnosticOptions {
+    /// 默认允许远程 count，light/details 需要显式启动参数授权。
+    fn default() -> Self {
+        Self {
+            process_permission: RemoteMetricPermission::Count,
+            socket_permission: RemoteMetricPermission::Count,
+        }
+    }
 }
 
 impl DiagnosticOptions {
@@ -60,7 +129,7 @@ impl DiagnosticOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceState {
     /// 最新采样缓存。
-    pub store: TelemetryState,
+    pub latest_telemetry: LatestTelemetry,
     /// 是否允许发送第一包上报。
     pub first_report_ready: bool,
 }

@@ -6,7 +6,7 @@ use super::{
     EncodedExportMessage, ExportMessageListener, ExportProtocol, ExportTransport,
     ExportTransportClient, TransportId, TransportRequest,
 };
-use crate::export::ExportJobId;
+use crate::export::ExportDeliveryId;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -32,8 +32,8 @@ pub(crate) enum TransportEvent {
     Sent {
         /// transport ID。
         transport: TransportId,
-        /// job ID。
-        job: ExportJobId,
+        /// delivery ID。
+        delivery: ExportDeliveryId,
         /// 上报序号。
         sequence: u64,
     },
@@ -41,8 +41,8 @@ pub(crate) enum TransportEvent {
     Failed {
         /// transport ID。
         transport: TransportId,
-        /// job ID。
-        job: ExportJobId,
+        /// delivery ID。
+        delivery: ExportDeliveryId,
         /// 上报序号。
         sequence: u64,
         /// 错误文本。
@@ -66,8 +66,8 @@ enum TransportWorkerCommand {
     },
     /// 发送单条请求。
     Send {
-        /// job ID。
-        job: ExportJobId,
+        /// delivery ID。
+        delivery: ExportDeliveryId,
         /// 上报序号。
         sequence: u64,
         /// transport 请求。
@@ -155,13 +155,13 @@ impl TransportWorkerHandle {
     /// 投递发送请求；这里不等待真实发送结果，结果由 `TransportEvent` 回传。
     pub(crate) fn send(
         &self,
-        job: ExportJobId,
+        delivery: ExportDeliveryId,
         sequence: u64,
         request: TransportRequest,
     ) -> anyhow::Result<()> {
         self.commands
             .try_send(TransportWorkerCommand::Send {
-                job,
+                delivery,
                 sequence,
                 request,
             })
@@ -226,7 +226,7 @@ async fn transport_worker_loop(
                 let _ = result_tx.send(result);
             }
             TransportWorkerCommand::Send {
-                job,
+                delivery,
                 sequence,
                 request,
             } => {
@@ -234,12 +234,12 @@ async fn transport_worker_loop(
                 let event = match result {
                     Ok(()) => TransportEvent::Sent {
                         transport: id,
-                        job,
+                        delivery,
                         sequence,
                     },
                     Err(error) => TransportEvent::Failed {
                         transport: id,
-                        job,
+                        delivery,
                         sequence,
                         error: error.to_string(),
                     },

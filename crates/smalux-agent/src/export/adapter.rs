@@ -1,18 +1,22 @@
 //! 导出格式 adapter。
 
 use super::{
-    ExportJobId, ExportMessageListener, ExportProtocol, TransportId, TransportPlan,
-    TransportRequest, TransportSpec, komari, ws,
+    ExportDeliveryId, ExportEndpointScheme, ExportMessageListener, TransportId, TransportPlan,
+    TransportRequest, TransportSpec, build_export_endpoint, komari, ws,
 };
 use crate::config::model::{ExportConfig, ExportFormat};
 use crate::service::outbound::{
-    ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
+    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
+    RemoteTaskResultEnvelope,
 };
 use smalux_protocol::{
     OutboundReport, encode_ack_as_smalux_json_bytes, encode_outbound_report_as_smalux_json_bytes,
     encode_protocol_error_as_smalux_json_bytes, encode_remote_probe_result_as_smalux_json_bytes,
     encode_remote_task_result_as_smalux_json_bytes,
 };
+
+/// Smalux 自有协议主连接路径。
+const SMALUX_CONNECT_PATH: &str = "/api/agents/connect";
 
 /// 导出格式适配器。
 pub(crate) trait ExportAdapter {
@@ -22,9 +26,17 @@ pub(crate) trait ExportAdapter {
     /// 将内部上报语义编码成零到多条 transport 请求。
     fn encode_report(
         &mut self,
-        job_id: ExportJobId,
+        delivery_id: ExportDeliveryId,
         outbound: &OutboundReport,
     ) -> anyhow::Result<Vec<TransportRequest>>;
+
+    /// 将低频基础信息编码成零到多条 transport 请求。
+    fn encode_basic_info(
+        &mut self,
+        _info: &BasicInfoEnvelope,
+    ) -> anyhow::Result<Vec<TransportRequest>> {
+        Ok(vec![])
+    }
 
     /// 将远程任务结果编码成零到多条 transport 请求。
     fn encode_remote_task_result(
@@ -66,28 +78,28 @@ struct SmaluxJsonAdapter;
 impl ExportAdapter for SmaluxJsonAdapter {
     /// smalux_json 当前使用主 WebSocket transport。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan> {
-        match ExportProtocol::from_server_url(&config.server_url)? {
-            ExportProtocol::WebSocket => Ok(TransportPlan::new(vec![TransportSpec::WebSocket {
-                id: TransportId::RealtimeReport,
-                config: ws::WebSocketConfig::try_from(config)?,
-                connect_on_start: true,
-            }])),
-            ExportProtocol::Http => {
-                anyhow::bail!("smalux_json format does not support http transport yet")
-            }
-        }
+        let endpoint = build_export_endpoint(
+            &config.base_url,
+            ExportEndpointScheme::WebSocket,
+            SMALUX_CONNECT_PATH,
+        )?;
+        Ok(TransportPlan::new(vec![TransportSpec::WebSocket {
+            id: TransportId::RealtimeReport,
+            config: ws::WebSocketConfig::from_export_endpoint(config, endpoint)?,
+            connect_on_start: true,
+        }]))
     }
 
     /// 编码为 smalux JSON bytes，封包和加密由 WebSocket transport 处理。
     fn encode_report(
         &mut self,
-        job_id: ExportJobId,
+        delivery_id: ExportDeliveryId,
         outbound: &OutboundReport,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        if job_id != ExportJobId::RealtimeReport {
+        if delivery_id != ExportDeliveryId::RealtimeReport {
             anyhow::bail!(
-                "smalux_json does not support export job: {}",
-                job_id.as_str()
+                "smalux_json does not support export delivery: {}",
+                delivery_id.as_str()
             );
         }
 

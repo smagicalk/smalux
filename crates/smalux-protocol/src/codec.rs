@@ -100,7 +100,7 @@ pub fn encode_protocol_error_as_smalux_json_bytes(
 
 /// 将内部上报语义转换为 client frame。
 fn outbound_report_to_client_frame(outbound: &OutboundReport) -> ClientFrame {
-    let frame = ClientFrame::new(
+    ClientFrame::new(
         outbound.agent_id.clone(),
         outbound.sequence,
         outbound.created_at,
@@ -110,8 +110,7 @@ fn outbound_report_to_client_frame(outbound: &OutboundReport) -> ClientFrame {
             OutboundReportKind::Delta { delta } => ClientPayload::Delta { delta },
             OutboundReportKind::Ack { ack } => ClientPayload::Ack { ack },
         },
-    );
-    frame
+    )
 }
 
 /// 编码 agent 发往 server 的 frame。

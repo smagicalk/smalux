@@ -29,6 +29,7 @@ impl Default for DiskConfig {
 
 /// 磁盘采样配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiskConfigPatch {
     /// 是否启用磁盘采样。
     pub enabled: Option<bool>,

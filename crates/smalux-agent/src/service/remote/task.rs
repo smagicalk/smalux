@@ -235,17 +235,17 @@ async fn execute_remote_task(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return task_result(
-                request.task_id,
-                RemoteTaskStatus::Failed,
-                None,
-                OutputText::empty(),
-                OutputText::empty(),
+            return task_result(TaskResultParts {
+                task_id: request.task_id,
+                status: RemoteTaskStatus::Failed,
+                exit_code: None,
+                stdout: OutputText::empty(),
+                stderr: OutputText::empty(),
                 started_at,
                 started,
-                false,
-                Some(error.to_string()),
-            );
+                timed_out: false,
+                error: Some(error.to_string()),
+            });
         }
     };
 
@@ -277,8 +277,8 @@ async fn execute_remote_task(
 
     let stdout = join_output_task(stdout_task).await;
     let stderr = join_output_task(stderr_task).await;
-    task_result(
-        request.task_id,
+    task_result(TaskResultParts {
+        task_id: request.task_id,
         status,
         exit_code,
         stdout,
@@ -287,7 +287,7 @@ async fn execute_remote_task(
         started,
         timed_out,
         error,
-    )
+    })
 }
 
 /// 远程任务输出文本和截断状态。
@@ -370,32 +370,48 @@ impl OutputText {
     }
 }
 
-/// 组装远程任务结果。
-fn task_result(
+/// 远程任务结果构造所需字段。
+struct TaskResultParts {
+    /// 任务 ID。
     task_id: String,
+    /// 任务状态。
     status: RemoteTaskStatus,
+    /// 进程退出码。
     exit_code: Option<i32>,
+    /// 已保留的 stdout。
     stdout: OutputText,
+    /// 已保留的 stderr。
     stderr: OutputText,
+    /// 任务开始时间戳。
     started_at: u64,
+    /// 用于计算耗时的本地开始瞬间。
     started: Instant,
+    /// 是否因为超时终止。
     timed_out: bool,
+    /// 任务错误信息。
     error: Option<String>,
-) -> RemoteTaskResult {
-    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+}
+
+/// 组装远程任务结果。
+fn task_result(parts: TaskResultParts) -> RemoteTaskResult {
+    let duration_ms = parts
+        .started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
     RemoteTaskResult {
-        task_id,
-        status,
-        exit_code,
-        stdout: stdout.text,
-        stderr: stderr.text,
-        started_at,
+        task_id: parts.task_id,
+        status: parts.status,
+        exit_code: parts.exit_code,
+        stdout: parts.stdout.text,
+        stderr: parts.stderr.text,
+        started_at: parts.started_at,
         finished_at: unix_timestamp_secs(),
         duration_ms,
-        timed_out,
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
-        error,
+        timed_out: parts.timed_out,
+        stdout_truncated: parts.stdout.truncated,
+        stderr_truncated: parts.stderr.truncated,
+        error: parts.error,
     }
 }
 

@@ -29,7 +29,7 @@ pub(crate) enum ServerControlMessage {
     /// 服务配置增量更新。
     ConfigPatch {
         /// 需要应用的配置 patch。
-        patch: AgentConfigPatch,
+        patch: Box<AgentConfigPatch>,
     },
     /// 立即采集一次进程信息。
     CollectProcessesOnce {

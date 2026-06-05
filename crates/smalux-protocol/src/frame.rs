@@ -36,7 +36,9 @@ impl OutboundReport {
             agent_id: report.identity.agent_id.clone(),
             sequence,
             created_at,
-            kind: OutboundReportKind::Snapshot { report },
+            kind: OutboundReportKind::Snapshot {
+                report: Box::new(report),
+            },
         }
     }
 
@@ -66,7 +68,9 @@ impl OutboundReport {
             agent_id: agent_id.into(),
             sequence,
             created_at,
-            kind: OutboundReportKind::Delta { delta },
+            kind: OutboundReportKind::Delta {
+                delta: Box::new(delta),
+            },
         }
     }
 }
@@ -77,7 +81,7 @@ pub enum OutboundReportKind {
     /// 完整监控快照。
     Snapshot {
         /// 完整 `AgentReport`。
-        report: AgentReport,
+        report: Box<AgentReport>,
     },
     /// 低成本在线心跳。
     Heartbeat {
@@ -87,7 +91,7 @@ pub enum OutboundReportKind {
     /// 相对上一份完整快照或 delta 的增量变更。
     Delta {
         /// 增量上报内容。
-        delta: DeltaReport,
+        delta: Box<DeltaReport>,
     },
     /// agent 对 server 消息的确认。
     Ack {
@@ -141,7 +145,7 @@ pub enum ClientPayload {
     /// 完整监控快照。
     Snapshot {
         /// 完整 `AgentReport`。
-        report: AgentReport,
+        report: Box<AgentReport>,
     },
     /// 低成本在线心跳。
     Heartbeat {
@@ -151,7 +155,7 @@ pub enum ClientPayload {
     /// 增量监控上报。
     Delta {
         /// 增量上报内容。
-        delta: DeltaReport,
+        delta: Box<DeltaReport>,
     },
     /// agent 对 server 消息的确认。
     Ack {

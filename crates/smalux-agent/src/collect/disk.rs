@@ -13,25 +13,26 @@ fn build_disk_info(disks: &Disks) -> DiskInfo {
 
 /// 从已刷新的磁盘对象构建磁盘信息，并按真实间隔计算速度。
 pub(crate) fn build_disk_info_with_elapsed(disks: &Disks, elapsed_secs: Option<f64>) -> DiskInfo {
-    let mut res_disk = DiskInfo::default();
-    res_disk.warmed_up = elapsed_secs.filter(|secs| *secs > 0.0).is_some();
+    let warmed_up = elapsed_secs.filter(|secs| *secs > 0.0).is_some();
+    let mut res_disk = DiskInfo {
+        warmed_up,
+        ..DiskInfo::default()
+    };
     for disk in disks.list() {
         // 单盘字段用于明细展示，汇总字段同步累加到 DiskInfo。
-        let mut disk_info = Disk::default();
-        disk_info.name = disk.name().to_string_lossy().into_owned();
-
-        disk_info.total_space = disk.total_space();
+        let mut disk_info = Disk {
+            name: disk.name().to_string_lossy().into_owned(),
+            total_space: disk.total_space(),
+            available_space: disk.available_space(),
+            kind: disk.kind().to_string(),
+            file_system: disk.file_system().to_string_lossy().into_owned(),
+            is_read_only: disk.is_read_only(),
+            is_removable: disk.is_removable(),
+            mount_point: disk.mount_point().to_string_lossy().into_owned(),
+            ..Disk::default()
+        };
         res_disk.total_space += disk_info.total_space;
-
-        disk_info.available_space = disk.available_space();
         res_disk.available_space += disk_info.available_space;
-
-        disk_info.kind = disk.kind().to_string();
-        disk_info.file_system = disk.file_system().to_string_lossy().into_owned();
-
-        disk_info.is_read_only = disk.is_read_only();
-        disk_info.is_removable = disk.is_removable();
-        disk_info.mount_point = disk.mount_point().to_string_lossy().into_owned();
 
         let speed = disk.usage();
         // `usage` 表示本次刷新周期内的增量，`total_*` 表示系统启动后的累计值。

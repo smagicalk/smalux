@@ -239,8 +239,9 @@ mod tests {
     #[tokio::test]
     async fn listener_enqueues_terminal_command() {
         let mut config = AgentConfig::default();
-        config.export.server_url =
-            "ws://127.0.0.1:3000/api/clients/report?token=secret-token".to_string();
+        config.export.base_url = "http://127.0.0.1:3000".to_string();
+        config.export.auth_mode = ExportAuthMode::Query;
+        config.export.token = Some("secret-token".to_string());
         let manager = ConfigManager::new(config).unwrap();
         let (commands, mut command_rx) = inbound_command_channel();
         let listener = message_listener(manager, commands);

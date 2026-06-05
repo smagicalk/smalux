@@ -1,10 +1,10 @@
 //! CLI 启动输入到运行时配置的转换。
 
 use super::super::model::{
-    AgentConfig, AgentConfigPatch, DiskConfigPatch, ExportConfigPatch, GroupConfigPatch,
-    JobConfigPatch, JobsConfigPatch, NetworkConfigPatch, ProcessConfigPatch, PublicIpConfigPatch,
-    RemoteProbeConfigPatch, RemoteShellConfigPatch, RemoteTaskConfigPatch, ReportConfigPatch,
-    SocketConfigPatch,
+    AgentConfig, AgentConfigPatch, BasicInfoOutputConfigPatch, DiskConfigPatch, ExportConfigPatch,
+    GroupConfigPatch, NetworkConfigPatch, OutboundConfigPatch, ProcessConfigPatch,
+    PublicIpConfigPatch, RealtimeReportOutputConfigPatch, RemoteProbeConfigPatch,
+    RemoteShellConfigPatch, RemoteTaskConfigPatch, ReportConfigPatch, SocketConfigPatch,
 };
 use super::args::{CliArgs, CliQueryParam};
 use crate::service::ServiceOptions;
@@ -43,6 +43,9 @@ impl CliArgs {
 
     /// 应用只能在启动阶段生效的配置。
     fn apply_startup_only_config(&self, config: &mut AgentConfig) {
+        if let Some(agent_id) = self.agent_id.clone() {
+            config.agent_id = agent_id;
+        }
         if let Some(log_file) = self.log_file.clone() {
             config.log_file = log_file;
         }
@@ -52,6 +55,15 @@ impl CliArgs {
         if let Some(log_max_size_mb) = self.log_max_size_mb {
             config.log_max_size_mb = log_max_size_mb;
         }
+        if let Some(required_for_first_report) = self.public_ip_required {
+            config.public_ip.required_for_first_report = required_for_first_report;
+        }
+        if let Some(retry_interval) = self.public_ip_retry_interval {
+            config.public_ip.retry_interval = retry_interval;
+        }
+        if let Some(unsafe_cert) = self.unsafe_cert {
+            config.export.unsafe_cert = unsafe_cert;
+        }
     }
 
     /// 从启动参数构造 CLI-only 服务静态选项。
@@ -60,11 +72,11 @@ impl CliArgs {
         if let Some(enabled) = self.remote_shell_enabled {
             options.remote_shell.enabled = enabled;
         }
-        if let Some(allow) = self.allow_process_details {
-            options.diagnostics.allow_process_details = allow;
+        if let Some(permission) = self.allow_process_level {
+            options.diagnostics.process_permission = permission.into();
         }
-        if let Some(allow) = self.allow_socket_details {
-            options.diagnostics.allow_socket_details = allow;
+        if let Some(permission) = self.allow_socket_level {
+            options.diagnostics.socket_permission = permission.into();
         }
         if let Some(enabled) = self.remote_task_enabled {
             options.remote_task.enabled = enabled;
@@ -76,9 +88,7 @@ impl CliArgs {
 
     /// 将启动参数转换为配置 patch。
     pub(crate) fn into_patch(self) -> AgentConfigPatch {
-        let realtime_report_interval = self.realtime_report_interval.or(self.report_interval);
         AgentConfigPatch {
-            agent_id: self.agent_id,
             core: (self.core_enabled.is_some() || self.core_interval.is_some()).then_some(
                 GroupConfigPatch {
                     enabled: self.core_enabled,
@@ -126,20 +136,16 @@ impl CliArgs {
                 limit: self.sockets_limit,
             }),
             public_ip: (self.public_ip_enabled.is_some()
-                || self.public_ip_required.is_some()
                 || self.public_ip_prefer_interface.is_some()
                 || self.public_ip_verify_interface.is_some()
-                || self.public_ip_startup_timeout.is_some()
-                || self.public_ip_retry_interval.is_some()
+                || self.public_ip_lookup_timeout.is_some()
                 || self.public_ip_refresh_interval.is_some()
                 || self.public_ip_max_concurrency.is_some())
             .then_some(PublicIpConfigPatch {
                 enabled: self.public_ip_enabled,
-                required_for_first_report: self.public_ip_required,
                 prefer_interface_candidate: self.public_ip_prefer_interface,
                 verify_interface_candidate: self.public_ip_verify_interface,
-                startup_timeout: self.public_ip_startup_timeout,
-                retry_interval: self.public_ip_retry_interval,
+                lookup_timeout: self.public_ip_lookup_timeout,
                 refresh_interval: self.public_ip_refresh_interval,
                 max_concurrency: self.public_ip_max_concurrency,
             }),
@@ -159,28 +165,25 @@ impl CliArgs {
                 snapshot_interval: self.report_snapshot_interval,
                 force_snapshot_min_interval: self.report_force_snapshot_min_interval,
             }),
-            jobs: (self.realtime_report_enabled.is_some()
-                || realtime_report_interval.is_some()
-                || self.realtime_report_run_on_start.is_some()
+            outbound: (self.realtime_report_enabled.is_some()
+                || self.realtime_report_send_on_start.is_some()
                 || self.basic_info_enabled.is_some()
-                || self.basic_info_interval.is_some()
-                || self.basic_info_run_on_start.is_some())
-            .then_some(JobsConfigPatch {
+                || self.basic_info_refresh_interval.is_some()
+                || self.basic_info_send_on_start.is_some())
+            .then_some(OutboundConfigPatch {
                 realtime_report: (self.realtime_report_enabled.is_some()
-                    || realtime_report_interval.is_some()
-                    || self.realtime_report_run_on_start.is_some())
-                .then_some(JobConfigPatch {
+                    || self.realtime_report_send_on_start.is_some())
+                .then_some(RealtimeReportOutputConfigPatch {
                     enabled: self.realtime_report_enabled,
-                    interval: realtime_report_interval,
-                    run_on_start: self.realtime_report_run_on_start,
+                    send_on_start: self.realtime_report_send_on_start,
                 }),
                 basic_info: (self.basic_info_enabled.is_some()
-                    || self.basic_info_interval.is_some()
-                    || self.basic_info_run_on_start.is_some())
-                .then_some(JobConfigPatch {
+                    || self.basic_info_refresh_interval.is_some()
+                    || self.basic_info_send_on_start.is_some())
+                .then_some(BasicInfoOutputConfigPatch {
                     enabled: self.basic_info_enabled,
-                    interval: self.basic_info_interval,
-                    run_on_start: self.basic_info_run_on_start,
+                    refresh_interval: self.basic_info_refresh_interval,
+                    send_on_start: self.basic_info_send_on_start,
                 }),
             }),
             remote_shell: (self.remote_shell_max_sessions.is_some()
@@ -213,7 +216,7 @@ impl CliArgs {
                 global_min_interval: self.remote_probe_global_min_interval,
                 target_min_interval: self.remote_probe_target_min_interval,
             }),
-            export: (self.server_url.is_some()
+            export: (self.base_url.is_some()
                 || self.format.is_some()
                 || self.wire_mode.is_some()
                 || self.secure_required.is_some()
@@ -221,11 +224,10 @@ impl CliArgs {
                 || self.auth.is_some()
                 || self.query_token_param.is_some()
                 || !self.query.is_empty()
-                || self.unsafe_cert.is_some()
                 || self.heartbeat.is_some()
                 || self.reconnect_interval.is_some())
             .then_some(ExportConfigPatch {
-                server_url: self.server_url,
+                base_url: self.base_url,
                 format: self.format.map(Into::into),
                 wire_mode: self.wire_mode.map(Into::into),
                 secure_required: self.secure_required,
@@ -233,7 +235,6 @@ impl CliArgs {
                 auth_mode: self.auth.map(Into::into),
                 query_token_param: self.query_token_param,
                 query: query_params_to_map(self.query),
-                unsafe_cert: self.unsafe_cert,
                 heartbeat: self.heartbeat,
                 reconnect_interval: self.reconnect_interval,
             }),

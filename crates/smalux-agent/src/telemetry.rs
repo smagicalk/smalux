@@ -8,5 +8,5 @@ mod event;
 mod state;
 
 pub(crate) use aggregator::TelemetryAggregator;
-pub(crate) use event::ReportEvent;
-pub(crate) use state::TelemetryState;
+pub(crate) use event::{ReportEvent, TelemetryUpdate};
+pub(crate) use state::LatestTelemetry;

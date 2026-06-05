@@ -16,14 +16,14 @@ use crate::config::ConfigManager;
 use bootstrap::{bootstrap_once, public_ip_required_for_first_report, retry_identity_until_ready};
 use collector::{collector_command_channel, collector_loop};
 use export::export_supervisor;
-use message::inbound::{ControlDispatcher, inbound_command_loop};
+use message::inbound::{ControlDispatcher, ControlDispatcherParts, inbound_command_loop};
 use message::outbound::{OutboundSequence, outbound_channel};
+use message::telemetry_update_channel;
 use public_ip::public_ip_refresh_loop;
 use remote::probe::RemoteProbeManager;
 use remote::task::RemoteTaskManager;
-use reporter::{reporter_command_channel, reporter_loop};
-use std::sync::Arc;
-use tokio::sync::{RwLock, watch};
+use reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
+use tokio::sync::watch;
 
 pub(crate) use message::inbound;
 pub(crate) use message::inbound::{
@@ -31,7 +31,7 @@ pub(crate) use message::inbound::{
 };
 pub(crate) use message::listener as control;
 pub(crate) use message::outbound;
-pub(crate) use options::ServiceOptions;
+pub(crate) use options::{RemoteMetricPermission, ServiceOptions};
 pub(crate) use remote::probe;
 pub(crate) use remote::probe::{RemoteProbeRunRequest, display_task_id as display_probe_task_id};
 pub(crate) use remote::shell;
@@ -44,7 +44,7 @@ pub(crate) use smalux_protocol::RemoteProbeType;
 ///
 /// 这里是 agent 的运行时装配入口：先创建所有有界队列和远程能力管理器，再启动
 /// 控制、导出、采集、公网 IP 刷新和上报任务。各任务之间不直接互相调用，统一通过
-/// `TelemetryState`、入站命令队列和出站事件队列协作，方便后续替换 transport 或新增功能。
+/// reporter 私有 latest 缓存、入站命令队列和出站事件队列协作，方便后续替换 transport 或新增功能。
 pub(crate) async fn run(
     config_manager: ConfigManager,
     options: ServiceOptions,
@@ -57,13 +57,12 @@ pub(crate) async fn run(
     tracing::info!(
         agent_id = %config.agent_id,
         agent_version = options.agent_version,
-        server_url = %config.export.server_url,
+        base_url = %config.export.base_url,
         core_interval_ms = config.core.interval.as_millis(),
         disk_interval_ms = config.disk.interval.as_millis(),
         network_interval_ms = config.network.interval.as_millis(),
         report_interval_ms = config.report.interval.as_millis(),
-        realtime_report_job_interval_ms = config.jobs.realtime_report.interval.as_millis(),
-        basic_info_job_interval_ms = config.jobs.basic_info.interval.as_millis(),
+        basic_info_refresh_interval_ms = config.outbound.basic_info.refresh_interval.as_millis(),
         remote_shell_enabled = options.remote_shell.enabled,
         remote_shell_max_sessions = config.remote_shell.max_sessions,
         remote_task_enabled = options.remote_task.enabled,
@@ -81,6 +80,8 @@ pub(crate) async fn run(
     let (reporter_command_tx, reporter_command_rx) = reporter_command_channel();
     // collector command 用于一次性进程/socket 采集，避免入站控制线程直接做重采样。
     let (collector_command_tx, collector_command_rx) = collector_command_channel();
+    // telemetry update 队列承载采集结果；reporter 是 latest 缓存的唯一拥有者。
+    let (telemetry_tx, telemetry_rx) = telemetry_update_channel();
     let remote_shell_manager = shell::RemoteShellManager::new(options.remote_shell.clone());
     let remote_task_manager = RemoteTaskManager::new(
         options.remote_task.clone(),
@@ -95,17 +96,17 @@ pub(crate) async fn run(
     );
     let (inbound_command_tx, inbound_command_rx) = inbound_command_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let control_dispatcher = ControlDispatcher::new(
-        config_manager.clone(),
-        remote_shell_manager.clone(),
-        remote_task_manager,
-        remote_probe_manager,
-        collector_command_tx.clone(),
-        reporter_command_tx,
-        outbound_tx.clone(),
-        outbound_sequence.clone(),
-        options.diagnostics,
-    );
+    let control_dispatcher = ControlDispatcher::new(ControlDispatcherParts {
+        config_manager: config_manager.clone(),
+        remote_shell: remote_shell_manager.clone(),
+        remote_task: remote_task_manager,
+        remote_probe: remote_probe_manager,
+        collector_commands: collector_command_tx.clone(),
+        reporter_commands: reporter_command_tx,
+        outbound_tx: outbound_tx.clone(),
+        sequence: outbound_sequence.clone(),
+        diagnostics: options.diagnostics,
+    });
     // 入站命令循环是所有协议 listener 的统一落点，Komari 和 Smalux 自有协议都会走这里。
     let control_task = tokio::spawn(inbound_command_loop(
         inbound_command_rx,
@@ -121,38 +122,39 @@ pub(crate) async fn run(
     let mut state = bootstrap_once(&mut collector, &config_rx).await;
     let retry_config = config_rx.borrow().clone();
     let retry_required = public_ip_required_for_first_report(&retry_config);
-    if retry_required && !state.store.public_ip_ready() {
-        retry_identity_until_ready(&mut collector, &mut state.store, &mut config_rx).await;
+    if retry_required && !state.latest_telemetry.public_ip_ready() {
+        retry_identity_until_ready(&mut collector, &mut state.latest_telemetry, &mut config_rx)
+            .await;
     }
-    state.first_report_ready = state.store.first_report_ready();
+    state.first_report_ready = state.latest_telemetry.first_report_ready();
 
     tracing::info!("agent service bootstrap completed");
 
-    let store = Arc::new(RwLock::new(state.store));
-    // 后续三个循环共享同一个 TelemetryState：采集循环写入，公网 IP 低频刷新写入，
-    // reporter 按 report.interval 读取并组装要发送的业务 frame。
+    let latest_telemetry = state.latest_telemetry;
+    // 后续采集循环和公网 IP 刷新只提交 update；reporter 持有 latest 缓存并组装业务 frame。
     let collector_task = tokio::spawn(collector_loop(
         collector,
-        store.clone(),
+        telemetry_tx.clone(),
         config_manager.subscribe(),
         collector_command_rx,
         shutdown_rx.clone(),
     ));
     let public_ip_task = tokio::spawn(public_ip_refresh_loop(
         LocalCollector::new(),
-        store.clone(),
+        telemetry_tx,
         config_manager.subscribe(),
         shutdown_rx.clone(),
     ));
-    let reporter_task = tokio::spawn(reporter_loop(
-        store,
-        options.agent_version,
-        config_manager.subscribe(),
-        shutdown_rx,
+    let reporter_task = tokio::spawn(reporter_loop(ReporterLoopParts {
+        state: latest_telemetry,
+        agent_version: options.agent_version,
+        config_rx: config_manager.subscribe(),
+        shutdown: shutdown_rx,
         outbound_tx,
-        outbound_sequence,
-        reporter_command_rx,
-    ));
+        sequence: outbound_sequence,
+        telemetry_updates: telemetry_rx,
+        reporter_commands: reporter_command_rx,
+    }));
 
     let service_result: anyhow::Result<()> = tokio::select! {
         result = export_task => result
@@ -187,22 +189,24 @@ pub(crate) async fn run(
 mod tests {
     //! 服务编排辅助逻辑测试。
 
-    use super::ServiceOptions;
     use super::export::export_supervisor;
-    use super::inbound::{ControlDispatcher, InboundCommandReceiver, inbound_command_channel};
+    use super::inbound::{
+        ControlDispatcher, ControlDispatcherParts, InboundCommandReceiver, inbound_command_channel,
+    };
+    use super::message::{TelemetryUpdateSender, telemetry_update_channel};
     use super::outbound::{
         OutboundEvent, OutboundSequence, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
         outbound_channel,
     };
-    use super::reporter::{reporter_command_channel, reporter_loop};
+    use super::reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
+    use super::{RemoteMetricPermission, ServiceOptions};
     use crate::collect::{CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample};
     use crate::config::model::{AgentConfigPatch, ExportAuthMode, ExportFormat, GroupConfigPatch};
     use crate::export::wire;
-    use crate::service::collector::{
-        CollectorCommand, collector_command_channel, sample_enabled_groups,
-    };
+    use crate::service::collector::{CollectorCommand, collector_command_channel};
     use crate::service::control::ServiceControlListener;
     use crate::service::reporter::reporter_tick_once;
+    use crate::telemetry::TelemetryUpdate;
     use futures_util::{SinkExt, StreamExt};
     use smalux_core::model::info::{
         CoreInfo, DiskInfo, IdentityInfo, MemoryInfo, MetricLevel, NetworkInfo, ProcessInfo,
@@ -214,7 +218,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{RwLock, mpsc, watch};
+    use tokio::sync::{mpsc, watch};
     use tokio::task::JoinHandle;
     use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -231,6 +235,8 @@ mod tests {
         reporter_task: JoinHandle<()>,
         /// mock WebSocket server 任务。
         server_task: JoinHandle<()>,
+        /// telemetry 更新发送端。
+        telemetry_tx: TelemetryUpdateSender,
     }
 
     impl ServiceHarness {
@@ -248,7 +254,7 @@ mod tests {
     /// 启动一个收集 agent 文本消息的 WebSocket mock server。
     async fn spawn_collecting_ws_server() -> (String, mpsc::Receiver<String>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (received_tx, received_rx) = mpsc::channel(16);
 
         let task = tokio::spawn(async move {
@@ -283,7 +289,7 @@ mod tests {
     /// 启动首个连接读一条后关闭、第二个连接持续收集的 WebSocket mock server。
     async fn spawn_reconnecting_ws_server() -> (String, mpsc::Receiver<String>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (received_tx, received_rx) = mpsc::channel(16);
 
         let task = tokio::spawn(async move {
@@ -341,10 +347,7 @@ mod tests {
         JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "ws://{}/api/clients/report?token=secret-token",
-            listener.local_addr().unwrap()
-        );
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (ws_tx, ws_rx) = mpsc::channel(16);
         let (http_tx, http_rx) = mpsc::channel(16);
 
@@ -370,10 +373,7 @@ mod tests {
         JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "ws://{}/api/clients/report?token=secret-token",
-            listener.local_addr().unwrap()
-        );
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (ws_tx, ws_rx) = mpsc::channel(16);
         let (http_tx, http_rx) = mpsc::channel(16);
 
@@ -400,10 +400,7 @@ mod tests {
     async fn spawn_komari_task_result_mock_server()
     -> (String, mpsc::Receiver<HttpCapture>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "ws://{}/api/clients/report?token=secret-token",
-            listener.local_addr().unwrap()
-        );
+        let url = format!("http://{}", listener.local_addr().unwrap());
         let (http_tx, http_rx) = mpsc::channel(16);
 
         let task = tokio::spawn(async move {
@@ -517,34 +514,34 @@ mod tests {
     }
 
     /// 构造已满足第一包上报条件的测试缓存。
-    fn ready_service_store() -> crate::telemetry::TelemetryState {
-        let mut store = crate::telemetry::TelemetryState::default();
-        store.set_identity(IdentityInfo {
+    fn ready_latest_telemetry() -> crate::telemetry::LatestTelemetry {
+        let mut latest_telemetry = crate::telemetry::LatestTelemetry::default();
+        latest_telemetry.set_identity(IdentityInfo {
             agent_id: "agent-service".to_string(),
             hostname: "host-service".to_string(),
             ..IdentityInfo::default()
         });
-        store.set_system(SystemInfo {
+        latest_telemetry.set_system(SystemInfo {
             hostname: "host-service".to_string(),
             ..SystemInfo::default()
         });
-        store.set_core(CoreSample {
+        latest_telemetry.set_core(CoreSample {
             sampled_at: 1,
             value: CoreInfo::default(),
         });
-        store.set_disk(DiskSample {
+        latest_telemetry.set_disk(DiskSample {
             sampled_at: 1,
             value: DiskInfo::default(),
         });
-        store.set_network(NetworkSample {
+        latest_telemetry.set_network(NetworkSample {
             sampled_at: 1,
             value: NetworkInfo::default(),
         });
-        store.set_processes(ProcessSample {
+        latest_telemetry.set_processes(ProcessSample {
             sampled_at: 1,
             value: ProcessInfo::ready(42),
         });
-        store.set_sockets(SocketSample {
+        latest_telemetry.set_sockets(SocketSample {
             sampled_at: 1,
             value: SocketInfo::ready(
                 10,
@@ -553,7 +550,7 @@ mod tests {
                 SocketAccuracy::SocketTable,
             ),
         });
-        store
+        latest_telemetry
     }
 
     /// 构造默认关闭的远程 shell manager。
@@ -622,17 +619,17 @@ mod tests {
             disabled_remote_task_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
         let remote_probe_manager =
             make_remote_probe_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
-        let dispatcher = ControlDispatcher::new(
-            manager,
-            disabled_remote_shell_manager(),
-            remote_task_manager,
-            remote_probe_manager,
+        let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
+            config_manager: manager,
+            remote_shell: disabled_remote_shell_manager(),
+            remote_task: remote_task_manager,
+            remote_probe: remote_probe_manager,
             collector_commands,
             reporter_commands,
             outbound_tx,
             sequence,
-            ServiceOptions::default().diagnostics,
-        );
+            diagnostics: ServiceOptions::default().diagnostics,
+        });
 
         ControlHarness {
             listener: ServiceControlListener::new(inbound_commands),
@@ -657,17 +654,17 @@ mod tests {
             disabled_remote_task_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
         let remote_probe_manager =
             make_remote_probe_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
-        let dispatcher = ControlDispatcher::new(
-            manager,
-            disabled_remote_shell_manager(),
-            remote_task_manager,
-            remote_probe_manager,
+        let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
+            config_manager: manager,
+            remote_shell: disabled_remote_shell_manager(),
+            remote_task: remote_task_manager,
+            remote_probe: remote_probe_manager,
             collector_commands,
             reporter_commands,
             outbound_tx,
             sequence,
             diagnostics,
-        );
+        });
 
         let harness = ControlHarness {
             listener: ServiceControlListener::new(inbound_commands),
@@ -682,22 +679,30 @@ mod tests {
 
     /// 启动 reporter + export supervisor，用真实 WebSocket 发送消息到 mock server。
     async fn spawn_report_export_service(
-        server_url: String,
+        base_url: String,
         server_task: JoinHandle<()>,
-        store: std::sync::Arc<RwLock<crate::telemetry::TelemetryState>>,
+        latest_telemetry: crate::telemetry::LatestTelemetry,
         configure: impl FnOnce(&mut crate::config::AgentConfig),
     ) -> ServiceHarness {
-        let mut config = crate::config::AgentConfig::default();
-        config.agent_id = "agent-service".to_string();
-        config.export.server_url = server_url;
-        config.report.interval = Duration::from_millis(100);
-        config.jobs.realtime_report.interval = Duration::from_millis(100);
-        config.export.heartbeat = Duration::from_secs(30);
+        let mut config = crate::config::AgentConfig {
+            agent_id: "agent-service".to_string(),
+            export: crate::config::model::ExportConfig {
+                base_url,
+                heartbeat: Duration::from_secs(30),
+                ..crate::config::model::ExportConfig::default()
+            },
+            report: crate::config::model::ReportConfig {
+                interval: Duration::from_millis(100),
+                ..crate::config::model::ReportConfig::default()
+            },
+            ..crate::config::AgentConfig::default()
+        };
         configure(&mut config);
 
         let manager = crate::config::ConfigManager::new(config).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
         let (inbound_commands, _inbound_command_rx) = inbound_command_channel();
+        let (telemetry_tx, telemetry_rx) = telemetry_update_channel();
         let (_reporter_command_tx, reporter_command_rx) = reporter_command_channel();
         let export_task = tokio::spawn(export_supervisor(
             manager.clone(),
@@ -705,21 +710,23 @@ mod tests {
             inbound_commands,
         ));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let reporter_task = tokio::spawn(reporter_loop(
-            store,
-            "0.1.0-service-test",
-            manager.subscribe(),
-            shutdown_rx,
+        let reporter_task = tokio::spawn(reporter_loop(ReporterLoopParts {
+            state: latest_telemetry,
+            agent_version: "0.1.0-service-test",
+            config_rx: manager.subscribe(),
+            shutdown: shutdown_rx,
             outbound_tx,
-            OutboundSequence::default(),
-            reporter_command_rx,
-        ));
+            sequence: OutboundSequence::default(),
+            telemetry_updates: telemetry_rx,
+            reporter_commands: reporter_command_rx,
+        }));
 
         ServiceHarness {
             shutdown_tx,
             export_task,
             reporter_task,
             server_task,
+            telemetry_tx,
         }
     }
 
@@ -781,8 +788,9 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_snapshot_by_default() {
         let (url, mut received_rx, server_task) = spawn_collecting_ws_server().await;
-        let store = std::sync::Arc::new(RwLock::new(ready_service_store()));
-        let harness = spawn_report_export_service(url, server_task, store, |_config| {}).await;
+        let latest_telemetry = ready_latest_telemetry();
+        let harness =
+            spawn_report_export_service(url, server_task, latest_telemetry, |_config| {}).await;
 
         let first = recv_client_frame(&mut received_rx).await;
         let second = recv_client_frame(&mut received_rx).await;
@@ -799,8 +807,8 @@ mod tests {
     #[tokio::test]
     async fn service_export_reconnects_after_realtime_transport_failure() {
         let (url, mut received_rx, server_task) = spawn_reconnecting_ws_server().await;
-        let store = std::sync::Arc::new(RwLock::new(ready_service_store()));
-        let harness = spawn_report_export_service(url, server_task, store, |config| {
+        let latest_telemetry = ready_latest_telemetry();
+        let harness = spawn_report_export_service(url, server_task, latest_telemetry, |config| {
             config.export.reconnect_interval = Duration::from_millis(100);
         })
         .await;
@@ -818,9 +826,14 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_remote_task_result() {
         let (url, mut received_rx, server_task) = spawn_collecting_ws_server().await;
-        let mut config = crate::config::AgentConfig::default();
-        config.agent_id = "agent-service".to_string();
-        config.export.server_url = url;
+        let config = crate::config::AgentConfig {
+            agent_id: "agent-service".to_string(),
+            export: crate::config::model::ExportConfig {
+                base_url: url,
+                ..crate::config::model::ExportConfig::default()
+            },
+            ..crate::config::AgentConfig::default()
+        };
         let manager = crate::config::ConfigManager::new(config).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
         let (inbound_commands, _inbound_command_rx) = inbound_command_channel();
@@ -872,11 +885,17 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_komari_remote_task_result() {
         let (url, mut http_rx, server_task) = spawn_komari_task_result_mock_server().await;
-        let mut config = crate::config::AgentConfig::default();
-        config.agent_id = "agent-service".to_string();
-        config.export.format = ExportFormat::Komari;
-        config.export.auth_mode = ExportAuthMode::None;
-        config.export.server_url = url;
+        let config = crate::config::AgentConfig {
+            agent_id: "agent-service".to_string(),
+            export: crate::config::model::ExportConfig {
+                format: ExportFormat::Komari,
+                auth_mode: ExportAuthMode::Query,
+                token: Some("secret-token".to_string()),
+                base_url: url,
+                ..crate::config::model::ExportConfig::default()
+            },
+            ..crate::config::AgentConfig::default()
+        };
         let manager = crate::config::ConfigManager::new(config).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
         let (inbound_commands, _inbound_command_rx) = inbound_command_channel();
@@ -929,11 +948,17 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_komari_remote_probe_result() {
         let (base_url, mut ws_rx, server_task) = spawn_collecting_ws_server().await;
-        let mut config = crate::config::AgentConfig::default();
-        config.agent_id = "agent-service".to_string();
-        config.export.format = ExportFormat::Komari;
-        config.export.auth_mode = ExportAuthMode::None;
-        config.export.server_url = format!("{base_url}/api/clients/report?token=secret-token");
+        let config = crate::config::AgentConfig {
+            agent_id: "agent-service".to_string(),
+            export: crate::config::model::ExportConfig {
+                format: ExportFormat::Komari,
+                auth_mode: ExportAuthMode::Query,
+                token: Some("secret-token".to_string()),
+                base_url,
+                ..crate::config::model::ExportConfig::default()
+            },
+            ..crate::config::AgentConfig::default()
+        };
         let manager = crate::config::ConfigManager::new(config).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
         let (inbound_commands, _inbound_command_rx) = inbound_command_channel();
@@ -980,8 +1005,8 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_delta_and_business_heartbeat() {
         let (url, mut received_rx, server_task) = spawn_collecting_ws_server().await;
-        let store = std::sync::Arc::new(RwLock::new(ready_service_store()));
-        let harness = spawn_report_export_service(url, server_task, store.clone(), |config| {
+        let latest_telemetry = ready_latest_telemetry();
+        let harness = spawn_report_export_service(url, server_task, latest_telemetry, |config| {
             config.report.delta_enabled = true;
             config.report.heartbeat_enabled = true;
             config.report.heartbeat_interval = Duration::from_secs(1);
@@ -990,9 +1015,9 @@ mod tests {
         .await;
 
         let snapshot = recv_client_frame(&mut received_rx).await;
-        {
-            let mut store = store.write().await;
-            store.set_core(CoreSample {
+        harness
+            .telemetry_tx
+            .send(TelemetryUpdate::Core(CoreSample {
                 sampled_at: 2,
                 value: CoreInfo {
                     memory: MemoryInfo {
@@ -1001,8 +1026,9 @@ mod tests {
                     },
                     ..CoreInfo::default()
                 },
-            });
-        }
+            }))
+            .await
+            .unwrap();
         let delta = recv_client_frame_matching(&mut received_rx, "delta frame", |payload| {
             matches!(payload, ClientPayload::Delta { .. })
         })
@@ -1035,10 +1061,11 @@ mod tests {
     #[tokio::test]
     async fn service_export_sends_komari_websocket_report_and_basic_info() {
         let (url, mut ws_rx, mut http_rx, server_task) = spawn_komari_ws_mock_server().await;
-        let store = std::sync::Arc::new(RwLock::new(ready_service_store()));
-        let harness = spawn_report_export_service(url, server_task, store, |config| {
+        let latest_telemetry = ready_latest_telemetry();
+        let harness = spawn_report_export_service(url, server_task, latest_telemetry, |config| {
             config.export.format = ExportFormat::Komari;
-            config.export.auth_mode = ExportAuthMode::None;
+            config.export.auth_mode = ExportAuthMode::Query;
+            config.export.token = Some("secret-token".to_string());
         })
         .await;
 
@@ -1063,10 +1090,11 @@ mod tests {
     async fn service_export_continues_after_basic_info_transport_failure() {
         let (url, mut ws_rx, mut http_rx, server_task) =
             spawn_komari_ws_mock_server_with_http_failure().await;
-        let store = std::sync::Arc::new(RwLock::new(ready_service_store()));
-        let harness = spawn_report_export_service(url, server_task, store, |config| {
+        let latest_telemetry = ready_latest_telemetry();
+        let harness = spawn_report_export_service(url, server_task, latest_telemetry, |config| {
             config.export.format = ExportFormat::Komari;
-            config.export.auth_mode = ExportAuthMode::None;
+            config.export.auth_mode = ExportAuthMode::Query;
+            config.export.token = Some("secret-token".to_string());
         })
         .await;
 
@@ -1078,47 +1106,12 @@ mod tests {
         assert_eq!(basic_info.method, "POST");
     }
 
-    /// 验证启用的采样组会写入缓存。
-    #[test]
-    fn sample_enabled_groups_updates_store() {
-        let mut collector = crate::collect::LocalCollector::new();
-        let mut store = crate::telemetry::TelemetryState::default();
-        let config = crate::config::AgentConfig::default();
-
-        sample_enabled_groups(&mut collector, &mut store, &config);
-
-        assert!(store.core.ready().is_some());
-        assert!(store.disk.ready().is_some());
-        assert!(store.network.ready().is_some());
-        assert!(store.processes.ready().is_some());
-        assert!(store.sockets.ready().is_some());
-    }
-
-    /// 验证禁用的采样组会被标记为 Disabled。
-    #[test]
-    fn sample_enabled_groups_marks_disabled_groups() {
-        let mut collector = crate::collect::LocalCollector::new();
-        let mut store = crate::telemetry::TelemetryState::default();
-        let mut config = crate::config::AgentConfig::default();
-        config.disk.enabled = false;
-        config.network.enabled = false;
-
-        sample_enabled_groups(&mut collector, &mut store, &config);
-
-        assert!(store.core.ready().is_some());
-        assert!(store.disk.ready_or_disabled());
-        assert!(store.network.ready_or_disabled());
-        assert!(store.processes.ready().is_some());
-        assert!(store.sockets.ready().is_some());
-        assert!(!store.first_report_ready());
-    }
-
     /// 验证 reporter tick 会在缺少第一包必需数据时报错。
     #[tokio::test]
-    async fn reporter_tick_requires_ready_store() {
-        let store = crate::telemetry::TelemetryState::default();
+    async fn reporter_tick_requires_ready_latest_telemetry() {
+        let latest_telemetry = crate::telemetry::LatestTelemetry::default();
 
-        assert!(reporter_tick_once(&store, "0.1.0").is_err());
+        assert!(reporter_tick_once(&latest_telemetry, "0.1.0").is_err());
     }
 
     /// 验证 server 下发配置 patch 后会更新动态配置。
@@ -1203,7 +1196,7 @@ mod tests {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
-            allow_process_details: true,
+            process_permission: RemoteMetricPermission::Details,
             ..super::options::DiagnosticOptions::default()
         };
         let (mut harness, mut command_rx) =
@@ -1235,7 +1228,7 @@ mod tests {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
-            allow_socket_details: true,
+            socket_permission: RemoteMetricPermission::Details,
             ..super::options::DiagnosticOptions::default()
         };
         let (mut harness, mut command_rx) =
@@ -1261,9 +1254,68 @@ mod tests {
         );
     }
 
-    /// 验证未通过启动参数授权时，server 不能打开 details 采集。
+    /// 验证 none 权限会拒绝 server 触发 count 采集。
     #[tokio::test]
-    async fn service_control_listener_rejects_remote_details_without_permission() {
+    async fn service_control_listener_rejects_count_when_permission_none() {
+        let manager =
+            crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
+        let diagnostics = super::options::DiagnosticOptions {
+            process_permission: RemoteMetricPermission::None,
+            ..super::options::DiagnosticOptions::default()
+        };
+        let (mut harness, mut command_rx) =
+            service_control_harness_with_commands(manager, diagnostics);
+
+        let error = harness
+            .handle_message(
+                r#"{
+                    "type": "collect_processes_once",
+                    "level": "count",
+                    "limit": 5
+                }"#,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("allowed level is none"));
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    /// 验证 light 权限允许 server 触发 light 采集。
+    #[tokio::test]
+    async fn service_control_listener_allows_light_when_permission_light() {
+        let manager =
+            crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
+        let diagnostics = super::options::DiagnosticOptions {
+            socket_permission: RemoteMetricPermission::Light,
+            ..super::options::DiagnosticOptions::default()
+        };
+        let (mut harness, mut command_rx) =
+            service_control_harness_with_commands(manager, diagnostics);
+
+        harness
+            .handle_message(
+                r#"{
+                    "type": "collect_sockets_once",
+                    "level": "light",
+                    "limit": 7
+                }"#,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            command_rx.try_recv().unwrap(),
+            CollectorCommand::SampleSocketsOnce {
+                level: MetricLevel::Light,
+                limit: 7
+            }
+        );
+    }
+
+    /// 验证未通过启动参数授权时，server 不能打开超过 count 的远程采集。
+    #[tokio::test]
+    async fn service_control_listener_rejects_remote_level_above_permission() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let (mut harness, _command_rx) = service_control_harness_with_commands(
@@ -1275,19 +1327,19 @@ mod tests {
             .handle_message(
                 r#"{
                     "type": "config_patch",
-                    "patch": { "processes": { "level": "details" } }
+                    "patch": { "processes": { "level": "light" } }
                 }"#,
             )
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("process details"));
+        assert!(error.to_string().contains("process light"));
         assert_eq!(manager.current().processes.level, MetricLevel::Count);
     }
 
-    /// 验证一次性 details 诊断同样受启动参数授权保护。
+    /// 验证一次性诊断同样受启动参数授权保护。
     #[tokio::test]
-    async fn service_control_listener_rejects_one_shot_details_without_permission() {
+    async fn service_control_listener_rejects_one_shot_level_above_permission() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let (mut harness, mut command_rx) =

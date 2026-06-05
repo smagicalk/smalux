@@ -47,6 +47,7 @@ impl Default for ReportConfig {
 
 /// 上报配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReportConfigPatch {
     /// 是否启用上报。
     pub enabled: Option<bool>,

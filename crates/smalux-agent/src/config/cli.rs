@@ -14,6 +14,7 @@ mod tests {
     use super::value::{CliExportFormat, CliMetricLevel};
     use super::*;
     use crate::config::model::{AgentConfigPatch, ExportAuthMode, ExportFormat};
+    use crate::service::RemoteMetricPermission;
     use clap::Parser;
     use smalux_core::model::info::MetricLevel;
     use std::time::Duration;
@@ -26,7 +27,7 @@ mod tests {
             log_file: Some("logs/test-agent.log".to_string()),
             log_retention_files: Some(9),
             log_max_size_mb: Some(32),
-            server_url: Some("ws://127.0.0.1:9000/ws".to_string()),
+            base_url: Some("http://127.0.0.1:9000".to_string()),
             format: Some(CliExportFormat::SmaluxJson),
             core_interval: Some(Duration::from_secs(2)),
             disk_interval: Some(Duration::from_secs(10)),
@@ -40,8 +41,7 @@ mod tests {
             sockets_level: Some(CliMetricLevel::Details),
             sockets_limit: Some(100),
             report_interval: Some(Duration::from_secs(3)),
-            realtime_report_interval: Some(Duration::from_secs(4)),
-            basic_info_interval: Some(Duration::from_secs(60)),
+            basic_info_refresh_interval: Some(Duration::from_secs(60)),
             report_heartbeat_enabled: Some(true),
             report_heartbeat_interval: Some(Duration::from_secs(30)),
             report_delta_enabled: Some(true),
@@ -61,7 +61,7 @@ mod tests {
         assert_eq!(config.log_file, "logs/test-agent.log");
         assert_eq!(config.log_retention_files, 9);
         assert_eq!(config.log_max_size_mb, 32);
-        assert_eq!(config.export.server_url, "ws://127.0.0.1:9000/ws");
+        assert_eq!(config.export.base_url, "http://127.0.0.1:9000");
         assert_eq!(config.export.format, ExportFormat::SmaluxJson);
         assert_eq!(config.core.interval, Duration::from_secs(2));
         assert_eq!(config.disk.interval, Duration::from_secs(10));
@@ -75,8 +75,10 @@ mod tests {
         assert_eq!(config.sockets.level, MetricLevel::Details);
         assert_eq!(config.sockets.limit, 100);
         assert_eq!(config.report.interval, Duration::from_secs(3));
-        assert_eq!(config.jobs.realtime_report.interval, Duration::from_secs(4));
-        assert_eq!(config.jobs.basic_info.interval, Duration::from_secs(60));
+        assert_eq!(
+            config.outbound.basic_info.refresh_interval,
+            Duration::from_secs(60)
+        );
         assert!(config.report.heartbeat_enabled);
         assert_eq!(config.report.heartbeat_interval, Duration::from_secs(30));
         assert!(config.report.delta_enabled);
@@ -106,7 +108,7 @@ mod tests {
             "--log-max-size-mb",
             "16",
             "-s",
-            "ws://127.0.0.1:9001/ws",
+            "http://127.0.0.1:9001",
             "-f",
             "smalux_json",
             "-a",
@@ -153,7 +155,7 @@ mod tests {
             "12h",
             "-R",
             "4s",
-            "--basic-info-interval",
+            "--basic-info-refresh-interval",
             "90s",
             "--basic-info-enabled",
             "false",
@@ -174,7 +176,7 @@ mod tests {
         assert_eq!(config.log_file, "logs/short.log");
         assert_eq!(config.log_retention_files, 5);
         assert_eq!(config.log_max_size_mb, 16);
-        assert_eq!(config.export.server_url, "ws://127.0.0.1:9001/ws");
+        assert_eq!(config.export.base_url, "http://127.0.0.1:9001");
         assert_eq!(config.export.format, ExportFormat::SmaluxJson);
         assert_eq!(config.export.auth_mode, ExportAuthMode::Bearer);
         assert_eq!(config.export.token.as_deref(), Some("short-token"));
@@ -203,9 +205,11 @@ mod tests {
             Duration::from_secs(12 * 60 * 60)
         );
         assert_eq!(config.report.interval, Duration::from_secs(4));
-        assert_eq!(config.jobs.realtime_report.interval, Duration::from_secs(4));
-        assert!(!config.jobs.basic_info.enabled);
-        assert_eq!(config.jobs.basic_info.interval, Duration::from_secs(90));
+        assert!(!config.outbound.basic_info.enabled);
+        assert_eq!(
+            config.outbound.basic_info.refresh_interval,
+            Duration::from_secs(90)
+        );
         assert!(config.report.heartbeat_enabled);
         assert_eq!(config.report.heartbeat_interval, Duration::from_secs(30));
         assert!(config.report.delta_enabled);
@@ -218,7 +222,7 @@ mod tests {
         let args = CliArgs::try_parse_from([
             "smalux-agent",
             "-s",
-            "wss://example.com/api/clients/report",
+            "https://example.com",
             "-f",
             "komari",
             "-a",
@@ -244,8 +248,14 @@ mod tests {
         let patch = args.into_patch();
 
         assert!(!options.remote_shell.enabled);
-        assert!(!options.diagnostics.allow_process_details);
-        assert!(!options.diagnostics.allow_socket_details);
+        assert_eq!(
+            options.diagnostics.process_permission,
+            RemoteMetricPermission::Count
+        );
+        assert_eq!(
+            options.diagnostics.socket_permission,
+            RemoteMetricPermission::Count
+        );
         assert!(!options.remote_task.enabled);
         assert_eq!(patch, AgentConfigPatch::default());
     }
@@ -284,10 +294,10 @@ mod tests {
             "30m",
             "-P",
             "powershell.exe",
-            "--allow-process-details",
-            "true",
-            "--allow-socket-details",
-            "true",
+            "--allow-process-level",
+            "details",
+            "--allow-socket-level",
+            "light",
             "-T",
             "true",
             "-C",
@@ -326,8 +336,14 @@ mod tests {
             remote_shell.session_timeout,
             Some(Duration::from_secs(30 * 60))
         );
-        assert!(options.diagnostics.allow_process_details);
-        assert!(options.diagnostics.allow_socket_details);
+        assert_eq!(
+            options.diagnostics.process_permission,
+            RemoteMetricPermission::Details
+        );
+        assert_eq!(
+            options.diagnostics.socket_permission,
+            RemoteMetricPermission::Light
+        );
         assert!(options.remote_task.enabled);
         assert_eq!(remote_task.max_concurrent, Some(3));
         assert_eq!(remote_task.timeout, Some(Duration::from_secs(45)));

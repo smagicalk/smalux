@@ -37,6 +37,7 @@ impl SocketConfig {
 
 /// Socket 采集配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SocketConfigPatch {
     /// 是否启用 Socket 采样。
     pub enabled: Option<bool>,

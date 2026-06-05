@@ -4,56 +4,45 @@
 //! 合并和重复敏感 query 校验逻辑。
 
 use crate::config::model::{ExportAuthMode, ExportConfig};
+use crate::export::{ExportEndpointScheme, build_export_endpoint};
 use std::collections::BTreeSet;
 
 /// Komari report endpoint 的完整默认路径。
 const KOMARI_REPORT_PATH: &str = "/api/clients/report";
-/// Komari report endpoint 的最后一段路径。
-const KOMARI_REPORT_SUFFIX: &str = "/report";
 /// Komari basic info endpoint 的完整默认路径。
 const KOMARI_BASIC_INFO_PATH: &str = "/api/clients/uploadBasicInfo";
-/// Komari basic info endpoint 的最后一段路径。
-const KOMARI_BASIC_INFO_SUFFIX: &str = "/uploadBasicInfo";
 /// Komari terminal endpoint 的完整默认路径。
 const KOMARI_TERMINAL_PATH: &str = "/api/clients/terminal";
-/// Komari terminal endpoint 的最后一段路径。
-const KOMARI_TERMINAL_SUFFIX: &str = "/terminal";
 /// Komari task result endpoint 的完整默认路径。
 const KOMARI_TASK_RESULT_PATH: &str = "/api/clients/task/result";
-/// Komari task result endpoint 相对 `/api/clients` 的路径。
-const KOMARI_TASK_RESULT_SUFFIX: &str = "/task/result";
 
 /// 构造 Komari WebSocket 实时 report URL，不主动追加认证 query。
 pub(super) fn komari_report_websocket_url(config: &ExportConfig) -> anyhow::Result<String> {
-    let mut url = websocket_url_from_export_url(&config.server_url)?;
-    normalize_report_path(&mut url);
-    Ok(url.to_string())
+    build_export_endpoint(
+        &config.base_url,
+        ExportEndpointScheme::WebSocket,
+        KOMARI_REPORT_PATH,
+    )
 }
 
 /// 构造 Komari basic info URL。
 pub(super) fn komari_basic_info_url(config: &ExportConfig) -> anyhow::Result<String> {
-    let mut url = http_url_from_export_url(&config.server_url)?;
-    normalize_report_path(&mut url);
-    let path = url.path().trim_end_matches('/');
-    let basic_info_path = path
-        .strip_suffix(KOMARI_REPORT_SUFFIX)
-        .map(|prefix| format!("{prefix}{KOMARI_BASIC_INFO_SUFFIX}"))
-        .unwrap_or_else(|| KOMARI_BASIC_INFO_PATH.to_string());
-    url.set_path(&basic_info_path);
+    let mut url = reqwest::Url::parse(&build_export_endpoint(
+        &config.base_url,
+        ExportEndpointScheme::Http,
+        KOMARI_BASIC_INFO_PATH,
+    )?)?;
     append_export_query(&mut url, config)?;
     Ok(url.to_string())
 }
 
 /// 构造 Komari task result HTTP URL。
 pub(super) fn komari_task_result_url(config: &ExportConfig) -> anyhow::Result<String> {
-    let mut url = http_url_from_export_url(&config.server_url)?;
-    normalize_report_path(&mut url);
-    let path = url.path().trim_end_matches('/');
-    let task_result_path = path
-        .strip_suffix(KOMARI_REPORT_SUFFIX)
-        .map(|prefix| format!("{prefix}{KOMARI_TASK_RESULT_SUFFIX}"))
-        .unwrap_or_else(|| KOMARI_TASK_RESULT_PATH.to_string());
-    url.set_path(&task_result_path);
+    let mut url = reqwest::Url::parse(&build_export_endpoint(
+        &config.base_url,
+        ExportEndpointScheme::Http,
+        KOMARI_TASK_RESULT_PATH,
+    )?)?;
     append_export_query(&mut url, config)?;
     Ok(url.to_string())
 }
@@ -67,14 +56,11 @@ pub(super) fn komari_terminal_url(
         anyhow::bail!("komari terminal request_id cannot be empty");
     }
 
-    let mut url = websocket_url_from_export_url(&config.server_url)?;
-    normalize_report_path(&mut url);
-    let path = url.path().trim_end_matches('/');
-    let terminal_path = path
-        .strip_suffix(KOMARI_REPORT_SUFFIX)
-        .map(|prefix| format!("{prefix}{KOMARI_TERMINAL_SUFFIX}"))
-        .unwrap_or_else(|| KOMARI_TERMINAL_PATH.to_string());
-    url.set_path(&terminal_path);
+    let mut url = reqwest::Url::parse(&build_export_endpoint(
+        &config.base_url,
+        ExportEndpointScheme::WebSocket,
+        KOMARI_TERMINAL_PATH,
+    )?)?;
     url.query_pairs_mut().append_pair("id", request_id);
     append_export_query(&mut url, config)?;
     Ok(url.to_string())
@@ -110,57 +96,6 @@ pub(super) fn redact_komari_url(url: &str) -> String {
     } else {
         format!("{base}?{redacted_query}#{fragment}")
     }
-}
-
-/// 判断 URL path 是否已经是 report endpoint。
-fn is_report_endpoint_path(path: &str) -> bool {
-    path.trim_end_matches('/').ends_with(KOMARI_REPORT_SUFFIX)
-}
-
-/// 把基础 endpoint 或自定义前缀规范化为 Komari report path。
-fn normalize_report_path(url: &mut reqwest::Url) {
-    let path = url.path().trim_end_matches('/');
-    let report_path = if path.is_empty() || path == "/" {
-        KOMARI_REPORT_PATH.to_string()
-    } else if is_report_endpoint_path(path) {
-        path.to_string()
-    } else if path.ends_with("/api/clients") {
-        format!("{path}{KOMARI_REPORT_SUFFIX}")
-    } else {
-        format!("{path}{KOMARI_REPORT_PATH}")
-    };
-
-    url.set_path(&report_path);
-}
-
-/// 把 ws/wss/http/https 导出地址转换为 HTTP URL。
-fn http_url_from_export_url(server_url: &str) -> anyhow::Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(server_url)?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        "http" => "http",
-        "https" => "https",
-        other => anyhow::bail!("unsupported komari export url scheme: {other}"),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("failed to set komari http url scheme"))?;
-    Ok(url)
-}
-
-/// 把 ws/wss/http/https 导出地址转换为 WebSocket URL。
-fn websocket_url_from_export_url(server_url: &str) -> anyhow::Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(server_url)?;
-    let scheme = match url.scheme() {
-        "ws" => "ws",
-        "wss" => "wss",
-        "http" => "ws",
-        "https" => "wss",
-        other => anyhow::bail!("unsupported komari export url scheme: {other}"),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("failed to set komari websocket url scheme"))?;
-    Ok(url)
 }
 
 /// 合并通用 query 和 query token。
@@ -217,47 +152,26 @@ mod tests {
     use super::*;
 
     /// 构造 Komari 测试配置。
-    fn komari_config(server_url: &str) -> ExportConfig {
+    fn komari_config(base_url: &str) -> ExportConfig {
         ExportConfig {
-            server_url: server_url.to_string(),
+            base_url: base_url.to_string(),
             auth_mode: ExportAuthMode::Query,
             token: Some("secret-token".to_string()),
             ..ExportConfig::default()
         }
     }
 
-    /// 验证基础 endpoint 可以推导 WebSocket report URL。
+    /// 验证 base_url 根地址可以推导 WebSocket report URL。
     #[test]
-    fn komari_websocket_report_url_is_derived_from_base_endpoint() {
+    fn komari_websocket_report_url_is_derived_from_base_url() {
         let url = komari_report_websocket_url(&komari_config("https://example.com")).unwrap();
 
         assert_eq!(url, "wss://example.com/api/clients/report");
     }
 
-    /// 验证带部署前缀的基础 endpoint 会保留前缀。
+    /// 验证 basic info URL 可以从 base_url 根地址推导。
     #[test]
-    fn komari_websocket_report_url_preserves_base_path_prefix() {
-        let url =
-            komari_report_websocket_url(&komari_config("https://example.com/monitor")).unwrap();
-
-        assert_eq!(url, "wss://example.com/monitor/api/clients/report");
-    }
-
-    /// 验证 basic info URL 会从 report URL 推导。
-    #[test]
-    fn komari_basic_info_url_is_derived_from_report_url() {
-        let url =
-            komari_basic_info_url(&komari_config("wss://example.com/api/clients/report")).unwrap();
-
-        assert_eq!(
-            url,
-            "https://example.com/api/clients/uploadBasicInfo?token=secret-token"
-        );
-    }
-
-    /// 验证 basic info URL 可以从基础 endpoint 推导。
-    #[test]
-    fn komari_basic_info_url_is_derived_from_base_endpoint() {
+    fn komari_basic_info_url_is_derived_from_base_url() {
         let url = komari_basic_info_url(&komari_config("https://example.com")).unwrap();
 
         assert_eq!(
@@ -266,11 +180,10 @@ mod tests {
         );
     }
 
-    /// 验证 task result URL 会从 report URL 推导。
+    /// 验证 task result URL 可以从 base_url 根地址推导。
     #[test]
-    fn komari_task_result_url_is_derived_from_report_url() {
-        let url =
-            komari_task_result_url(&komari_config("wss://example.com/api/clients/report")).unwrap();
+    fn komari_task_result_url_is_derived_from_base_url() {
+        let url = komari_task_result_url(&komari_config("https://example.com")).unwrap();
 
         assert_eq!(
             url,
@@ -278,25 +191,10 @@ mod tests {
         );
     }
 
-    /// 验证 task result URL 可以从带部署前缀的基础 endpoint 推导。
+    /// 验证 terminal URL 会从 base_url 根地址推导并带上 request id。
     #[test]
-    fn komari_task_result_url_preserves_base_path_prefix() {
-        let url = komari_task_result_url(&komari_config("https://example.com/monitor")).unwrap();
-
-        assert_eq!(
-            url,
-            "https://example.com/monitor/api/clients/task/result?token=secret-token"
-        );
-    }
-
-    /// 验证 terminal URL 会从 report URL 推导并带上 request id。
-    #[test]
-    fn komari_terminal_url_is_derived_from_report_url() {
-        let url = komari_terminal_url(
-            &komari_config("https://example.com/api/clients/report"),
-            "term-1",
-        )
-        .unwrap();
+    fn komari_terminal_url_is_derived_from_base_url() {
+        let url = komari_terminal_url(&komari_config("https://example.com"), "term-1").unwrap();
 
         assert_eq!(
             url,
@@ -304,14 +202,14 @@ mod tests {
         );
     }
 
-    /// 验证 HTTPS report endpoint 也会被规范化为 WebSocket report URL。
+    /// 验证 base URL 不能包含 path。
     #[test]
-    fn komari_https_report_endpoint_is_normalized_to_websocket_report_url() {
-        let url =
+    fn komari_base_url_rejects_path() {
+        let error =
             komari_report_websocket_url(&komari_config("https://example.com/api/clients/report"))
-                .unwrap();
+                .unwrap_err();
 
-        assert_eq!(url, "wss://example.com/api/clients/report");
+        assert!(error.to_string().contains("path"));
     }
 
     /// 验证 URL 日志会脱敏 token。
@@ -330,10 +228,12 @@ mod tests {
     /// 验证重复敏感 query 会快速失败，避免 token 歧义。
     #[test]
     fn komari_url_rejects_duplicate_sensitive_query() {
-        let error = komari_basic_info_url(&komari_config(
-            "https://example.com/api/clients/report?token=url",
-        ))
-        .unwrap_err();
+        let mut config = komari_config("https://example.com");
+        config
+            .query
+            .insert("token".to_string(), "from-query".to_string());
+
+        let error = komari_basic_info_url(&config).unwrap_err();
 
         assert!(error.to_string().contains("duplicate sensitive query"));
     }

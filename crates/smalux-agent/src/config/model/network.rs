@@ -36,6 +36,7 @@ impl Default for NetworkConfig {
 
 /// 网络采样配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NetworkConfigPatch {
     /// 是否启用网络采样。
     pub enabled: Option<bool>,

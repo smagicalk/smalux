@@ -27,8 +27,11 @@ pub(crate) fn build_network_info_with_elapsed_and_filter(
 ) -> NetworkInfo {
     let filter = InterfaceFilter::new(include_interfaces, exclude_interfaces);
     let mut matched_include_interfaces = HashSet::new();
-    let mut res_network = NetworkInfo::default();
-    res_network.warmed_up = elapsed_secs.filter(|secs| *secs > 0.0).is_some();
+    let warmed_up = elapsed_secs.filter(|secs| *secs > 0.0).is_some();
+    let mut res_network = NetworkInfo {
+        warmed_up,
+        ..NetworkInfo::default()
+    };
 
     for (name, network) in networks.list() {
         if !filter.includes(name) {
@@ -39,15 +42,17 @@ pub(crate) fn build_network_info_with_elapsed_and_filter(
         }
 
         // 单网卡明细用于展示和诊断，汇总字段同步累加到 NetworkInfo。
-        let mut network_info = Network::default();
-        network_info.name = name.to_string();
-        network_info.mtu = network.mtu();
-        network_info.received = network.received();
-        network_info.errors_on_received = network.errors_on_received();
-        network_info.errors_on_transmitted = network.errors_on_transmitted();
-        network_info.mac = network.mac_address().to_string();
-        network_info.packets_received = network.packets_received();
-        network_info.transmitted = network.transmitted();
+        let mut network_info = Network {
+            name: name.to_string(),
+            mtu: network.mtu(),
+            received: network.received(),
+            errors_on_received: network.errors_on_received(),
+            errors_on_transmitted: network.errors_on_transmitted(),
+            packets_received: network.packets_received(),
+            transmitted: network.transmitted(),
+            mac: network.mac_address().to_string(),
+            ..Network::default()
+        };
         if let Some(elapsed_secs) = elapsed_secs.filter(|secs| *secs > 0.0) {
             network_info.received_bytes_per_sec = network_info.received as f64 / elapsed_secs;
             network_info.transmitted_bytes_per_sec = network_info.transmitted as f64 / elapsed_secs;
@@ -80,9 +85,10 @@ pub(crate) fn build_network_info_with_elapsed_and_filter(
 
         for ip in network.ip_networks() {
             // 保留地址和掩码长度，后续可用于展示 CIDR 或筛选内网地址。
-            let mut ip_info = Ip::default();
-            ip_info.mask_len = ip.prefix;
-            ip_info.ip = ip.addr;
+            let ip_info = Ip {
+                ip: ip.addr,
+                mask_len: ip.prefix,
+            };
             network_info.ip.push(ip_info);
         }
         res_network.networks.push(network_info);

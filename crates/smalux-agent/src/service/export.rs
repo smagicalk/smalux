@@ -1,19 +1,23 @@
 //! 导出连接监管。
 
-mod jobs;
+mod delivery;
 mod pending;
 mod pipeline;
 
 use super::inbound::InboundCommandSender;
 use super::outbound::{OutboundEvent, OutboundReceiver};
 use crate::config::ConfigManager;
-use jobs::{EXPORT_JOB_SCHEDULER_TICK, send_due_interval_jobs, send_ready_jobs};
-use pending::{
-    handle_transport_event, queue_control_ack, queue_control_error, queue_remote_probe_result,
-    queue_remote_task_result, send_pending_control_acks, send_pending_control_errors,
-    send_pending_remote_probe_results, send_pending_remote_task_results, send_resume_events,
+use delivery::{
+    EXPORT_DELIVERY_SCHEDULER_TICK, has_interval_deliveries, send_due_interval_deliveries,
+    send_ready_deliveries,
 };
-use pipeline::{close_transport_hub, connect_export_pipeline, rebuild_runtime_jobs};
+use pending::{
+    PendingResumeEvents, handle_transport_event, queue_basic_info, queue_control_ack,
+    queue_control_error, queue_remote_probe_result, queue_remote_task_result,
+    send_pending_control_acks, send_pending_control_errors, send_pending_remote_probe_results,
+    send_pending_remote_task_results, send_resume_events,
+};
+use pipeline::{close_transport_hub, connect_export_pipeline, rebuild_runtime_deliveries};
 use std::collections::BTreeMap;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
@@ -29,8 +33,8 @@ pub(crate) async fn export_supervisor(
         mut transport_events,
         mut router,
         mut current_export,
-        mut current_jobs_config,
-        mut jobs,
+        mut current_outbound_config,
+        mut deliveries,
     ) = connect_export_pipeline(config_manager.clone(), inbound_commands.clone()).await?;
     let mut latest_report = None;
     let mut pending_remote_task_results = BTreeMap::new();
@@ -38,18 +42,18 @@ pub(crate) async fn export_supervisor(
     let mut pending_control_acks = BTreeMap::new();
     let mut pending_control_errors = BTreeMap::new();
     // pending 只保存“已经编码并投递给 transport，但还没有收到 Sent 事件”的即时消息。
-    // 周期 report 不做 pending，因为 latest_report 会一直保留最新值，重连后按 job 再发即可。
-    let mut job_tick = interval(EXPORT_JOB_SCHEDULER_TICK);
-    job_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    if let Err(err) = send_ready_jobs(
+    // 周期 report 不做 pending，因为 latest_report 会一直保留最新值，重连后按 delivery 再发即可。
+    let mut delivery_tick = interval(EXPORT_DELIVERY_SCHEDULER_TICK);
+    delivery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    if let Err(err) = send_ready_deliveries(
         &mut transport_hub,
         &mut router,
-        &mut jobs,
+        &mut deliveries,
         latest_report.as_ref(),
     )
     .await
     {
-        tracing::warn!(error = ?err, "initial export report job failed");
+        tracing::warn!(error = ?err, "initial export report delivery failed");
     }
 
     loop {
@@ -71,20 +75,20 @@ pub(crate) async fn export_supervisor(
                         // report 是 latest-state 语义：如果 export 端落后，只保留最新 report，
                         // 避免慢连接导致大量旧 snapshot/delta 堆积。
                         latest_report = Some(report);
-                        if let Err(err) = send_ready_jobs(
+                        if let Err(err) = send_ready_deliveries(
                             &mut transport_hub,
                             &mut router,
-                            &mut jobs,
+                            &mut deliveries,
                             latest_report.as_ref(),
                         ).await {
                             tracing::warn!(
                                 error = ?err,
                                 reconnect_interval_ms = current_export.reconnect_interval.as_millis(),
-                                "export report job failed; reconnecting"
+                                "export report delivery failed; reconnecting"
                             );
                             close_transport_hub(&mut transport_hub).await;
                             sleep(current_export.reconnect_interval).await;
-                            (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                            (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                                 connect_export_pipeline(
                                     config_manager.clone(),
                                     inbound_commands.clone(),
@@ -92,15 +96,28 @@ pub(crate) async fn export_supervisor(
                             if let Err(err) = send_resume_events(
                                 &mut transport_hub,
                                 &mut router,
-                                &mut jobs,
+                                &mut deliveries,
                                 latest_report.as_ref(),
-                                &mut pending_remote_task_results,
-                                &mut pending_remote_probe_results,
-                                &mut pending_control_acks,
-                                &mut pending_control_errors,
+                                PendingResumeEvents {
+                                    remote_task_results: &mut pending_remote_task_results,
+                                    remote_probe_results: &mut pending_remote_probe_results,
+                                    control_acks: &mut pending_control_acks,
+                                    control_errors: &mut pending_control_errors,
+                                },
                             ).await {
                                 tracing::warn!(error = ?err, "export event failed after reconnect");
                             }
+                        }
+                    }
+                    OutboundEvent::BasicInfo(info) => {
+                        // basic info 是低频兼容事件，下一轮 interval 会自然重试。
+                        // 这里不做 pending，也不因为 HTTP 辅助请求失败重建主连接。
+                        if let Err(err) = queue_basic_info(
+                            &mut transport_hub,
+                            &mut router,
+                            *info,
+                        ).await {
+                            tracing::warn!(error = ?err, "basic info export failed; continuing");
                         }
                     }
                     OutboundEvent::ControlAck(ack) => {
@@ -119,7 +136,7 @@ pub(crate) async fn export_supervisor(
                             );
                             close_transport_hub(&mut transport_hub).await;
                             sleep(current_export.reconnect_interval).await;
-                            (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                            (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                                 connect_export_pipeline(
                                     config_manager.clone(),
                                     inbound_commands.clone(),
@@ -169,7 +186,7 @@ pub(crate) async fn export_supervisor(
                             );
                             close_transport_hub(&mut transport_hub).await;
                             sleep(current_export.reconnect_interval).await;
-                            (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                            (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                                 connect_export_pipeline(
                                     config_manager.clone(),
                                     inbound_commands.clone(),
@@ -219,7 +236,7 @@ pub(crate) async fn export_supervisor(
                             );
                             close_transport_hub(&mut transport_hub).await;
                             sleep(current_export.reconnect_interval).await;
-                            (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                            (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                                 connect_export_pipeline(
                                     config_manager.clone(),
                                     inbound_commands.clone(),
@@ -276,7 +293,7 @@ pub(crate) async fn export_supervisor(
                             );
                             close_transport_hub(&mut transport_hub).await;
                             sleep(current_export.reconnect_interval).await;
-                            (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                            (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                                 connect_export_pipeline(
                                     config_manager.clone(),
                                     inbound_commands.clone(),
@@ -326,7 +343,7 @@ pub(crate) async fn export_supervisor(
                     tracing::warn!("transport event channel closed; reconnecting export transport");
                     close_transport_hub(&mut transport_hub).await;
                     sleep(current_export.reconnect_interval).await;
-                    (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                    (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                         connect_export_pipeline(
                             config_manager.clone(),
                             inbound_commands.clone(),
@@ -336,7 +353,7 @@ pub(crate) async fn export_supervisor(
 
                 if let Err(err) = handle_transport_event(
                     event,
-                    &mut jobs,
+                    &mut deliveries,
                     &mut pending_remote_task_results,
                     &mut pending_remote_probe_results,
                     &mut pending_control_acks,
@@ -349,7 +366,7 @@ pub(crate) async fn export_supervisor(
                     );
                     close_transport_hub(&mut transport_hub).await;
                     sleep(current_export.reconnect_interval).await;
-                    (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                    (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                         connect_export_pipeline(
                             config_manager.clone(),
                             inbound_commands.clone(),
@@ -357,32 +374,34 @@ pub(crate) async fn export_supervisor(
                     if let Err(err) = send_resume_events(
                         &mut transport_hub,
                         &mut router,
-                        &mut jobs,
+                        &mut deliveries,
                         latest_report.as_ref(),
-                        &mut pending_remote_task_results,
-                        &mut pending_remote_probe_results,
-                        &mut pending_control_acks,
-                        &mut pending_control_errors,
+                        PendingResumeEvents {
+                            remote_task_results: &mut pending_remote_task_results,
+                            remote_probe_results: &mut pending_remote_probe_results,
+                            control_acks: &mut pending_control_acks,
+                            control_errors: &mut pending_control_errors,
+                        },
                     ).await {
-                        tracing::warn!(error = ?err, "export job failed after transport event reconnect");
+                        tracing::warn!(error = ?err, "export delivery failed after transport event reconnect");
                     }
                 }
             }
-            _ = job_tick.tick() => {
-                if let Err(err) = send_due_interval_jobs(
+            _ = delivery_tick.tick(), if has_interval_deliveries(&deliveries) => {
+                if let Err(err) = send_due_interval_deliveries(
                     &mut transport_hub,
                     &mut router,
-                    &mut jobs,
+                    &mut deliveries,
                     latest_report.as_ref(),
                 ).await {
                     tracing::warn!(
                         error = ?err,
                         reconnect_interval_ms = current_export.reconnect_interval.as_millis(),
-                        "export interval job failed; reconnecting"
+                        "export interval delivery failed; reconnecting"
                     );
                     close_transport_hub(&mut transport_hub).await;
                     sleep(current_export.reconnect_interval).await;
-                    (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                    (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                         connect_export_pipeline(
                             config_manager.clone(),
                             inbound_commands.clone(),
@@ -390,14 +409,16 @@ pub(crate) async fn export_supervisor(
                     if let Err(err) = send_resume_events(
                         &mut transport_hub,
                         &mut router,
-                        &mut jobs,
+                        &mut deliveries,
                         latest_report.as_ref(),
-                        &mut pending_remote_task_results,
-                        &mut pending_remote_probe_results,
-                        &mut pending_control_acks,
-                        &mut pending_control_errors,
+                        PendingResumeEvents {
+                            remote_task_results: &mut pending_remote_task_results,
+                            remote_probe_results: &mut pending_remote_probe_results,
+                            control_acks: &mut pending_control_acks,
+                            control_errors: &mut pending_control_errors,
+                        },
                     ).await {
-                        tracing::warn!(error = ?err, "export job failed after interval reconnect");
+                        tracing::warn!(error = ?err, "export delivery failed after interval reconnect");
                     }
                 }
             }
@@ -408,43 +429,46 @@ pub(crate) async fn export_supervisor(
                 }
 
                 let next = config_rx.borrow_and_update().clone();
-                if next.export == current_export && next.jobs == current_jobs_config {
-                    tracing::debug!("service config changed without export job changes");
+                if next.export == current_export && next.outbound == current_outbound_config {
+                    tracing::debug!("service config changed without export delivery changes");
                     continue;
                 }
                 if next.export == current_export {
-                    tracing::info!("export jobs config changed; updating export jobs");
-                    jobs = rebuild_runtime_jobs(&mut router, &current_export, &next.jobs)?;
-                    current_jobs_config = next.jobs.clone();
-                    if let Err(err) = send_ready_jobs(
+                    tracing::info!("export outbound config changed; updating export deliveries");
+                    deliveries =
+                        rebuild_runtime_deliveries(&mut router, &current_export, &next.outbound)?;
+                    current_outbound_config = next.outbound.clone();
+                    if let Err(err) = send_ready_deliveries(
                         &mut transport_hub,
                         &mut router,
-                        &mut jobs,
+                        &mut deliveries,
                         latest_report.as_ref(),
                     ).await {
                         tracing::warn!(
                             error = ?err,
                             reconnect_interval_ms = current_export.reconnect_interval.as_millis(),
-                            "export job failed after job config update; reconnecting"
+                            "export delivery failed after outbound config update; reconnecting"
                         );
                         close_transport_hub(&mut transport_hub).await;
                         sleep(current_export.reconnect_interval).await;
-                        (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                        (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                             connect_export_pipeline(
                                 config_manager.clone(),
                                 inbound_commands.clone(),
                             ).await?;
                         if let Err(err) = send_resume_events(
                             &mut transport_hub,
-                                &mut router,
-                                &mut jobs,
-                                latest_report.as_ref(),
-                                &mut pending_remote_task_results,
-                                &mut pending_remote_probe_results,
-                                &mut pending_control_acks,
-                                &mut pending_control_errors,
+                            &mut router,
+                            &mut deliveries,
+                            latest_report.as_ref(),
+                            PendingResumeEvents {
+                                remote_task_results: &mut pending_remote_task_results,
+                                remote_probe_results: &mut pending_remote_probe_results,
+                                control_acks: &mut pending_control_acks,
+                                control_errors: &mut pending_control_errors,
+                            },
                         ).await {
-                            tracing::warn!(error = ?err, "export job failed after job config reconnect");
+                            tracing::warn!(error = ?err, "export delivery failed after outbound config reconnect");
                         }
                     }
                     continue;
@@ -458,7 +482,7 @@ pub(crate) async fn export_supervisor(
                 );
                 close_transport_hub(&mut transport_hub).await;
                 sleep(reconnect_interval).await;
-                (transport_hub, transport_events, router, current_export, current_jobs_config, jobs) =
+                (transport_hub, transport_events, router, current_export, current_outbound_config, deliveries) =
                     connect_export_pipeline(
                         config_manager.clone(),
                         inbound_commands.clone(),
@@ -466,14 +490,16 @@ pub(crate) async fn export_supervisor(
                 if let Err(err) = send_resume_events(
                     &mut transport_hub,
                     &mut router,
-                    &mut jobs,
+                    &mut deliveries,
                     latest_report.as_ref(),
-                    &mut pending_remote_task_results,
-                    &mut pending_remote_probe_results,
-                    &mut pending_control_acks,
-                    &mut pending_control_errors,
+                    PendingResumeEvents {
+                        remote_task_results: &mut pending_remote_task_results,
+                        remote_probe_results: &mut pending_remote_probe_results,
+                        control_acks: &mut pending_control_acks,
+                        control_errors: &mut pending_control_errors,
+                    },
                 ).await {
-                    tracing::warn!(error = ?err, "export report job failed after export config reconnect");
+                    tracing::warn!(error = ?err, "export report delivery failed after export config reconnect");
                 }
             }
         }
@@ -489,29 +515,29 @@ mod tests {
 
     use super::*;
     use crate::export::{
-        ExportJobFailurePolicy, ExportJobId, ExportJobSpec, TransportEvent, TransportId,
+        ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec, TransportEvent,
+        TransportId,
     };
-    use crate::service::export::jobs::RuntimeJob;
+    use crate::service::export::delivery::RuntimeDelivery;
     use crate::service::outbound::{
         ControlAckEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
     };
     use std::collections::BTreeMap;
-    use std::time::Duration;
 
     /// 验证发送成功事件才会更新已发送序号。
     #[test]
     fn transport_sent_event_updates_last_sent_sequence() {
-        let mut jobs = vec![RuntimeJob::from_spec(ExportJobSpec::on_latest_report(
-            ExportJobId::RealtimeReport,
-        ))];
+        let mut deliveries = vec![RuntimeDelivery::from_spec(
+            ExportDeliverySpec::on_latest_report(ExportDeliveryId::RealtimeReport),
+        )];
 
         handle_transport_event(
             TransportEvent::Sent {
                 transport: TransportId::RealtimeReport,
-                job: ExportJobId::RealtimeReport,
+                delivery: ExportDeliveryId::RealtimeReport,
                 sequence: 7,
             },
-            &mut jobs,
+            &mut deliveries,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
@@ -519,24 +545,24 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(jobs[0].last_sent_sequence, Some(7));
+        assert_eq!(deliveries[0].last_sent_sequence, Some(7));
     }
 
     /// 验证实时上报发送失败会要求重连。
     #[test]
     fn realtime_transport_failed_event_requests_reconnect() {
-        let mut jobs = vec![RuntimeJob::from_spec(ExportJobSpec::on_latest_report(
-            ExportJobId::RealtimeReport,
-        ))];
+        let mut deliveries = vec![RuntimeDelivery::from_spec(
+            ExportDeliverySpec::on_latest_report(ExportDeliveryId::RealtimeReport),
+        )];
 
         let error = handle_transport_event(
             TransportEvent::Failed {
                 transport: TransportId::RealtimeReport,
-                job: ExportJobId::RealtimeReport,
+                delivery: ExportDeliveryId::RealtimeReport,
                 sequence: 7,
                 error: "send failed".to_string(),
             },
-            &mut jobs,
+            &mut deliveries,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
@@ -547,23 +573,24 @@ mod tests {
         assert!(error.to_string().contains("export transport send failed"));
     }
 
-    /// 验证低频辅助 job 发送失败只记录并继续。
+    /// 验证低频辅助 delivery 发送失败只记录并继续。
     #[test]
     fn basic_info_transport_failed_event_continues() {
-        let mut jobs = vec![RuntimeJob::from_spec(ExportJobSpec::interval(
-            ExportJobId::BasicInfo,
-            Duration::from_secs(300),
-            ExportJobFailurePolicy::LogAndContinue,
-        ))];
+        let mut deliveries = vec![RuntimeDelivery::from_spec(
+            ExportDeliverySpec::event_driven(
+                ExportDeliveryId::BasicInfo,
+                ExportDeliveryFailurePolicy::LogAndContinue,
+            ),
+        )];
 
         handle_transport_event(
             TransportEvent::Failed {
-                transport: TransportId::BasicInfo,
-                job: ExportJobId::BasicInfo,
+                transport: TransportId::AuxiliaryHttp,
+                delivery: ExportDeliveryId::BasicInfo,
                 sequence: 7,
                 error: "send failed".to_string(),
             },
-            &mut jobs,
+            &mut deliveries,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
@@ -601,7 +628,7 @@ mod tests {
         handle_transport_event(
             TransportEvent::Sent {
                 transport: TransportId::RealtimeReport,
-                job: ExportJobId::RemoteTaskResult,
+                delivery: ExportDeliveryId::RemoteTaskResult,
                 sequence: 9,
             },
             &mut [],
@@ -640,7 +667,7 @@ mod tests {
         handle_transport_event(
             TransportEvent::Sent {
                 transport: TransportId::RealtimeReport,
-                job: ExportJobId::RemoteProbeResult,
+                delivery: ExportDeliveryId::RemoteProbeResult,
                 sequence: 11,
             },
             &mut [],
@@ -670,7 +697,7 @@ mod tests {
         handle_transport_event(
             TransportEvent::Sent {
                 transport: TransportId::RealtimeReport,
-                job: ExportJobId::ControlAck,
+                delivery: ExportDeliveryId::ControlAck,
                 sequence: 10,
             },
             &mut [],

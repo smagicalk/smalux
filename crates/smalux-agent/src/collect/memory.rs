@@ -6,16 +6,15 @@ use sysinfo::System;
 /// 从已刷新的系统对象构建物理内存与 swap 的容量和使用情况。
 pub(crate) fn build_memory_info(system: &System) -> MemoryInfo {
     // 所有容量单位保持为 sysinfo 返回的字节数，展示层再决定格式化方式。
-    let mut res_memory = MemoryInfo::default();
-    res_memory.memory_usage = system.used_memory();
-    res_memory.memory_total = system.total_memory();
-    res_memory.memory_available = system.available_memory();
-    res_memory.memory_free = system.free_memory();
-    res_memory.swap_total = system.total_swap();
-    res_memory.swap_usage = system.used_swap();
-    res_memory.swap_free = system.free_swap();
-
-    res_memory
+    MemoryInfo {
+        memory_total: system.total_memory(),
+        memory_usage: system.used_memory(),
+        memory_available: system.available_memory(),
+        memory_free: system.free_memory(),
+        swap_total: system.total_swap(),
+        swap_usage: system.used_swap(),
+        swap_free: system.free_swap(),
+    }
 }
 
 #[cfg(test)]

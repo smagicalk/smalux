@@ -3,12 +3,13 @@
 //! 该状态不是发送队列，而是每个采样组的最新快照。它用于构建完整 snapshot、
 //! 计算 delta，以及给兼容协议读取当前状态。
 
+use super::event::TelemetryUpdate;
 use crate::collect::{
     CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample, unix_timestamp_secs,
 };
 use smalux_core::model::info::{
-    AGENT_REPORT_SCHEMA_VERSION, AgentReport, IdentityInfo, PublicIpStatus, ReportMeta, Stamped,
-    SystemInfo,
+    AGENT_REPORT_SCHEMA_VERSION, AgentReport, IdentityInfo, PublicIpInfo, PublicIpStatus,
+    ReportMeta, Stamped, SystemInfo,
 };
 
 /// 采样组缓存状态。
@@ -55,9 +56,9 @@ impl<T> GroupState<T> {
     }
 }
 
-/// agent 最新 telemetry 状态。
+/// agent 最新 telemetry 缓存。
 #[derive(Debug, Clone, Default)]
-pub(crate) struct TelemetryState {
+pub(crate) struct LatestTelemetry {
     /// 身份信息。
     pub identity: GroupState<IdentityInfo>,
     /// 静态系统信息。
@@ -74,10 +75,47 @@ pub(crate) struct TelemetryState {
     pub sockets: GroupState<SocketSample>,
 }
 
-impl TelemetryState {
+impl LatestTelemetry {
+    /// 应用采集层提交的状态更新。
+    pub(crate) fn apply_update(&mut self, update: TelemetryUpdate) {
+        match update {
+            TelemetryUpdate::Batch(updates) => {
+                for update in updates {
+                    self.apply_update(update);
+                }
+            }
+            TelemetryUpdate::IdentityRefresh(identity) => self.apply_identity_refresh(identity),
+            TelemetryUpdate::Core(core) => self.set_core(core),
+            TelemetryUpdate::Disk(disk) => self.set_disk(disk),
+            TelemetryUpdate::Network(network) => self.set_network(network),
+            TelemetryUpdate::Processes(processes) => self.set_processes(processes),
+            TelemetryUpdate::Sockets(sockets) => self.set_sockets(sockets),
+        }
+    }
+
     /// 写入身份信息。
     pub(crate) fn set_identity(&mut self, identity: IdentityInfo) {
         self.identity = GroupState::Ready(identity);
+    }
+
+    /// 写入公网 IP 刷新结果；刷新失败时尽量保留旧公网 IP。
+    pub(crate) fn apply_identity_refresh(&mut self, mut identity: IdentityInfo) {
+        if matches!(identity.public_ip.status, PublicIpStatus::Failed)
+            && let Some(previous) = self.identity.ready()
+        {
+            let error = identity
+                .public_ip
+                .error
+                .clone()
+                .unwrap_or_else(|| "Public IP lookup failed".to_string());
+            let last_attempt_at = identity
+                .public_ip
+                .last_attempt_at
+                .unwrap_or_else(unix_timestamp_secs);
+            identity.public_ip =
+                PublicIpInfo::stale_or_failed(&previous.public_ip, error, last_attempt_at);
+        }
+        self.set_identity(identity);
     }
 
     /// 写入静态系统信息。
@@ -208,7 +246,7 @@ fn optional_group<T: Clone>(state: &GroupState<T>, name: &str) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    //! Telemetry 状态测试。
+    //! 最新 telemetry 缓存测试。
 
     use super::*;
     use smalux_core::model::info::{
@@ -234,7 +272,7 @@ mod tests {
     /// 验证缺少必需组时不会构造上报。
     #[test]
     fn build_report_requires_all_required_groups() {
-        let state = TelemetryState::default();
+        let state = LatestTelemetry::default();
 
         assert!(!state.first_report_ready());
         assert!(state.build_report("0.1.0").is_err());
@@ -243,7 +281,7 @@ mod tests {
     /// 验证缓存齐全时可以构造上报。
     #[test]
     fn build_report_returns_agent_report() {
-        let mut state = TelemetryState::default();
+        let mut state = LatestTelemetry::default();
         state.set_identity(test_identity());
         state.set_system(SystemInfo::default());
         state.set_core(CoreSample {
@@ -287,7 +325,7 @@ mod tests {
     /// 验证禁用的采样组不会阻塞上报，也不会出现在 payload 中。
     #[test]
     fn build_report_omits_disabled_metric_groups() {
-        let mut state = TelemetryState::default();
+        let mut state = LatestTelemetry::default();
         state.configure_metric_groups(true, false, false, false, false);
         state.set_identity(test_identity());
         state.set_system(SystemInfo::default());
@@ -311,7 +349,7 @@ mod tests {
     fn build_report_allows_failed_public_ip_status() {
         let mut identity = test_identity();
         identity.public_ip = PublicIpInfo::failed("temporary failure".to_string(), 10);
-        let mut state = TelemetryState::default();
+        let mut state = LatestTelemetry::default();
         state.configure_metric_groups(false, false, false, false, false);
         state.set_identity(identity);
         state.set_system(SystemInfo::default());
@@ -326,7 +364,7 @@ mod tests {
     /// 验证公网 IP ready 判断只接受真实获取成功状态。
     #[test]
     fn public_ip_ready_requires_ready_status() {
-        let mut state = TelemetryState::default();
+        let mut state = LatestTelemetry::default();
         state.set_identity(test_identity());
         assert!(state.public_ip_ready());
 
@@ -334,5 +372,49 @@ mod tests {
         identity.public_ip = PublicIpInfo::failed("temporary failure".to_string(), 10);
         state.set_identity(identity);
         assert!(!state.public_ip_ready());
+    }
+
+    /// 验证身份刷新失败会保留旧公网 IP，并标记为 stale。
+    #[test]
+    fn identity_refresh_failure_marks_existing_public_ip_stale() {
+        let mut state = LatestTelemetry::default();
+        state.set_identity(test_identity());
+
+        state.apply_identity_refresh(IdentityInfo {
+            agent_id: "agent-test".to_string(),
+            public_ip: PublicIpInfo::failed("temporary failure".to_string(), 2),
+            ..IdentityInfo::default()
+        });
+
+        let identity = state.identity.ready().unwrap();
+        assert_eq!(identity.agent_id, "agent-test");
+        assert_eq!(identity.public_ip.status, PublicIpStatus::Stale);
+        assert_eq!(
+            identity.public_ip.ip,
+            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+        );
+        assert_eq!(
+            identity.public_ip.error.as_deref(),
+            Some("temporary failure")
+        );
+    }
+
+    /// 验证没有可用旧公网 IP 时会记录 failed 状态。
+    #[test]
+    fn identity_refresh_failure_is_recorded_when_identity_missing() {
+        let mut state = LatestTelemetry::default();
+
+        state.apply_identity_refresh(IdentityInfo {
+            agent_id: "agent-test".to_string(),
+            public_ip: PublicIpInfo::failed("temporary failure".to_string(), 2),
+            ..IdentityInfo::default()
+        });
+
+        let identity = state.identity.ready().unwrap();
+        assert_eq!(identity.public_ip.status, PublicIpStatus::Failed);
+        assert_eq!(
+            identity.public_ip.error.as_deref(),
+            Some("temporary failure")
+        );
     }
 }

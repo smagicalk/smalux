@@ -8,8 +8,8 @@ use super::super::defaults::{
 use super::disk::{DiskConfig, DiskConfigPatch};
 use super::export::{ExportConfig, ExportConfigPatch};
 use super::group::{GroupConfig, GroupConfigPatch};
-use super::job::{JobsConfig, JobsConfigPatch};
 use super::network::{NetworkConfig, NetworkConfigPatch};
+use super::outbound::{OutboundConfig, OutboundConfigPatch};
 use super::process::{ProcessConfig, ProcessConfigPatch};
 use super::public_ip::{PublicIpConfig, PublicIpConfigPatch};
 use super::remote::{
@@ -46,8 +46,8 @@ pub(crate) struct AgentConfig {
     pub public_ip: PublicIpConfig,
     /// 上报配置。
     pub report: ReportConfig,
-    /// 导出 job 配置。
-    pub jobs: JobsConfig,
+    /// 出站业务事件配置。
+    pub outbound: OutboundConfig,
     /// 远程 shell 运行限制。
     pub remote_shell: RemoteShellConfig,
     /// 远程任务运行限制。
@@ -83,7 +83,7 @@ impl Default for AgentConfig {
             ),
             public_ip: PublicIpConfig::default(),
             report: ReportConfig::default(),
-            jobs: JobsConfig::default(),
+            outbound: OutboundConfig::default(),
             remote_shell: RemoteShellConfig::default(),
             remote_task: RemoteTaskConfig::default(),
             remote_probe: RemoteProbeConfig::default(),
@@ -92,11 +92,10 @@ impl Default for AgentConfig {
     }
 }
 
-/// agent 配置 patch。
+/// server 运行期配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentConfigPatch {
-    /// agent 实例 ID。启动后不建议由 server 修改。
-    pub agent_id: Option<String>,
     /// 核心指标配置 patch。
     pub core: Option<GroupConfigPatch>,
     /// 磁盘指标配置 patch。
@@ -111,8 +110,8 @@ pub(crate) struct AgentConfigPatch {
     pub public_ip: Option<PublicIpConfigPatch>,
     /// 上报配置 patch。
     pub report: Option<ReportConfigPatch>,
-    /// 导出 job 配置 patch。
-    pub jobs: Option<JobsConfigPatch>,
+    /// 出站业务事件配置 patch。
+    pub outbound: Option<OutboundConfigPatch>,
     /// 远程 shell 运行限制 patch。
     pub remote_shell: Option<RemoteShellConfigPatch>,
     /// 远程任务运行限制 patch。
@@ -124,11 +123,8 @@ pub(crate) struct AgentConfigPatch {
 }
 
 impl AgentConfigPatch {
-    /// 应用 agent 配置 patch。
+    /// 应用 server 运行期配置 patch。
     pub(crate) fn apply_to(&self, config: &mut AgentConfig) {
-        if let Some(agent_id) = self.agent_id.clone() {
-            config.agent_id = agent_id;
-        }
         if let Some(core) = &self.core {
             core.apply_to(&mut config.core);
         }
@@ -150,8 +146,8 @@ impl AgentConfigPatch {
         if let Some(report) = &self.report {
             report.apply_to(&mut config.report);
         }
-        if let Some(jobs) = &self.jobs {
-            jobs.apply_to(&mut config.jobs);
+        if let Some(outbound) = &self.outbound {
+            outbound.apply_to(&mut config.outbound);
         }
         if let Some(remote_shell) = &self.remote_shell {
             remote_shell.apply_to(&mut config.remote_shell);

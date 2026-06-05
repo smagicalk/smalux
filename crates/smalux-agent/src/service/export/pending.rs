@@ -1,19 +1,19 @@
 //! export pending 事件缓存和重发。
 
 use super::super::outbound::{
-    ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
-    ReportEnvelope,
+    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
+    RemoteTaskResultEnvelope, ReportEnvelope,
 };
-use super::jobs::{RuntimeJob, send_ready_jobs};
+use super::delivery::{RuntimeDelivery, send_ready_deliveries};
 use crate::export::{
-    ExportJobFailurePolicy, ExportJobId, ExportRouter, TransportEvent, TransportHub,
+    ExportDeliveryFailurePolicy, ExportDeliveryId, ExportRouter, TransportEvent, TransportHub,
 };
 use std::collections::BTreeMap;
 
 /// 处理 transport worker 回传的真实发送结果。
 pub(super) fn handle_transport_event(
     event: TransportEvent,
-    jobs: &mut [RuntimeJob],
+    deliveries: &mut [RuntimeDelivery],
     pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
     pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
     pending_control_acks: &mut BTreeMap<u64, ControlAckEnvelope>,
@@ -22,74 +22,81 @@ pub(super) fn handle_transport_event(
     match event {
         TransportEvent::Sent {
             transport,
-            job,
+            delivery,
             sequence,
         } => {
-            if job == ExportJobId::RemoteTaskResult {
+            if delivery == ExportDeliveryId::RemoteTaskResult {
                 pending_remote_task_results.remove(&sequence);
             }
-            if job == ExportJobId::RemoteProbeResult {
+            if delivery == ExportDeliveryId::RemoteProbeResult {
                 pending_remote_probe_results.remove(&sequence);
             }
-            if job == ExportJobId::ControlAck {
+            if delivery == ExportDeliveryId::ControlAck {
                 pending_control_acks.remove(&sequence);
             }
-            if job == ExportJobId::ControlError {
+            if delivery == ExportDeliveryId::ControlError {
                 pending_control_errors.remove(&sequence);
             }
-            if let Some(runtime_job) = jobs
+            if let Some(runtime_delivery) = deliveries
                 .iter_mut()
-                .find(|runtime_job| runtime_job.spec.id == job)
+                .find(|runtime_delivery| runtime_delivery.spec.id == delivery)
             {
-                runtime_job.last_sent_sequence =
-                    Some(runtime_job.last_sent_sequence.unwrap_or(0).max(sequence));
+                runtime_delivery.last_sent_sequence = Some(
+                    runtime_delivery
+                        .last_sent_sequence
+                        .unwrap_or(0)
+                        .max(sequence),
+                );
             }
             tracing::debug!(
                 transport = transport.as_str(),
-                job = job.as_str(),
+                delivery = delivery.as_str(),
                 sequence,
-                "export job send confirmed"
+                "export delivery send confirmed"
             );
             Ok(())
         }
         TransportEvent::Failed {
             transport,
-            job,
+            delivery,
             sequence,
             error,
         } => {
             let policy = if matches!(
-                job,
-                ExportJobId::RemoteTaskResult
-                    | ExportJobId::RemoteProbeResult
-                    | ExportJobId::ControlAck
-                    | ExportJobId::ControlError
+                delivery,
+                ExportDeliveryId::RemoteTaskResult
+                    | ExportDeliveryId::RemoteProbeResult
+                    | ExportDeliveryId::ControlAck
+                    | ExportDeliveryId::ControlError
             ) {
-                ExportJobFailurePolicy::ReconnectPipeline
+                ExportDeliveryFailurePolicy::ReconnectPipeline
+            } else if delivery == ExportDeliveryId::BasicInfo {
+                ExportDeliveryFailurePolicy::LogAndContinue
             } else {
-                jobs.iter()
-                    .find(|runtime_job| runtime_job.spec.id == job)
-                    .map(|runtime_job| runtime_job.spec.failure_policy)
-                    .unwrap_or(ExportJobFailurePolicy::ReconnectPipeline)
+                deliveries
+                    .iter()
+                    .find(|runtime_delivery| runtime_delivery.spec.id == delivery)
+                    .map(|runtime_delivery| runtime_delivery.spec.failure_policy)
+                    .unwrap_or(ExportDeliveryFailurePolicy::ReconnectPipeline)
             };
 
             match policy {
-                ExportJobFailurePolicy::ReconnectPipeline => {
+                ExportDeliveryFailurePolicy::ReconnectPipeline => {
                     anyhow::bail!(
-                        "export transport send failed: transport={}, job={}, sequence={}, error={}",
+                        "export transport send failed: transport={}, delivery={}, sequence={}, error={}",
                         transport.as_str(),
-                        job.as_str(),
+                        delivery.as_str(),
                         sequence,
                         error
                     )
                 }
-                ExportJobFailurePolicy::LogAndContinue => {
+                ExportDeliveryFailurePolicy::LogAndContinue => {
                     tracing::warn!(
                         transport = transport.as_str(),
-                        job = job.as_str(),
+                        delivery = delivery.as_str(),
                         sequence,
                         error = %error,
-                        "export job send failed; continuing"
+                        "export delivery send failed; continuing"
                     );
                     Ok(())
                 }
@@ -98,22 +105,51 @@ pub(super) fn handle_transport_event(
     }
 }
 
+/// 投递低频基础信息事件；失败只由调用方记录，不参与 pending 重投。
+pub(super) async fn queue_basic_info(
+    transport_hub: &mut TransportHub,
+    router: &mut ExportRouter,
+    info: BasicInfoEnvelope,
+) -> anyhow::Result<()> {
+    let request_count = router.send_basic_info(transport_hub, &info).await?;
+    if request_count == 0 {
+        tracing::debug!(
+            sequence = info.sequence,
+            format_skipped = true,
+            "basic info skipped by adapter"
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(sequence = info.sequence, request_count, "basic info queued");
+    Ok(())
+}
+
+/// 重新连接后恢复需要继续发送的事件。
+pub(super) struct PendingResumeEvents<'a> {
+    /// 等待重新发送的远程任务结果。
+    pub(super) remote_task_results: &'a mut BTreeMap<u64, RemoteTaskResultEnvelope>,
+    /// 等待重新发送的远程探测结果。
+    pub(super) remote_probe_results: &'a mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+    /// 等待重新发送的控制确认。
+    pub(super) control_acks: &'a mut BTreeMap<u64, ControlAckEnvelope>,
+    /// 等待重新发送的控制错误。
+    pub(super) control_errors: &'a mut BTreeMap<u64, ControlErrorEnvelope>,
+}
+
 /// 重新连接后恢复需要继续发送的事件。
 pub(super) async fn send_resume_events(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    jobs: &mut [RuntimeJob],
+    deliveries: &mut [RuntimeDelivery],
     latest_report: Option<&ReportEnvelope>,
-    pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
-    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
-    pending_control_acks: &mut BTreeMap<u64, ControlAckEnvelope>,
-    pending_control_errors: &mut BTreeMap<u64, ControlErrorEnvelope>,
+    pending: PendingResumeEvents<'_>,
 ) -> anyhow::Result<()> {
-    send_ready_jobs(transport_hub, router, jobs, latest_report).await?;
-    send_pending_remote_task_results(transport_hub, router, pending_remote_task_results).await?;
-    send_pending_remote_probe_results(transport_hub, router, pending_remote_probe_results).await?;
-    send_pending_control_acks(transport_hub, router, pending_control_acks).await?;
-    send_pending_control_errors(transport_hub, router, pending_control_errors).await
+    send_ready_deliveries(transport_hub, router, deliveries, latest_report).await?;
+    send_pending_remote_task_results(transport_hub, router, pending.remote_task_results).await?;
+    send_pending_remote_probe_results(transport_hub, router, pending.remote_probe_results).await?;
+    send_pending_control_acks(transport_hub, router, pending.control_acks).await?;
+    send_pending_control_errors(transport_hub, router, pending.control_errors).await
 }
 
 /// 投递远程任务结果，并在等待发送确认期间保留一份副本。

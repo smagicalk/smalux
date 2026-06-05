@@ -22,6 +22,7 @@ impl GroupConfig {
 
 /// 通用采样组配置 patch。
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GroupConfigPatch {
     /// 是否启用该采样组。
     pub enabled: Option<bool>,

@@ -7,23 +7,25 @@ use sysinfo::System;
 
 /// 从已刷新的系统对象构建 CPU 汇总信息和每个逻辑 CPU 的明细。
 pub(crate) fn build_cpu_info(system: &System) -> CpuInfo {
-    let mut res_cpu = CpuInfo::default();
     let cpus = system.cpus();
-
-    res_cpu.cpu_num = cpus.len();
+    let mut res_cpu = CpuInfo {
+        cpu_num: cpus.len(),
+        cpu_usage: system.global_cpu_usage(),
+        cpus: Vec::with_capacity(cpus.len()),
+    };
 
     for cpu in cpus {
         // 保留每个逻辑 CPU 的名称、品牌、供应商、频率和使用率，方便上层做明细展示。
-        let mut cpu_info = Cpu::default();
-        cpu_info.name = cpu.name().to_string();
-        cpu_info.usage = cpu.cpu_usage();
-        cpu_info.frequency = cpu.frequency();
-        cpu_info.brand = cpu.brand().to_string();
-        cpu_info.vendor_id = cpu.vendor_id().to_string();
+        let cpu_info = Cpu {
+            name: cpu.name().to_string(),
+            brand: cpu.brand().to_string(),
+            vendor_id: cpu.vendor_id().to_string(),
+            usage: cpu.cpu_usage(),
+            frequency: cpu.frequency(),
+        };
         res_cpu.cpus.push(cpu_info);
     }
 
-    res_cpu.cpu_usage = system.global_cpu_usage();
     res_cpu
 }
 

@@ -1,6 +1,8 @@
 //! CLI 参数定义和原始解析器。
 
-use super::value::{CliAuthMode, CliExportFormat, CliMetricLevel, CliWireMode};
+use super::value::{
+    CliAuthMode, CliExportFormat, CliMetricLevel, CliRemoteMetricPermission, CliWireMode,
+};
 use clap::Parser;
 use std::time::Duration;
 
@@ -50,9 +52,9 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     pub log_max_size_mb: Option<u64>,
 
-    /// server WebSocket 地址。
-    #[arg(short = 's', long)]
-    pub server_url: Option<String>,
+    /// server 根地址，例如 `https://example.com`；adapter 会派生具体 endpoint。
+    #[arg(short = 's', long = "server")]
+    pub base_url: Option<String>,
     /// 导出数据编码格式：smalux_json/komari。
     #[arg(short = 'f', long = "format", value_enum)]
     pub format: Option<CliExportFormat>,
@@ -129,9 +131,9 @@ pub(crate) struct CliArgs {
     /// 进程 light/details 返回条数上限。
     #[arg(long)]
     pub processes_limit: Option<usize>,
-    /// 是否允许 server 触发进程 details 诊断采集。
-    #[arg(long)]
-    pub allow_process_details: Option<bool>,
+    /// 允许 server 触发的最高进程采样级别：none/count/light/details。
+    #[arg(long = "allow-process-level", value_enum)]
+    pub allow_process_level: Option<CliRemoteMetricPermission>,
 
     /// 是否启用 Socket 汇总指标。
     #[arg(long)]
@@ -145,9 +147,9 @@ pub(crate) struct CliArgs {
     /// Socket details 返回条数上限。
     #[arg(long)]
     pub sockets_limit: Option<usize>,
-    /// 是否允许 server 触发 Socket details 诊断采集。
-    #[arg(long)]
-    pub allow_socket_details: Option<bool>,
+    /// 允许 server 触发的最高 Socket 采样级别：none/count/light/details。
+    #[arg(long = "allow-socket-level", value_enum)]
+    pub allow_socket_level: Option<CliRemoteMetricPermission>,
 
     /// 是否启用公网 IP 采集。
     #[arg(long)]
@@ -161,9 +163,9 @@ pub(crate) struct CliArgs {
     /// 是否校验网卡公网候选地址。
     #[arg(long)]
     pub public_ip_verify_interface: Option<bool>,
-    /// 公网 IP 启动探测超时，例如 `3s`。
+    /// 公网 IP 外部探测超时，例如 `3s`。
     #[arg(long, value_parser = parse_duration)]
-    pub public_ip_startup_timeout: Option<Duration>,
+    pub public_ip_lookup_timeout: Option<Duration>,
     /// 公网 IP 失败重试间隔，例如 `30s`。
     #[arg(long, value_parser = parse_duration)]
     pub public_ip_retry_interval: Option<Duration>,
@@ -196,24 +198,21 @@ pub(crate) struct CliArgs {
     #[arg(long, value_parser = parse_duration)]
     pub report_force_snapshot_min_interval: Option<Duration>,
 
-    /// 是否启用实时上报导出 job。
+    /// 是否启用实时 report 出站。
     #[arg(long)]
     pub realtime_report_enabled: Option<bool>,
-    /// 实时上报导出 job 间隔；未传时 `--report-interval` 会同时作为兼容别名。
-    #[arg(long, value_parser = parse_duration)]
-    pub realtime_report_interval: Option<Duration>,
-    /// 实时上报导出 job 是否在第一份 report ready 后立即运行。
+    /// 第一份 report ready 后是否立即发送实时 report。
     #[arg(long)]
-    pub realtime_report_run_on_start: Option<bool>,
-    /// 是否启用 basic info 导出 job。
+    pub realtime_report_send_on_start: Option<bool>,
+    /// 是否启用 basic info 出站事件。
     #[arg(long)]
     pub basic_info_enabled: Option<bool>,
-    /// basic info 导出 job 间隔，例如 `5m`。
+    /// basic info 刷新事件生成间隔，例如 `5m`。
     #[arg(long, value_parser = parse_duration)]
-    pub basic_info_interval: Option<Duration>,
-    /// basic info 导出 job 是否在第一份 report ready 后立即运行。
+    pub basic_info_refresh_interval: Option<Duration>,
+    /// 第一份 telemetry ready 后是否立即发送 basic info。
     #[arg(long)]
-    pub basic_info_run_on_start: Option<bool>,
+    pub basic_info_send_on_start: Option<bool>,
 
     /// 是否启用远程交互式 shell；只能启动时设置，server patch 不能修改。
     #[arg(short = 'S', long)]

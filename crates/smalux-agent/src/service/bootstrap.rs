@@ -3,7 +3,7 @@
 use super::options::ServiceState;
 use crate::collect::{LocalCollector, get_info};
 use crate::config::AgentConfig;
-use crate::telemetry::TelemetryState;
+use crate::telemetry::LatestTelemetry;
 use smalux_core::model::info::{PublicIpInfo, PublicIpStatus};
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
@@ -15,49 +15,50 @@ pub(crate) async fn bootstrap_once(
     collector: &mut LocalCollector,
     config_rx: &watch::Receiver<AgentConfig>,
 ) -> ServiceState {
-    let mut store = TelemetryState::default();
+    let mut latest_telemetry = LatestTelemetry::default();
     let config = config_rx.borrow().clone();
 
     tracing::info!("Starting initial metric bootstrap");
-    store.configure_metric_groups(
+    latest_telemetry.configure_metric_groups(
         config.core.enabled,
         config.disk.enabled,
         config.network.enabled,
         config.processes.enabled,
         config.sockets.enabled,
     );
-    store.set_system(get_info());
+    latest_telemetry.set_system(get_info());
     if config.core.enabled {
-        store.set_core(collector.sample_core());
+        latest_telemetry.set_core(collector.sample_core());
     }
     if config.disk.enabled {
-        store.set_disk(collector.sample_disk(config.disk.include_per_device));
+        latest_telemetry.set_disk(collector.sample_disk(config.disk.include_per_device));
     }
     if config.network.enabled {
-        store.set_network(collector.sample_network(
+        latest_telemetry.set_network(collector.sample_network(
             config.network.include_per_interface,
             &config.network.include_interfaces,
             &config.network.exclude_interfaces,
         ));
     }
     if config.processes.enabled {
-        store.set_processes(
+        latest_telemetry.set_processes(
             collector.sample_processes(config.processes.level, config.processes.limit),
         );
     }
     if config.sockets.enabled {
-        store.set_sockets(collector.sample_sockets(config.sockets.level, config.sockets.limit));
+        latest_telemetry
+            .set_sockets(collector.sample_sockets(config.sockets.level, config.sockets.limit));
     }
 
     let identity = collector
         .sample_identity(config.agent_id.clone(), &config.public_ip)
         .await;
     log_public_ip_status("bootstrap", &identity.public_ip);
-    store.set_identity(identity);
+    latest_telemetry.set_identity(identity);
 
-    let first_report_ready = store.first_report_ready();
+    let first_report_ready = latest_telemetry.first_report_ready();
     ServiceState {
-        store,
+        latest_telemetry,
         first_report_ready,
     }
 }
@@ -65,7 +66,7 @@ pub(crate) async fn bootstrap_once(
 /// 重试公网 IP 身份信息采集，成功后更新缓存。
 pub(crate) async fn retry_identity_until_ready(
     collector: &mut LocalCollector,
-    store: &mut TelemetryState,
+    latest_telemetry: &mut LatestTelemetry,
     config_rx: &mut watch::Receiver<AgentConfig>,
 ) {
     let mut config = config_rx.borrow().clone();
@@ -77,7 +78,7 @@ pub(crate) async fn retry_identity_until_ready(
     let mut retry_tick = public_ip_retry_interval(&config);
     let mut config_rx_open = true;
 
-    while !store.public_ip_ready() {
+    while !latest_telemetry.public_ip_ready() {
         tokio::select! {
             _ = retry_tick.tick() => {}
             changed = config_rx.changed(), if config_rx_open => {
@@ -101,8 +102,8 @@ pub(crate) async fn retry_identity_until_ready(
             .sample_identity(config.agent_id.clone(), &config.public_ip)
             .await;
         log_public_ip_status("retry", &identity.public_ip);
-        store.set_identity(identity);
-        if store.public_ip_ready() {
+        latest_telemetry.set_identity(identity);
+        if latest_telemetry.public_ip_ready() {
             break;
         }
     }
@@ -190,7 +191,7 @@ mod tests {
         config.public_ip.retry_interval = Duration::from_millis(200);
         let (sender, mut config_rx) = watch::channel(config.clone());
         let mut collector = LocalCollector::new();
-        let mut store = TelemetryState::default();
+        let mut latest_telemetry = LatestTelemetry::default();
 
         let sender_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -200,12 +201,12 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            retry_identity_until_ready(&mut collector, &mut store, &mut config_rx),
+            retry_identity_until_ready(&mut collector, &mut latest_telemetry, &mut config_rx),
         )
         .await
         .unwrap();
         sender_task.await.unwrap();
 
-        assert!(!store.first_report_ready());
+        assert!(!latest_telemetry.first_report_ready());
     }
 }

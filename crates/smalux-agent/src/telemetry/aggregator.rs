@@ -3,7 +3,7 @@
 //! 这里负责把最新 telemetry 状态转换为 snapshot、delta 或 heartbeat。导出层只消费
 //! 已经聚合好的 `ReportEvent`，不直接理解采样缓存细节。
 
-use super::{ReportEvent, TelemetryState};
+use super::{LatestTelemetry, ReportEvent};
 use crate::collect::unix_timestamp_secs;
 use crate::config::AgentConfig;
 use smalux_core::model::info::AgentReport;
@@ -29,7 +29,7 @@ impl TelemetryAggregator {
     /// 从 telemetry 状态和配置构建下一条待发送事件。
     pub(crate) fn next_report_event(
         &mut self,
-        state: &TelemetryState,
+        state: &LatestTelemetry,
         agent_version: &str,
         config: &AgentConfig,
         next_sequence: impl FnMut() -> u64,
@@ -45,7 +45,7 @@ impl TelemetryAggregator {
     /// 从当前 telemetry 状态强制构建完整 snapshot。
     pub(crate) fn force_snapshot_event(
         &mut self,
-        state: &TelemetryState,
+        state: &LatestTelemetry,
         agent_version: &str,
         mut next_sequence: impl FnMut() -> u64,
     ) -> anyhow::Result<ReportEvent> {
@@ -61,7 +61,7 @@ impl TelemetryAggregator {
     /// 从 telemetry 状态和配置构建下一条内部上报语义。
     fn next_outbound(
         &mut self,
-        state: &TelemetryState,
+        state: &LatestTelemetry,
         agent_version: &str,
         config: &AgentConfig,
         mut next_sequence: impl FnMut() -> u64,
@@ -73,10 +73,10 @@ impl TelemetryAggregator {
             return Ok(Some(self.snapshot(report, now, next_sequence())));
         }
 
-        if config.report.delta_enabled {
-            if let Some(delta) = self.build_delta(&report, now) {
-                return Ok(Some(self.delta(report, delta, now, next_sequence())));
-            }
+        if config.report.delta_enabled
+            && let Some(delta) = self.build_delta(&report, now)
+        {
+            return Ok(Some(self.delta(report, delta, now, next_sequence())));
         }
 
         if self.should_send_heartbeat(now, config) {
@@ -215,8 +215,8 @@ mod tests {
     };
 
     /// 构造已经满足上报条件的状态。
-    fn ready_state() -> TelemetryState {
-        let mut state = TelemetryState::default();
+    fn ready_state() -> LatestTelemetry {
+        let mut state = LatestTelemetry::default();
         state.set_identity(IdentityInfo {
             agent_id: "agent-test".to_string(),
             ..IdentityInfo::default()
@@ -253,7 +253,7 @@ mod tests {
     /// 从 aggregator 中构建下一条事件。
     fn next_report(
         aggregator: &mut TelemetryAggregator,
-        state: &TelemetryState,
+        state: &LatestTelemetry,
         config: &AgentConfig,
     ) -> Option<OutboundReport> {
         let mut next_sequence = aggregator.last_report_sequence.unwrap_or(0);
