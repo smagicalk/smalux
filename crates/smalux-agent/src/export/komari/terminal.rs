@@ -4,7 +4,7 @@
 //! `request_id`，然后 agent 再打开独立 terminal WebSocket 并复用 remote shell manager。
 
 use crate::config::model::{ExportAuthMode, ExportConfig};
-use crate::export::ExportInboundMessage;
+use crate::export::TransportInboundMessage;
 use crate::export::ws::WebSocketConfig;
 use crate::service::shell::{
     RemoteShellFrame, RemoteShellInput, RemoteShellStreamCodec, RemoteShellStreamEvent,
@@ -61,11 +61,11 @@ impl RemoteShellStreamCodec for KomariTerminalCodec {
     /// 将 Komari terminal 入站消息转换为内部 shell 输入。
     fn decode_inbound(
         &self,
-        msg: ExportInboundMessage,
+        msg: TransportInboundMessage,
     ) -> anyhow::Result<Option<RemoteShellInput>> {
         match msg {
-            ExportInboundMessage::Binary(bytes) => Ok(Some(RemoteShellInput::Input(bytes))),
-            ExportInboundMessage::Text(text) => decode_terminal_text_message(text),
+            TransportInboundMessage::Binary(bytes) => Ok(Some(RemoteShellInput::Input(bytes))),
+            TransportInboundMessage::Text(text) => decode_terminal_text_message(text),
         }
     }
 
@@ -204,7 +204,7 @@ mod tests {
     fn komari_terminal_codec_decodes_raw_binary_input() {
         let codec = KomariTerminalCodec;
         let input = codec
-            .decode_inbound(ExportInboundMessage::Binary(b"echo ok\r\n".to_vec()))
+            .decode_inbound(TransportInboundMessage::Binary(b"echo ok\r\n".to_vec()))
             .unwrap()
             .unwrap();
 
@@ -220,7 +220,7 @@ mod tests {
     fn komari_terminal_codec_decodes_input_alias_text() {
         let codec = KomariTerminalCodec;
         let input = codec
-            .decode_inbound(ExportInboundMessage::Text(
+            .decode_inbound(TransportInboundMessage::Text(
                 r#"{ "type": "input", "input": "echo komari\n" }"#.to_string(),
             ))
             .unwrap()

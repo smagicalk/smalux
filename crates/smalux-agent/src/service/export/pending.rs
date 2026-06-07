@@ -37,16 +37,12 @@ pub(super) fn handle_transport_event(
             if delivery == ExportDeliveryId::ControlError {
                 pending_control_errors.remove(&sequence);
             }
-            if let Some(runtime_delivery) = deliveries
+            if let Some(delivery_state) = deliveries
                 .iter_mut()
-                .find(|runtime_delivery| runtime_delivery.spec.id == delivery)
+                .find(|delivery_state| delivery_state.spec.id == delivery)
             {
-                runtime_delivery.last_sent_sequence = Some(
-                    runtime_delivery
-                        .last_sent_sequence
-                        .unwrap_or(0)
-                        .max(sequence),
-                );
+                delivery_state.last_sent_sequence =
+                    Some(delivery_state.last_sent_sequence.unwrap_or(0).max(sequence));
             }
             tracing::debug!(
                 transport = transport.as_str(),
@@ -75,8 +71,8 @@ pub(super) fn handle_transport_event(
             } else {
                 deliveries
                     .iter()
-                    .find(|runtime_delivery| runtime_delivery.spec.id == delivery)
-                    .map(|runtime_delivery| runtime_delivery.spec.failure_policy)
+                    .find(|delivery_state| delivery_state.spec.id == delivery)
+                    .map(|delivery_state| delivery_state.spec.failure_policy)
                     .unwrap_or(ExportDeliveryFailurePolicy::ReconnectPipeline)
             };
 

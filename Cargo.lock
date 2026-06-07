@@ -3709,7 +3709,6 @@ dependencies = [
  "ctor",
  "form_urlencoded",
  "futures-util",
- "hkdf",
  "humantime",
  "humantime-serde",
  "netstat2",
@@ -3720,7 +3719,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_path",
- "sha2",
  "smalux-core",
  "smalux-protocol",
  "snow",
@@ -3756,10 +3754,16 @@ dependencies = [
 name = "smalux-protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64",
+ "hkdf",
  "humantime-serde",
  "serde",
  "serde_json",
+ "sha2",
  "smalux-core",
+ "snow",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3778,6 +3782,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smalux-core",
+ "smalux-protocol",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",

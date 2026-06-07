@@ -7,11 +7,11 @@ use super::tasks::{
     wait_for_task,
 };
 use crate::config::model::ExportWireMode;
-use crate::export::security;
-use crate::export::wire::{self, WirePacket, WirePacketKind};
-use crate::export::{EncodedExportMessage, ExportMessageListener, ExportTransport};
+use crate::export::{EncodedTransportMessage, ExportTransport, InboundProtocolHandler};
 use anyhow::anyhow;
 use futures_util::{SinkExt, StreamExt};
+use smalux_protocol::secure;
+use smalux_protocol::wire::{self, WirePacket, WirePacketKind};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,10 +36,10 @@ pub(crate) struct WebSocketClient {
     sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<WebSocketCommand>>>>,
     /// 后台收发任务句柄，用于 close 时等待任务退出。
     task: Option<JoinHandle<()>>,
-    /// 监听器 worker 任务句柄。
-    listener_task: Option<JoinHandle<()>>,
-    /// 服务端文本消息监听器。
-    listener: Arc<tokio::sync::RwLock<Option<Arc<dyn ExportMessageListener>>>>,
+    /// 入站协议处理器 worker 任务句柄。
+    inbound_handler_task: Option<JoinHandle<()>>,
+    /// 服务端入站协议处理器。
+    inbound_handler: Arc<tokio::sync::RwLock<Option<Arc<dyn InboundProtocolHandler>>>>,
 }
 
 impl Debug for WebSocketClient {
@@ -58,13 +58,13 @@ impl WebSocketClient {
             config,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
             task: None,
-            listener_task: None,
-            listener: Arc::new(tokio::sync::RwLock::new(None)),
+            inbound_handler_task: None,
+            inbound_handler: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
     /// 启动后台收发任务。
-    fn start_listener(
+    fn start_background_tasks(
         &mut self,
         websocket: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -72,15 +72,15 @@ impl WebSocketClient {
         receive: tokio::sync::mpsc::Receiver<WebSocketCommand>,
         wire_state: WebSocketWireState,
     ) {
-        let (task, listener_task) = spawn_websocket_tasks(
+        let (task, inbound_handler_task) = spawn_websocket_tasks(
             websocket,
             receive,
             self.config.heartbeat,
             wire_state,
-            self.listener.clone(),
+            self.inbound_handler.clone(),
         );
         self.task = Some(task);
-        self.listener_task = Some(listener_task);
+        self.inbound_handler_task = Some(inbound_handler_task);
     }
 
     /// 关闭已启动的后台任务。
@@ -89,8 +89,8 @@ impl WebSocketClient {
             wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "websocket background task").await;
         }
 
-        if let Some(task) = self.listener_task.take() {
-            wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "listener worker").await;
+        if let Some(task) = self.inbound_handler_task.take() {
+            wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "inbound handler worker").await;
         }
     }
 
@@ -127,21 +127,21 @@ impl WebSocketClient {
             "websocket secure_psk handshake starting"
         );
 
-        let mut handshake = security::build_noise_initiator(&key.psk)?;
+        let mut handshake = secure::build_noise_initiator(&key.psk)?;
         send_wire_packet(
             websocket,
             WirePacket::new(
                 WirePacketKind::Hello,
                 session_id,
                 0,
-                security::encode_secure_hello(&key.key_id)?,
+                secure::encode_secure_hello(&key.key_id)?,
             ),
         )
         .await?;
 
         // NNpsk0 不传静态公钥，认证完全来自双方是否能用同一个 PSK 完成握手。
         // 第 1 条 handshake 由 agent 发出，第 2 条必须由 server responder 返回。
-        let first = security::write_handshake_message(&mut handshake, b"")?;
+        let first = secure::write_handshake_message(&mut handshake, b"")?;
         send_wire_packet(
             websocket,
             WirePacket::new(WirePacketKind::Handshake, session_id, 1, first),
@@ -159,7 +159,7 @@ impl WebSocketClient {
             anyhow::bail!("secure handshake response session_id mismatch");
         }
         // read_handshake_message 会校验 responder 是否持有正确 PSK；失败就不能进入 transport mode。
-        security::read_handshake_message(&mut handshake, &response.payload)?;
+        secure::read_handshake_message(&mut handshake, &response.payload)?;
         let transport = handshake.into_transport_mode()?;
 
         tracing::info!(
@@ -194,7 +194,7 @@ impl WebSocketClient {
     fn spawn_drop_cleanup(
         sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<WebSocketCommand>>>>,
         task: Option<JoinHandle<()>>,
-        listener_task: Option<JoinHandle<()>>,
+        inbound_handler_task: Option<JoinHandle<()>>,
     ) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -207,13 +207,13 @@ impl WebSocketClient {
                     wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "websocket background task").await;
                 }
 
-                if let Some(task) = listener_task {
-                    wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "listener worker").await;
+                if let Some(task) = inbound_handler_task {
+                    wait_for_task(task, TASK_SHUTDOWN_TIMEOUT, "inbound handler worker").await;
                 }
             });
         } else {
             abort_task(task);
-            abort_task(listener_task);
+            abort_task(inbound_handler_task);
         }
     }
 }
@@ -298,7 +298,9 @@ impl WebSocketClient {
 impl ExportTransport for WebSocketClient {
     /// 建立 WebSocket 连接，认证成功后启动后台收发任务。
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.sender.lock().await.is_some() || self.task.is_some() || self.listener_task.is_some()
+        if self.sender.lock().await.is_some()
+            || self.task.is_some()
+            || self.inbound_handler_task.is_some()
         {
             anyhow::bail!("websocket client is already connected");
         }
@@ -308,7 +310,7 @@ impl ExportTransport for WebSocketClient {
             auth = self.config.auth.kind(),
             token_set = self.config.auth.token_set(),
             unsafe_cert = self.config.unsafe_cert,
-            heartbeat_secs = self.config.heartbeat,
+            heartbeat_ms = self.config.heartbeat.as_millis(),
             "websocket connecting"
         );
 
@@ -358,7 +360,7 @@ impl ExportTransport for WebSocketClient {
 
         // wire 准备完成后创建业务发送 channel，再启动后台收发循环。
         let (sender, stop_receiver) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        self.start_listener(ws, stop_receiver, wire_state);
+        self.start_background_tasks(ws, stop_receiver, wire_state);
         self.sender.lock().await.replace(sender);
         tracing::info!(
             url = %redact_url(&build_connect_url(&self.config)?),
@@ -373,25 +375,28 @@ impl ExportTransport for WebSocketClient {
     }
 
     /// 发送已编码消息。
-    async fn send_encoded_export_message(
+    async fn send_encoded_transport_message(
         &mut self,
-        msg: EncodedExportMessage,
+        msg: EncodedTransportMessage,
     ) -> anyhow::Result<()> {
         match msg {
-            EncodedExportMessage::Text(text) => self.enqueue_text(text).await,
-            EncodedExportMessage::Binary { sequence, body } => {
+            EncodedTransportMessage::Text(text) => self.enqueue_text(text).await,
+            EncodedTransportMessage::Binary { sequence, body } => {
                 self.enqueue_binary(sequence, body).await
             }
         }
     }
 
-    /// 替换当前消息监听器。
-    async fn set_listener(
+    /// 替换当前入站协议处理器。
+    async fn set_inbound_handler(
         &mut self,
-        listener: Box<dyn ExportMessageListener>,
+        handler: Box<dyn InboundProtocolHandler>,
     ) -> anyhow::Result<()> {
-        self.listener.write().await.replace(Arc::from(listener));
-        tracing::debug!("websocket listener updated");
+        self.inbound_handler
+            .write()
+            .await
+            .replace(Arc::from(handler));
+        tracing::debug!("websocket inbound handler updated");
         Ok(())
     }
 
@@ -408,8 +413,8 @@ impl Drop for WebSocketClient {
     fn drop(&mut self) {
         let sender = self.sender.clone();
         let task = self.task.take();
-        let listener_task = self.listener_task.take();
+        let inbound_handler_task = self.inbound_handler_task.take();
 
-        Self::spawn_drop_cleanup(sender, task, listener_task);
+        Self::spawn_drop_cleanup(sender, task, inbound_handler_task);
     }
 }

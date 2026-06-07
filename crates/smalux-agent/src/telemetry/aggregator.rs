@@ -8,7 +8,7 @@ use crate::collect::unix_timestamp_secs;
 use crate::config::AgentConfig;
 use smalux_core::model::info::AgentReport;
 use smalux_protocol::{DeltaReport, Heartbeat, OutboundReport};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 根据上次发送状态决定本次发 snapshot、delta、heartbeat 或跳过。
 #[derive(Debug, Default)]
@@ -17,12 +17,14 @@ pub(crate) struct TelemetryAggregator {
     last_report: Option<AgentReport>,
     /// 最近一次发送给导出层的监控状态序号。
     last_report_sequence: Option<u64>,
+    /// 最近一次发送 snapshot、delta 或 heartbeat 的单调时间。
+    last_outbound_instant: Option<Instant>,
     /// 最近一次发送完整 snapshot 的时间。
     last_snapshot_at: Option<u64>,
+    /// 最近一次发送完整 snapshot 的单调时间，用于保留亚秒间隔精度。
+    last_snapshot_instant: Option<Instant>,
     /// 最近一次发送完整 snapshot 的序号。
     last_snapshot_sequence: Option<u64>,
-    /// 最近一次发送业务心跳的时间。
-    last_heartbeat_at: Option<u64>,
 }
 
 impl TelemetryAggregator {
@@ -51,9 +53,11 @@ impl TelemetryAggregator {
     ) -> anyhow::Result<ReportEvent> {
         let report = state.build_report(agent_version)?;
         let now = unix_timestamp_secs();
+        let now_instant = Instant::now();
         Ok(ReportEvent::new(self.snapshot(
             report,
             now,
+            now_instant,
             next_sequence(),
         )))
     }
@@ -68,26 +72,43 @@ impl TelemetryAggregator {
     ) -> anyhow::Result<Option<OutboundReport>> {
         let report = state.build_report(agent_version)?;
         let now = unix_timestamp_secs();
+        let now_instant = Instant::now();
 
-        if self.should_send_snapshot(now, config) {
-            return Ok(Some(self.snapshot(report, now, next_sequence())));
+        if self.should_send_snapshot(now_instant, config) {
+            return Ok(Some(self.snapshot(
+                report,
+                now,
+                now_instant,
+                next_sequence(),
+            )));
         }
 
         if config.report.delta_enabled
             && let Some(delta) = self.build_delta(&report, now)
         {
-            return Ok(Some(self.delta(report, delta, now, next_sequence())));
+            return Ok(Some(self.delta(
+                report,
+                delta,
+                now,
+                now_instant,
+                next_sequence(),
+            )));
         }
 
-        if self.should_send_heartbeat(now, config) {
-            return Ok(Some(self.heartbeat(&report, now, next_sequence())));
+        if self.should_send_heartbeat(now_instant, config) {
+            return Ok(Some(self.heartbeat(
+                &report,
+                now,
+                now_instant,
+                next_sequence(),
+            )));
         }
 
         Ok(None)
     }
 
     /// 判断是否需要发送完整 snapshot。
-    fn should_send_snapshot(&self, now: u64, config: &AgentConfig) -> bool {
+    fn should_send_snapshot(&self, now: Instant, config: &AgentConfig) -> bool {
         if self.last_report.is_none() {
             return true;
         }
@@ -95,22 +116,34 @@ impl TelemetryAggregator {
             return true;
         }
 
-        elapsed_at_least(self.last_snapshot_at, now, config.report.snapshot_interval)
+        elapsed_at_least(
+            self.last_snapshot_instant,
+            now,
+            config.report.snapshot_interval,
+        )
     }
 
     /// 判断是否需要发送业务级 heartbeat。
-    fn should_send_heartbeat(&self, now: u64, config: &AgentConfig) -> bool {
+    fn should_send_heartbeat(&self, now: Instant, config: &AgentConfig) -> bool {
         config.report.heartbeat_enabled
             && elapsed_at_least(
-                self.last_heartbeat_at,
+                self.last_outbound_instant,
                 now,
                 config.report.heartbeat_interval,
             )
     }
 
     /// 构造完整 snapshot，并更新策略状态。
-    fn snapshot(&mut self, report: AgentReport, now: u64, sequence: u64) -> OutboundReport {
+    fn snapshot(
+        &mut self,
+        report: AgentReport,
+        now: u64,
+        now_instant: Instant,
+        sequence: u64,
+    ) -> OutboundReport {
         self.last_snapshot_at = Some(now);
+        self.last_snapshot_instant = Some(now_instant);
+        self.last_outbound_instant = Some(now_instant);
         self.last_snapshot_sequence = Some(sequence);
         self.last_report_sequence = Some(sequence);
         self.last_report = Some(report.clone());
@@ -123,17 +156,25 @@ impl TelemetryAggregator {
         report: AgentReport,
         delta: DeltaReport,
         now: u64,
+        now_instant: Instant,
         sequence: u64,
     ) -> OutboundReport {
         let agent_id = report.identity.agent_id.clone();
         self.last_report_sequence = Some(sequence);
+        self.last_outbound_instant = Some(now_instant);
         self.last_report = Some(report);
         OutboundReport::delta(agent_id, sequence, now, delta)
     }
 
     /// 构造业务级 heartbeat。
-    fn heartbeat(&mut self, report: &AgentReport, now: u64, sequence: u64) -> OutboundReport {
-        self.last_heartbeat_at = Some(now);
+    fn heartbeat(
+        &mut self,
+        report: &AgentReport,
+        now: u64,
+        now_instant: Instant,
+        sequence: u64,
+    ) -> OutboundReport {
+        self.last_outbound_instant = Some(now_instant);
         OutboundReport::heartbeat(
             report.identity.agent_id.clone(),
             sequence,
@@ -186,9 +227,9 @@ impl TelemetryAggregator {
 }
 
 /// 判断指定时间点距离上次事件是否已经达到配置间隔。
-fn elapsed_at_least(previous_at: Option<u64>, now: u64, interval: Duration) -> bool {
+fn elapsed_at_least(previous_at: Option<Instant>, now: Instant, interval: Duration) -> bool {
     previous_at
-        .map(|previous| now.saturating_sub(previous) >= interval.as_secs())
+        .map(|previous| now.duration_since(previous) >= interval)
         .unwrap_or(true)
 }
 
@@ -377,6 +418,43 @@ mod tests {
         let state = ready_state();
         let mut config = AgentConfig::default();
         config.report.delta_enabled = true;
+        let mut aggregator = TelemetryAggregator::default();
+        let first = next_report(&mut aggregator, &state, &config).unwrap();
+        let second = next_report(&mut aggregator, &state, &config);
+
+        assert!(matches!(
+            first.kind,
+            smalux_protocol::OutboundReportKind::Snapshot { .. }
+        ));
+        assert!(second.is_none());
+    }
+
+    /// 验证亚秒 snapshot 间隔不会被截断成 0。
+    #[test]
+    fn aggregator_respects_subsecond_snapshot_interval() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.report.delta_enabled = true;
+        config.report.snapshot_interval = Duration::from_millis(500);
+        let mut aggregator = TelemetryAggregator::default();
+        let first = next_report(&mut aggregator, &state, &config).unwrap();
+        let second = next_report(&mut aggregator, &state, &config);
+
+        assert!(matches!(
+            first.kind,
+            smalux_protocol::OutboundReportKind::Snapshot { .. }
+        ));
+        assert!(second.is_none());
+    }
+
+    /// 验证亚秒业务心跳间隔不会被截断成 0。
+    #[test]
+    fn aggregator_respects_subsecond_heartbeat_interval() {
+        let state = ready_state();
+        let mut config = AgentConfig::default();
+        config.report.delta_enabled = true;
+        config.report.heartbeat_enabled = true;
+        config.report.heartbeat_interval = Duration::from_millis(500);
         let mut aggregator = TelemetryAggregator::default();
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config);

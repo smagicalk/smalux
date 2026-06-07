@@ -1,11 +1,11 @@
-//! Komari server 消息监听。
+//! Komari server 消息入站处理。
 //!
 //! terminal 和 exec 消息会转换为内部入站命令；其它 server 消息会安全忽略，
 //! 避免误解析成 smalux `config_patch`。
 
 use crate::config::ConfigManager;
 use crate::export::{
-    ExportInboundMessage, ExportMessageListener, inbound_message_into_string, komari::terminal,
+    InboundProtocolHandler, TransportInboundMessage, inbound_message_into_string, komari::terminal,
 };
 use crate::service::{
     InboundCommand, InboundCommandEnvelope, InboundCommandSender, RemoteProbeRunRequest,
@@ -16,33 +16,33 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// 构造 Komari server 消息监听器。
-pub(super) fn message_listener(
+/// 构造 Komari server 消息入站处理器。
+pub(super) fn inbound_handler(
     config_manager: ConfigManager,
     commands: InboundCommandSender,
-) -> Box<dyn ExportMessageListener> {
-    Box::new(KomariMessageListener {
+) -> Box<dyn InboundProtocolHandler> {
+    Box::new(KomariInboundHandler {
         config_manager,
         commands,
     })
 }
 
-/// Komari server 消息监听器。
+/// Komari server 消息入站处理器。
 ///
 /// terminal 消息转交 remote shell，exec 消息转交 remote task，其它 server 事件只记录并忽略。
 #[derive(Debug)]
-struct KomariMessageListener {
+struct KomariInboundHandler {
     /// 动态配置管理器，用于读取当前 export 配置。
     config_manager: ConfigManager,
     /// 入站命令发送端。
     commands: InboundCommandSender,
 }
 
-impl ExportMessageListener for KomariMessageListener {
+impl InboundProtocolHandler for KomariInboundHandler {
     /// 解析 Komari server 文本消息。
     fn on_message(
         &self,
-        msg: ExportInboundMessage,
+        msg: TransportInboundMessage,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         let config_manager = self.config_manager.clone();
         let commands = self.commands.clone();
@@ -222,7 +222,7 @@ fn shell_command(command: String) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    //! Komari message listener 测试。
+    //! Komari 消息入站处理器测试。
 
     use super::*;
     use crate::config::AgentConfig;
@@ -236,17 +236,17 @@ mod tests {
 
     /// 验证 terminal 消息会转换为内部远程 shell 命令。
     #[tokio::test]
-    async fn listener_enqueues_terminal_command() {
+    async fn inbound_handler_enqueues_terminal_command() {
         let mut config = AgentConfig::default();
         config.export.base_url = "http://127.0.0.1:3000".to_string();
         config.export.auth_mode = ExportAuthMode::Query;
         config.export.token = Some("secret-token".to_string());
         let manager = ConfigManager::new(config).unwrap();
         let (commands, mut command_rx) = inbound_command_channel();
-        let listener = message_listener(manager, commands);
+        let handler = inbound_handler(manager, commands);
 
-        listener
-            .on_message(ExportInboundMessage::Text(
+        handler
+            .on_message(TransportInboundMessage::Text(
                 r#"{ "message": "terminal", "request_id": "term-1" }"#.to_string(),
             ))
             .await
@@ -270,7 +270,7 @@ mod tests {
 
     /// 验证 Komari terminal 消息可以打开真实 raw binary terminal stream。
     #[tokio::test]
-    async fn listener_terminal_command_opens_raw_terminal_stream() {
+    async fn inbound_handler_terminal_command_opens_raw_terminal_stream() {
         let terminal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", terminal_listener.local_addr().unwrap());
         let terminal_task = tokio::spawn(async move {
@@ -326,10 +326,10 @@ mod tests {
         config.export.token = Some("secret-token".to_string());
         let manager = ConfigManager::new(config).unwrap();
         let (commands, mut command_rx) = inbound_command_channel();
-        let listener = message_listener(manager, commands);
+        let handler = inbound_handler(manager, commands);
 
-        listener
-            .on_message(ExportInboundMessage::Text(
+        handler
+            .on_message(TransportInboundMessage::Text(
                 r#"{ "message": "terminal", "request_id": "term-e2e" }"#.to_string(),
             ))
             .await
@@ -380,13 +380,13 @@ mod tests {
 
     /// 验证 exec 消息会转换为内部远程任务命令。
     #[tokio::test]
-    async fn listener_enqueues_exec_command() {
+    async fn inbound_handler_enqueues_exec_command() {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
         let (commands, mut command_rx) = inbound_command_channel();
-        let listener = message_listener(manager, commands);
+        let handler = inbound_handler(manager, commands);
 
-        listener
-            .on_message(ExportInboundMessage::Text(
+        handler
+            .on_message(TransportInboundMessage::Text(
                 r#"{ "message": "exec", "task_id": "task-1", "command": "echo ok" }"#.to_string(),
             ))
             .await
@@ -417,13 +417,13 @@ mod tests {
 
     /// 验证 ping 消息会转换为内部远程探测命令。
     #[tokio::test]
-    async fn listener_enqueues_ping_command() {
+    async fn inbound_handler_enqueues_ping_command() {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
         let (commands, mut command_rx) = inbound_command_channel();
-        let listener = message_listener(manager, commands);
+        let handler = inbound_handler(manager, commands);
 
-        listener
-            .on_message(ExportInboundMessage::Text(
+        handler
+            .on_message(TransportInboundMessage::Text(
                 r#"{ "message": "ping", "ping_task_id": 123, "ping_type": "tcp", "ping_target": "example.com:443" }"#.to_string(),
             ))
             .await

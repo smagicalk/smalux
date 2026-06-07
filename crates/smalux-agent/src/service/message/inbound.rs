@@ -1,6 +1,6 @@
 //! Server 入站命令调度。
 //!
-//! 协议 listener 只负责把 server 消息转换为内部命令，本模块负责校验和执行业务动作。
+//! 协议 handler 只负责把 server 消息转换为内部命令，本模块负责校验和执行业务动作。
 
 use super::outbound::{
     ControlAckEnvelope, ControlErrorEnvelope, OutboundEvent, OutboundSender, OutboundSequence,
@@ -37,7 +37,7 @@ pub(crate) fn inbound_command_channel() -> (InboundCommandSender, InboundCommand
 
 /// 协议无关的 server 入站命令。
 ///
-/// 这里刻意不出现 WebSocket、Komari 或 JSON frame 的概念。协议 listener 负责把外部消息
+/// 这里刻意不出现 WebSocket、Komari 或 JSON frame 的概念。协议 handler 负责把外部消息
 /// 翻译成这些内部命令，调度器只按统一语义处理，后续新增 gRPC 或其它兼容格式时不用改
 /// 远程 shell/task/probe 的执行逻辑。
 #[derive(Debug)]

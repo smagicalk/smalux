@@ -1,6 +1,7 @@
 //! Smalux 自有协议安全通道工具。
 //!
-//! 这里只处理 token、PSK 派生和 Noise 状态机，不绑定 WebSocket、HTTP 或 gRPC。
+//! 本模块只处理 token、PSK 派生和 Noise 状态机，不绑定 WebSocket、HTTP 或 gRPC。
+//! agent 和 server 必须复用这里的参数，避免两端 HKDF、Noise pattern 或 packet 语义写偏。
 
 use base64::Engine;
 use hkdf::Hkdf;
@@ -9,10 +10,10 @@ use sha2::Sha256;
 
 /// 安全 token 前缀。
 const TOKEN_PREFIX: &str = "smx1";
-/// Noise pattern，server 后续必须使用同一个 pattern。
-pub(crate) const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+/// Noise pattern，agent 和 server 必须使用同一个 pattern。
+pub const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// 派生 32 字节 PSK，满足 Noise PSK 长度要求。
-const PSK_LEN: usize = 32;
+pub const PSK_LEN: usize = 32;
 /// 解密时预留的 AEAD tag 长度。
 const NOISE_TAG_LEN: usize = 16;
 /// HKDF salt，固定域隔离，避免 secret 在其他用途复用时混淆。
@@ -22,11 +23,11 @@ const HKDF_INFO_PREFIX: &[u8] = b"smalux secure psk v1 ";
 
 /// 解析后的安全 key。
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct SecurePskKey {
+pub struct SecurePskKey {
     /// 明文 key id，只用于 server 查找对应 secret。
-    pub(crate) key_id: String,
+    pub key_id: String,
     /// 派生后的 Noise PSK，不直接发送。
-    pub(crate) psk: [u8; PSK_LEN],
+    pub psk: [u8; PSK_LEN],
 }
 
 impl std::fmt::Debug for SecurePskKey {
@@ -41,15 +42,15 @@ impl std::fmt::Debug for SecurePskKey {
 
 /// 安全握手 hello payload。
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SecureHello {
+pub struct SecureHello {
     /// token 中的 key id。
-    pub(crate) key_id: String,
+    pub key_id: String,
     /// Noise pattern 名称。
-    pub(crate) pattern: String,
+    pub pattern: String,
 }
 
 /// 解析 `smx1.<key_id>.<secret_base64url>` 并派生 Noise PSK。
-pub(crate) fn parse_secure_token(token: &str) -> anyhow::Result<SecurePskKey> {
+pub fn parse_secure_token(token: &str) -> anyhow::Result<SecurePskKey> {
     // token 只作为本地输入使用：key_id 会放到 Hello，secret 不会发送。
     // server 需要通过同一个 key_id 找到自己保存的 secret，再按相同 HKDF 参数派生 PSK。
     let mut parts = token.split('.');
@@ -78,34 +79,32 @@ pub(crate) fn parse_secure_token(token: &str) -> anyhow::Result<SecurePskKey> {
 }
 
 /// 编码 hello payload。
-pub(crate) fn encode_secure_hello(key_id: &str) -> anyhow::Result<Vec<u8>> {
+pub fn encode_secure_hello(key_id: &str) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&SecureHello {
         key_id: key_id.to_string(),
         pattern: NOISE_PATTERN.to_string(),
     })?)
 }
 
-/// 解码 hello payload，主要供测试 mock server 使用。
-#[cfg(test)]
-pub(crate) fn decode_secure_hello(input: &[u8]) -> anyhow::Result<SecureHello> {
+/// 解码 hello payload。
+pub fn decode_secure_hello(input: &[u8]) -> anyhow::Result<SecureHello> {
     Ok(serde_json::from_slice(input)?)
 }
 
-/// 创建 Noise initiator。
-pub(crate) fn build_noise_initiator(psk: &[u8; PSK_LEN]) -> anyhow::Result<snow::HandshakeState> {
+/// 创建 Noise initiator，agent 主动连接时使用。
+pub fn build_noise_initiator(psk: &[u8; PSK_LEN]) -> anyhow::Result<snow::HandshakeState> {
     let params: snow::params::NoiseParams = NOISE_PATTERN.parse()?;
     Ok(snow::Builder::new(params).psk(0, psk).build_initiator()?)
 }
 
-/// 创建 Noise responder，仅测试 mock server 使用。
-#[cfg(test)]
-pub(crate) fn build_noise_responder(psk: &[u8; PSK_LEN]) -> anyhow::Result<snow::HandshakeState> {
+/// 创建 Noise responder，server 接收连接时使用。
+pub fn build_noise_responder(psk: &[u8; PSK_LEN]) -> anyhow::Result<snow::HandshakeState> {
     let params: snow::params::NoiseParams = NOISE_PATTERN.parse()?;
     Ok(snow::Builder::new(params).psk(0, psk).build_responder()?)
 }
 
 /// 写出一条 Noise 握手消息。
-pub(crate) fn write_handshake_message(
+pub fn write_handshake_message(
     state: &mut snow::HandshakeState,
     payload: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
@@ -116,7 +115,7 @@ pub(crate) fn write_handshake_message(
 }
 
 /// 读取一条 Noise 握手消息。
-pub(crate) fn read_handshake_message(
+pub fn read_handshake_message(
     state: &mut snow::HandshakeState,
     input: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
@@ -127,7 +126,7 @@ pub(crate) fn read_handshake_message(
 }
 
 /// 加密业务 payload。
-pub(crate) fn encrypt_payload(
+pub fn encrypt_payload(
     state: &mut snow::TransportState,
     payload: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
@@ -138,10 +137,7 @@ pub(crate) fn encrypt_payload(
 }
 
 /// 解密业务 payload。
-pub(crate) fn decrypt_payload(
-    state: &mut snow::TransportState,
-    input: &[u8],
-) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_payload(state: &mut snow::TransportState, input: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut out = vec![0u8; input.len()];
     let len = state.read_message(input, &mut out)?;
     out.truncate(len);

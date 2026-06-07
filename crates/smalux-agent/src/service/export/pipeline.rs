@@ -1,13 +1,13 @@
 //! export pipeline 构建和重建。
 
-use super::super::control::ServiceControlListener;
+use super::super::control::SmaluxControlHandler;
 use super::super::inbound::InboundCommandSender;
 use super::delivery::{DeliveryState, delivery_states_from_plan};
 use crate::config::ConfigManager;
 use crate::config::model::{ExportConfig, ExportFormat, OutboundConfig};
 use crate::export::{
-    ExportMessageListener, ExportRouter, TransportEventReceiver, TransportHub,
-    build_export_adapter, build_komari_message_listener, transport_event_channel,
+    ExportRouter, InboundProtocolHandler, TransportEventReceiver, TransportHub,
+    build_komari_inbound_handler, build_protocol_adapter, transport_event_channel,
 };
 use tokio::time::sleep;
 
@@ -42,7 +42,7 @@ pub(super) async fn connect_export_pipeline(
         let outbound_config = config.outbound.clone();
         let reconnect_interval = export_config.reconnect_interval;
         let format = export_config.format.as_str();
-        let mut router = ExportRouter::new(build_export_adapter(export_config.format));
+        let mut router = ExportRouter::new(build_protocol_adapter(export_config.format));
         let mut transport_plan = router.transport_plan(&export_config)?;
         transport_plan.apply_outbound_config(&outbound_config);
         let deliveries = delivery_states_from_plan(&transport_plan);
@@ -50,10 +50,10 @@ pub(super) async fn connect_export_pipeline(
         let mut transport_hub = TransportHub::from_plan(transport_plan, transport_event_tx)?;
         let transport_summary = transport_hub.summary();
 
-        // listener 绑定在 realtime report transport 上；server 控制消息从主长连接进入，
-        // 再转换为统一入站命令队列。Komari 和 Smalux 自有协议只在 listener 层分叉。
+        // handler 绑定在 realtime report transport 上；server 控制消息从主长连接进入，
+        // 再转换为统一入站命令队列。Komari 和 Smalux 自有协议只在 handler 层分叉。
         transport_hub
-            .set_realtime_report_listener(build_export_message_listener(
+            .set_realtime_report_handler(build_export_inbound_handler(
                 export_config.format,
                 config_manager.clone(),
                 inbound_commands.clone(),
@@ -87,7 +87,7 @@ pub(super) async fn connect_export_pipeline(
 }
 
 /// 重新读取 adapter delivery plan 并应用运行时 outbound 配置。
-pub(super) fn rebuild_runtime_deliveries(
+pub(super) fn rebuild_delivery_states(
     router: &mut ExportRouter,
     export_config: &ExportConfig,
     outbound_config: &OutboundConfig,
@@ -97,18 +97,17 @@ pub(super) fn rebuild_runtime_deliveries(
     Ok(delivery_states_from_plan(&transport_plan))
 }
 
-/// 根据导出格式创建服务端消息监听器。
-fn build_export_message_listener(
+/// 根据导出格式创建服务端入站协议处理器。
+fn build_export_inbound_handler(
     format: ExportFormat,
     config_manager: ConfigManager,
     inbound_commands: InboundCommandSender,
-) -> Box<dyn ExportMessageListener> {
+) -> Box<dyn InboundProtocolHandler> {
     match format {
-        ExportFormat::SmaluxJson => Box::new(ServiceControlListener::new(
-            config_manager,
-            inbound_commands,
-        )),
-        ExportFormat::Komari => build_komari_message_listener(config_manager, inbound_commands),
+        ExportFormat::SmaluxJson => {
+            Box::new(SmaluxControlHandler::new(config_manager, inbound_commands))
+        }
+        ExportFormat::Komari => build_komari_inbound_handler(config_manager, inbound_commands),
     }
 }
 

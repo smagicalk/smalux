@@ -25,13 +25,12 @@ mod tests {
     use super::config::WebSocketConfig;
     use super::request::{build_connect_request, build_connect_url, redact_url};
     use crate::config::model::{ExportAuthMode, ExportConfig, ExportFormat, ExportWireMode};
-    use crate::export::security;
-    use crate::export::wire;
     use crate::export::{
-        EncodedExportMessage, ExportInboundMessage, ExportMessageListener, ExportTransport,
+        EncodedTransportMessage, ExportTransport, InboundProtocolHandler, TransportInboundMessage,
     };
     use base64::Engine;
     use futures_util::{SinkExt, StreamExt};
+    use smalux_protocol::{secure as security, wire};
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::net::SocketAddr;
@@ -47,30 +46,30 @@ mod tests {
     /// 测试接收超时时间。
     const TEST_RECV_TIMEOUT: Duration = Duration::from_secs(3);
 
-    /// 用 channel 收集 listener 收到的文本消息。
-    struct ChannelMessageListener {
-        /// listener 名称，方便区分替换前后的消息来源。
+    /// 用 channel 收集入站 handler 收到的文本消息。
+    struct ChannelInboundHandler {
+        /// handler 名称，方便区分替换前后的消息来源。
         name: &'static str,
         /// 测试用消息发送端。
         sender: mpsc::Sender<String>,
     }
 
-    impl ChannelMessageListener {
-        /// 创建 channel listener。
+    impl ChannelInboundHandler {
+        /// 创建 channel handler。
         fn new(name: &'static str, sender: mpsc::Sender<String>) -> Self {
             Self { name, sender }
         }
     }
 
-    impl ExportMessageListener for ChannelMessageListener {
+    impl InboundProtocolHandler for ChannelInboundHandler {
         /// 将收到的消息写入测试 channel。
         fn on_message(
             &self,
-            msg: ExportInboundMessage,
+            msg: TransportInboundMessage,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
             let msg = match msg {
-                ExportInboundMessage::Text(msg) => msg,
-                ExportInboundMessage::Binary(bytes) => format!("binary:{}", bytes.len()),
+                TransportInboundMessage::Text(msg) => msg,
+                TransportInboundMessage::Binary(bytes) => format!("binary:{}", bytes.len()),
             };
             let msg = format!("{}:{msg}", self.name);
             let sender = self.sender.clone();
@@ -447,7 +446,7 @@ mod tests {
         assert!(url.contains("agent_id=agent-1"));
         assert!(url.contains("access_token=secret-token"));
         assert!(config.unsafe_cert);
-        assert_eq!(config.heartbeat, 7);
+        assert_eq!(config.heartbeat, Duration::from_secs(7));
     }
 
     /// Bearer 模式缺少 token 时必须快速失败。
@@ -491,13 +490,11 @@ mod tests {
     #[tokio::test]
     async fn connect_send_receive_and_close_with_local_server() {
         let (url, mut server_rx) = spawn_echo_server().await;
-        let (listener_tx, mut listener_rx) = mpsc::channel(8);
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let (handler_tx, mut handler_rx) = mpsc::channel(8);
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
         client
-            .set_listener(Box::new(ChannelMessageListener::new(
-                "listener",
-                listener_tx,
-            )))
+            .set_inbound_handler(Box::new(ChannelInboundHandler::new("handler", handler_tx)))
             .await
             .unwrap();
 
@@ -505,7 +502,7 @@ mod tests {
         client.send_text_message("hello").await.unwrap();
 
         assert_eq!(recv_with_timeout(&mut server_rx).await, "hello");
-        assert_eq!(recv_with_timeout(&mut listener_rx).await, "listener:hello");
+        assert_eq!(recv_with_timeout(&mut handler_rx).await, "handler:hello");
 
         client.close().await.unwrap();
     }
@@ -514,19 +511,17 @@ mod tests {
     #[tokio::test]
     async fn connect_send_receive_binary_with_local_server() {
         let (url, mut server_rx) = spawn_echo_server().await;
-        let (listener_tx, mut listener_rx) = mpsc::channel(8);
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let (handler_tx, mut handler_rx) = mpsc::channel(8);
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
         client
-            .set_listener(Box::new(ChannelMessageListener::new(
-                "listener",
-                listener_tx,
-            )))
+            .set_inbound_handler(Box::new(ChannelInboundHandler::new("handler", handler_tx)))
             .await
             .unwrap();
 
         client.connect().await.unwrap();
         client
-            .send_encoded_export_message(EncodedExportMessage::Binary {
+            .send_encoded_transport_message(EncodedTransportMessage::Binary {
                 sequence: 1,
                 body: vec![1, 2, 3, 4],
             })
@@ -534,10 +529,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(recv_with_timeout(&mut server_rx).await, "wire:plain_data:4");
-        assert_eq!(
-            recv_with_timeout(&mut listener_rx).await,
-            "listener:binary:4"
-        );
+        assert_eq!(recv_with_timeout(&mut handler_rx).await, "handler:binary:4");
 
         client.close().await.unwrap();
     }
@@ -547,25 +539,22 @@ mod tests {
     async fn connect_secure_psk_send_receive_with_local_server() {
         let token = secure_test_token("agent-key");
         let (url, mut server_rx) = spawn_secure_echo_server(token.clone()).await;
-        let (listener_tx, mut listener_rx) = mpsc::channel(8);
+        let (handler_tx, mut handler_rx) = mpsc::channel(8);
         let config = WebSocketConfig::new(url)
-            .with_heartbeat(0)
+            .with_heartbeat(Duration::ZERO)
             .with_wire_security(
                 ExportWireMode::SecurePsk,
                 Some(security::parse_secure_token(&token).unwrap()),
             );
         let mut client = client_with_config(config);
         client
-            .set_listener(Box::new(ChannelMessageListener::new(
-                "listener",
-                listener_tx,
-            )))
+            .set_inbound_handler(Box::new(ChannelInboundHandler::new("handler", handler_tx)))
             .await
             .unwrap();
 
         client.connect().await.unwrap();
         client
-            .send_encoded_export_message(EncodedExportMessage::Binary {
+            .send_encoded_transport_message(EncodedTransportMessage::Binary {
                 sequence: 7,
                 body: b"secure-payload".to_vec(),
             })
@@ -574,8 +563,8 @@ mod tests {
 
         assert_eq!(recv_with_timeout(&mut server_rx).await, "secure-payload");
         assert_eq!(
-            recv_with_timeout(&mut listener_rx).await,
-            format!("listener:binary:{}", b"secure-payload".len())
+            recv_with_timeout(&mut handler_rx).await,
+            format!("handler:binary:{}", b"secure-payload".len())
         );
 
         client.close().await.unwrap();
@@ -585,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn query_token_is_sent_as_query_param() {
         let (url, capture_rx) = spawn_handshake_server().await;
-        let mut client = client_with_config(query_token_config(url).with_heartbeat(0));
+        let mut client = client_with_config(query_token_config(url).with_heartbeat(Duration::ZERO));
 
         client.connect().await.unwrap();
         let capture = recv_handshake(capture_rx).await;
@@ -599,12 +588,11 @@ mod tests {
     #[tokio::test]
     async fn bearer_token_is_sent_as_authorization_header() {
         let (url, capture_rx) = spawn_handshake_server().await;
-        let config =
-            WebSocketConfig::new(url)
-                .with_heartbeat(0)
-                .with_auth(WebSocketAuth::BearerToken {
-                    token: "secret-token".to_string(),
-                });
+        let config = WebSocketConfig::new(url)
+            .with_heartbeat(Duration::ZERO)
+            .with_auth(WebSocketAuth::BearerToken {
+                token: "secret-token".to_string(),
+            });
         let mut client = client_with_config(config);
 
         client.connect().await.unwrap();
@@ -622,7 +610,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_connect_returns_error() {
         let (url, _server_rx) = spawn_echo_server().await;
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
 
         client.connect().await.unwrap();
         let error = client.connect().await.unwrap_err();
@@ -631,16 +620,17 @@ mod tests {
         assert!(error.to_string().contains("already connected"));
     }
 
-    /// 替换 listener 后，新消息应交给新 listener。
+    /// 替换 handler 后，新消息应交给新 handler。
     #[tokio::test]
-    async fn listener_update_applies_to_subsequent_messages() {
+    async fn inbound_handler_update_applies_to_subsequent_messages() {
         let (url, mut server_rx) = spawn_echo_server().await;
         let (first_tx, mut first_rx) = mpsc::channel(8);
         let (second_tx, mut second_rx) = mpsc::channel(8);
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
 
         client
-            .set_listener(Box::new(ChannelMessageListener::new("first", first_tx)))
+            .set_inbound_handler(Box::new(ChannelInboundHandler::new("first", first_tx)))
             .await
             .unwrap();
         client.connect().await.unwrap();
@@ -649,7 +639,7 @@ mod tests {
         assert_eq!(recv_with_timeout(&mut first_rx).await, "first:one");
 
         client
-            .set_listener(Box::new(ChannelMessageListener::new("second", second_tx)))
+            .set_inbound_handler(Box::new(ChannelInboundHandler::new("second", second_tx)))
             .await
             .unwrap();
         client.send_text_message("two").await.unwrap();
@@ -663,7 +653,8 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_zero_disables_ping() {
         let (url, mut server_rx) = spawn_echo_server().await;
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
 
         client.connect().await.unwrap();
         client.send_text_message("no-ping").await.unwrap();
@@ -675,7 +666,8 @@ mod tests {
     #[tokio::test]
     async fn server_close_can_be_cleaned_up_by_client_close() {
         let url = spawn_server_close_server().await;
-        let mut client = client_with_config(WebSocketConfig::new(url).with_heartbeat(0));
+        let mut client =
+            client_with_config(WebSocketConfig::new(url).with_heartbeat(Duration::ZERO));
 
         client.connect().await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;

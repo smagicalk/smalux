@@ -25,11 +25,11 @@ use remote::task::RemoteTaskManager;
 use reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
 use tokio::sync::watch;
 
+pub(crate) use message::handler as control;
 pub(crate) use message::inbound;
 pub(crate) use message::inbound::{
     InboundCommand, InboundCommandEnvelope, InboundCommandSender, inbound_command_channel,
 };
-pub(crate) use message::listener as control;
 pub(crate) use message::outbound;
 pub(crate) use options::{RemoteMetricPermission, ServiceOptions};
 pub(crate) use remote::probe;
@@ -107,7 +107,7 @@ pub(crate) async fn run(
         sequence: outbound_sequence.clone(),
         diagnostics: options.diagnostics,
     });
-    // 入站命令循环是所有协议 listener 的统一落点，Komari 和 Smalux 自有协议都会走这里。
+    // 入站命令循环是所有协议 handler 的统一落点，Komari 和 Smalux 自有协议都会走这里。
     let control_task = tokio::spawn(inbound_command_loop(
         inbound_command_rx,
         control_dispatcher,
@@ -202,9 +202,8 @@ mod tests {
     use super::{RemoteMetricPermission, ServiceOptions};
     use crate::collect::{CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample};
     use crate::config::model::{ExportAuthMode, ExportFormat};
-    use crate::export::wire;
     use crate::service::collector::{CollectorCommand, collector_command_channel};
-    use crate::service::control::ServiceControlListener;
+    use crate::service::control::SmaluxControlHandler;
     use crate::service::reporter::reporter_tick_once;
     use crate::telemetry::TelemetryUpdate;
     use futures_util::{SinkExt, StreamExt};
@@ -215,7 +214,7 @@ mod tests {
     use smalux_protocol::{
         ClientPayload, MetricCollectionRequest, RemoteProbeRequest, RemoteProbeType,
         RemoteShellOpenRequest, RemoteTaskRequest, ServerFrame, SnapshotRequest,
-        decode_client_frame, encode_server_frame,
+        decode_client_frame, encode_server_frame, wire,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -585,8 +584,8 @@ mod tests {
 
     /// 控制消息测试夹具。
     struct ControlHarness {
-        /// 协议 listener。
-        listener: ServiceControlListener,
+        /// 协议入站处理器。
+        handler: SmaluxControlHandler,
         /// 内部命令调度器。
         dispatcher: ControlDispatcher,
         /// 入站命令接收端。
@@ -600,7 +599,7 @@ mod tests {
     impl ControlHarness {
         /// 解析、投递并执行一条 server 控制消息。
         async fn handle_message(&mut self, message: &str) -> anyhow::Result<()> {
-            self.listener.handle_message(message).await?;
+            self.handler.handle_message(message).await?;
             let command = self
                 .command_rx
                 .recv()
@@ -609,9 +608,9 @@ mod tests {
             self.dispatcher.dispatch(command)
         }
 
-        /// 解析一条预期被 listener 丢弃的消息。
+        /// 解析一条预期被 handler 丢弃的消息。
         async fn handle_dropped_message(&mut self, message: &str) -> anyhow::Result<()> {
-            self.listener.handle_message(message).await?;
+            self.handler.handle_message(message).await?;
             assert!(self.command_rx.try_recv().is_err());
             Ok(())
         }
@@ -641,7 +640,7 @@ mod tests {
         });
 
         ControlHarness {
-            listener: ServiceControlListener::new(manager, inbound_commands),
+            handler: SmaluxControlHandler::new(manager, inbound_commands),
             dispatcher,
             command_rx,
             _outbound_rx: outbound_rx,
@@ -676,7 +675,7 @@ mod tests {
         });
 
         let harness = ControlHarness {
-            listener: ServiceControlListener::new(manager, inbound_commands),
+            handler: SmaluxControlHandler::new(manager, inbound_commands),
             dispatcher,
             command_rx,
             _outbound_rx: outbound_rx,
@@ -1125,7 +1124,7 @@ mod tests {
 
     /// 验证 server 下发配置 patch 后会更新动态配置。
     #[tokio::test]
-    async fn service_control_listener_applies_config_patch() {
+    async fn smalux_control_handler_applies_config_patch() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager.clone());
@@ -1143,7 +1142,7 @@ mod tests {
 
     /// 验证 framed snapshot_request 会进入 reporter 命令队列并回 ack。
     #[tokio::test]
-    async fn service_control_listener_accepts_snapshot_request() {
+    async fn smalux_control_handler_accepts_snapshot_request() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1172,7 +1171,7 @@ mod tests {
 
     /// 验证不能执行的 framed 控制命令会回 error。
     #[tokio::test]
-    async fn service_control_listener_errors_snapshot_request_when_report_disabled() {
+    async fn smalux_control_handler_errors_snapshot_request_when_report_disabled() {
         let mut config = crate::config::AgentConfig::default();
         config.report.enabled = false;
         let manager = crate::config::ConfigManager::new(config).unwrap();
@@ -1199,7 +1198,7 @@ mod tests {
 
     /// 验证一次性进程采集请求会投递到采集循环。
     #[tokio::test]
-    async fn service_control_listener_sends_process_collection_command() {
+    async fn smalux_control_handler_sends_process_collection_command() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
@@ -1231,7 +1230,7 @@ mod tests {
 
     /// 验证一次性 Socket 采集请求会投递到采集循环。
     #[tokio::test]
-    async fn service_control_listener_sends_socket_collection_command() {
+    async fn smalux_control_handler_sends_socket_collection_command() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
@@ -1263,7 +1262,7 @@ mod tests {
 
     /// 验证 none 权限会拒绝 server 触发 count 采集。
     #[tokio::test]
-    async fn service_control_listener_rejects_count_when_permission_none() {
+    async fn smalux_control_handler_rejects_count_when_permission_none() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
@@ -1290,7 +1289,7 @@ mod tests {
 
     /// 验证 light 权限允许 server 触发 light 采集。
     #[tokio::test]
-    async fn service_control_listener_allows_light_when_permission_light() {
+    async fn smalux_control_handler_allows_light_when_permission_light() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let diagnostics = super::options::DiagnosticOptions {
@@ -1322,7 +1321,7 @@ mod tests {
 
     /// 验证未通过启动参数授权时，server 不能打开超过 count 的远程采集。
     #[tokio::test]
-    async fn service_control_listener_rejects_remote_level_above_permission() {
+    async fn smalux_control_handler_rejects_remote_level_above_permission() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let (mut harness, _command_rx) = service_control_harness_with_commands(
@@ -1344,7 +1343,7 @@ mod tests {
 
     /// 验证一次性诊断同样受启动参数授权保护。
     #[tokio::test]
-    async fn service_control_listener_rejects_one_shot_level_above_permission() {
+    async fn smalux_control_handler_rejects_one_shot_level_above_permission() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let (mut harness, mut command_rx) =
@@ -1367,7 +1366,7 @@ mod tests {
 
     /// 验证未知 server 消息会被丢弃且不进入内部命令队列。
     #[tokio::test]
-    async fn service_control_listener_drops_unknown_message_type() {
+    async fn smalux_control_handler_drops_unknown_message_type() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1380,7 +1379,7 @@ mod tests {
 
     /// 验证 raw 远程 shell 打开消息会被丢弃，不再作为自有协议入口。
     #[tokio::test]
-    async fn service_control_listener_drops_raw_remote_shell_open() {
+    async fn smalux_control_handler_drops_raw_remote_shell_open() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1399,7 +1398,7 @@ mod tests {
 
     /// 验证 framed 远程 shell 默认关闭时会保留 server sequence 并回 error。
     #[tokio::test]
-    async fn service_control_listener_rejects_framed_remote_shell_when_disabled() {
+    async fn smalux_control_handler_rejects_framed_remote_shell_when_disabled() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1429,7 +1428,7 @@ mod tests {
 
     /// 验证远程任务默认关闭时不会执行，只回传 rejected 结果。
     #[tokio::test]
-    async fn service_control_listener_rejects_remote_task_when_disabled() {
+    async fn smalux_control_handler_rejects_remote_task_when_disabled() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1460,7 +1459,7 @@ mod tests {
 
     /// 验证远程探测默认关闭时不会发包，只回传 value=-1。
     #[tokio::test]
-    async fn service_control_listener_rejects_remote_probe_when_disabled() {
+    async fn smalux_control_handler_rejects_remote_probe_when_disabled() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
@@ -1490,7 +1489,7 @@ mod tests {
 
     /// 验证过小采样间隔会被动态配置校验拒绝。
     #[tokio::test]
-    async fn service_control_listener_rejects_invalid_patch() {
+    async fn smalux_control_handler_rejects_invalid_patch() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager.clone());

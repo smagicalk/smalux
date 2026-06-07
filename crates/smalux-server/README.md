@@ -41,7 +41,7 @@ src/
 
 首版 server 先做“接收并保存最新快照”，不急着做历史时序库。这样可以先把 agent 到 server 的协议闭环跑通，再根据 UI 和查询需求决定是否落库、如何分表、是否保留明细历史。
 
-完整上报 JSON 参数见 `crates/smalux-agent/README.md` 的 `ClientFrame` 和 `AgentReport` JSONC 示例，稳定 frame 规则见 `crates/smalux-protocol/README.md`。server 侧只接收实际标准 JSON，不接收文档里的注释。
+完整上报 JSON 参数见 `crates/smalux-agent/README.md` 的 `ClientFrame` 和 `AgentReport` JSONC 示例，稳定 frame、wire packet 和 `secure_psk` 规则见 `crates/smalux-protocol/README.md`。server 侧只接收实际标准 JSON，不接收文档里的注释。
 
 ### 接入入口
 
@@ -54,6 +54,7 @@ GET /api/agents/connect
   -> 接收 smalux binary wire frame；开发兼容模式可接收 text frame
   -> binary_plain: WirePacket(PlainData).payload 得到 JSON bytes
   -> secure_psk: Hello + Noise 握手后，WirePacket(SecureData).payload 解密得到 JSON bytes
+  -> wire/secure 直接复用 smalux_protocol::{wire, secure}
   -> smalux_protocol::decode_client_frame()
   -> ingest::validate_report()
   -> storage::save_latest_report()
@@ -85,12 +86,12 @@ agent connects /api/agents/connect
      -> ack/error: 关联 server 下发的 ServerFrame.sequence
      -> remote_task_result: 更新任务结果
      -> remote_probe_result: 更新探测结果
-  -> server 需要控制 agent 时，按当前 wire_mode 发送 ServerFrame 或 raw control JSON
+  -> server 需要控制 agent 时，按当前 wire_mode 发送 ServerFrame
 ```
 
-`secure_psk` 模式下，server 需要保存 `key_id -> secret`。收到 agent 的 `Hello` 后，用同样 HKDF-SHA256 参数派生 32 字节 PSK，再以 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` responder 身份回复第二条 handshake。握手成功后，所有业务 JSON 都必须先加密再放入 `SecureData`。
+`secure_psk` 模式下，server 需要保存 `key_id -> secret`。收到 agent 的 `Hello` 后，直接使用 `smalux_protocol::secure` 里的共享实现解析 token、派生 32 字节 PSK，并以 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` responder 身份回复第二条 handshake。握手成功后，所有业务 JSON 都必须先加密再放入 `SecureData`。
 
-server 必须使用下面的精确参数派生 PSK：
+server 不应重复手写下面这些参数，优先调用 `smalux_protocol::secure`；如果后续用其它语言实现 server，也必须使用同样精确参数派生 PSK：
 
 ```text
 input secret      = base64url_decode(secret_base64url)  # 兼容带 padding 和不带 padding
@@ -317,15 +318,22 @@ error_message
 
 ### 控制消息
 
-server 通过同一条 Smalux WebSocket 控制通道下发 JSON。当前有两种外层：
+server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当前只保留这一种控制入口，避免不同命令有的回 ack、有的不回 ack，导致 server 状态难以维护。
 
-- `ServerFrame`：当前稳定支持 `snapshot_request` 和 `remote_probe_run`，带 server `sequence`，agent 调度后回 `ack/error`。
-- raw control JSON：当前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 和 raw `remote_probe_run`，没有 `sequence`，agent 不会自动回控制 ack。
+当前稳定 `ServerFrame` 支持：
+
+- `snapshot_request`
+- `config_patch`
+- `collect_processes_once`
+- `collect_sockets_once`
+- `remote_shell_open`
+- `remote_task_run`
+- `remote_probe_run`
 
 第一版 server 建议先实现：
 
 - `ServerFrame(type=snapshot_request)`：当 server 没有完整状态、delta 基准不匹配或用户主动刷新时发送。
-- raw `config_patch`：动态调整 `AgentConfig` 中的采集、上报和导出参数。
+- `ServerFrame(type=config_patch)`：动态调整 `AgentConfig` 中的采集、上报和导出参数。
 - `ack/error` 接收：只用于确认 agent 是否接收并调度了带 `sequence` 的控制命令。
 
 后续再接：
@@ -343,8 +351,7 @@ server 如果要远程打开 `processes.level=details` 或 `sockets.level=detail
 - 发送 `ServerFrame` 前先分配 server 侧递增 `sequence`，保存一条 pending command。
 - 收到 `ack.sequence` 后，只能把该 command 标记为“已调度”；不能把远程 task/probe 标记为完成。
 - 收到 `error.sequence` 后，把该 command 标记为失败，并记录 `error.code` 和 `error.message`。
-- raw control JSON 没有 `sequence`，server 不能等待 ack；需要结果的 raw 命令应通过后续业务结果判断，例如 `remote_task_result.task_id`。
-- 重连后不要盲目重发所有 raw 命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重。
+- 重连后不要盲目重发所有有副作用命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重。
 
 ### 控制消息示例
 
@@ -473,7 +480,7 @@ server 需要把三类数据分开处理：
 - 如果 agent 当前 `export.secure_required=true`，server 不要下发关闭 `secure_required`、切到 `binary_plain` 或切到 `komari` 的 patch；agent 会拒绝这类降级。
 - server 日志不要打印完整 token、secure secret、PSK、Authorization header、带 token 的 URL。
 - `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
-- raw `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
+- `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
 - server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-level details` 或 `--allow-socket-level details`。
 - 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_run` 和未来的 remote task。
 

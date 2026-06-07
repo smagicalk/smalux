@@ -2,8 +2,8 @@
 
 use super::worker::{TransportEventSender, TransportWorkerHandle};
 use super::{
-    EncodedExportMessage, ExportDeliveryId, ExportMessageListener, ExportProtocol, ExportTransport,
-    TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
+    EncodedTransportMessage, ExportDeliveryId, ExportProtocol, ExportTransport,
+    InboundProtocolHandler, TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
 };
 
 /// 协议无关的导出 transport client。
@@ -44,30 +44,30 @@ impl ExportTransport for ExportTransportClient {
     }
 
     /// 发送已编码消息。
-    async fn send_encoded_export_message(
+    async fn send_encoded_transport_message(
         &mut self,
-        msg: EncodedExportMessage,
+        msg: EncodedTransportMessage,
     ) -> anyhow::Result<()> {
         match self {
-            Self::WebSocket(client) => client.send_encoded_export_message(msg).await,
+            Self::WebSocket(client) => client.send_encoded_transport_message(msg).await,
             Self::Http(_client) => match msg {
-                EncodedExportMessage::Text(_text) => {
+                EncodedTransportMessage::Text(_text) => {
                     anyhow::bail!("http transport does not support raw text messages")
                 }
-                EncodedExportMessage::Binary { .. } => {
+                EncodedTransportMessage::Binary { .. } => {
                     anyhow::bail!("http transport does not support raw binary messages")
                 }
             },
         }
     }
 
-    /// 设置服务端消息监听器。
-    async fn set_listener(
+    /// 设置服务端入站协议处理器。
+    async fn set_inbound_handler(
         &mut self,
-        listener: Box<dyn ExportMessageListener>,
+        handler: Box<dyn InboundProtocolHandler>,
     ) -> anyhow::Result<()> {
         match self {
-            Self::WebSocket(client) => client.set_listener(listener).await,
+            Self::WebSocket(client) => client.set_inbound_handler(handler).await,
             Self::Http(_client) => Ok(()),
         }
     }
@@ -150,16 +150,16 @@ impl TransportHub {
             .join(",")
     }
 
-    /// 给实时上报 transport 设置 server 消息监听器。
-    pub(crate) async fn set_realtime_report_listener(
+    /// 给实时上报 transport 设置入站协议处理器。
+    pub(crate) async fn set_realtime_report_handler(
         &mut self,
-        listener: Box<dyn ExportMessageListener>,
+        handler: Box<dyn InboundProtocolHandler>,
     ) -> anyhow::Result<()> {
         let Some(entry) = self.find_transport_mut(TransportId::RealtimeReport) else {
             anyhow::bail!("realtime report export transport is not configured");
         };
 
-        entry.worker.set_listener(listener).await
+        entry.worker.set_inbound_handler(handler).await
     }
 
     /// 连接所有长连接 transport。

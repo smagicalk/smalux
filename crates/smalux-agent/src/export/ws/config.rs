@@ -3,12 +3,13 @@
 use super::auth::WebSocketAuth;
 use super::request::redact_url;
 use crate::config::model::{ExportAuthMode, ExportConfig, ExportFormat, ExportWireMode};
-use crate::export::security::{SecurePskKey, parse_secure_token};
 use anyhow::anyhow;
+use smalux_protocol::secure::{SecurePskKey, parse_secure_token};
 use std::fmt::Debug;
+use std::time::Duration;
 
-/// 默认心跳间隔，单位秒。
-const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+/// 默认心跳间隔。
+const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// WebSocket 客户端配置。
 #[derive(Clone, Eq, PartialEq)]
@@ -27,8 +28,8 @@ pub(crate) struct WebSocketConfig {
     pub(crate) secure_key: Option<SecurePskKey>,
     /// 是否跳过 TLS 证书校验。
     pub(crate) unsafe_cert: bool,
-    /// 心跳间隔，单位为秒；0 表示禁用心跳。
-    pub(crate) heartbeat: u64,
+    /// 心跳间隔；`Duration::ZERO` 表示禁用心跳。
+    pub(crate) heartbeat: Duration,
 }
 
 impl WebSocketConfig {
@@ -42,7 +43,7 @@ impl WebSocketConfig {
             raw_binary_frames: false,
             secure_key: None,
             unsafe_cert: false,
-            heartbeat: DEFAULT_HEARTBEAT_SECS,
+            heartbeat: DEFAULT_HEARTBEAT,
         }
     }
 
@@ -85,8 +86,8 @@ impl WebSocketConfig {
         self
     }
 
-    /// 设置心跳间隔，0 表示禁用。
-    pub(crate) fn with_heartbeat(mut self, heartbeat: u64) -> Self {
+    /// 设置心跳间隔，`Duration::ZERO` 表示禁用。
+    pub(crate) fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
         self.heartbeat = heartbeat;
         self
     }
@@ -111,7 +112,6 @@ impl WebSocketConfig {
             );
         }
 
-        let heartbeat = config.heartbeat.as_secs();
         let auth = match config.auth_mode {
             ExportAuthMode::None => WebSocketAuth::None,
             ExportAuthMode::Query => WebSocketAuth::QueryToken {
@@ -132,7 +132,7 @@ impl WebSocketConfig {
             .with_auth(auth)
             .with_wire_security(effective_wire_mode, secure_key)
             .with_unsafe_cert(config.unsafe_cert)
-            .with_heartbeat(heartbeat);
+            .with_heartbeat(config.heartbeat);
 
         for (key, value) in &config.query {
             websocket_config = websocket_config.with_query_param(key, value);

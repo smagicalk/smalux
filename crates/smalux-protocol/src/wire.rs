@@ -14,7 +14,7 @@ const MAX_WIRE_PAYLOAD_LEN: usize = 1024 * 1024;
 
 /// wire codec 错误。
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WireError {
+pub enum WireError {
     /// 包长度不足。
     #[error("wire packet is too short")]
     PacketTooShort,
@@ -38,7 +38,7 @@ pub(crate) enum WireError {
 /// Smalux wire packet 类型。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
-pub(crate) enum WirePacketKind {
+pub enum WirePacketKind {
     /// 未加密业务数据，主要用于开发和联调。
     PlainData = 1,
     /// 握手前的 hello。
@@ -70,7 +70,7 @@ impl TryFrom<u8> for WirePacketKind {
 
 impl WirePacketKind {
     /// 返回稳定日志名称。
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::PlainData => "plain_data",
             Self::Hello => "hello",
@@ -83,22 +83,22 @@ impl WirePacketKind {
 
 /// Smalux 二进制 wire packet。
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct WirePacket {
+pub struct WirePacket {
     /// packet 类型。
-    pub(crate) kind: WirePacketKind,
+    pub kind: WirePacketKind,
     /// 预留 flags。
-    pub(crate) flags: u16,
+    pub flags: u16,
     /// 连接或 stream session id。
-    pub(crate) session_id: [u8; 16],
+    pub session_id: [u8; 16],
     /// packet 序号。
-    pub(crate) sequence: u64,
+    pub sequence: u64,
     /// packet payload。
-    pub(crate) payload: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 impl WirePacket {
     /// 创建 packet。
-    pub(crate) fn new(
+    pub fn new(
         kind: WirePacketKind,
         session_id: [u8; 16],
         sequence: u64,
@@ -114,18 +114,18 @@ impl WirePacket {
     }
 
     /// 创建明文业务 packet。
-    pub(crate) fn plain_data(session_id: [u8; 16], sequence: u64, payload: Vec<u8>) -> Self {
+    pub fn plain_data(session_id: [u8; 16], sequence: u64, payload: Vec<u8>) -> Self {
         Self::new(WirePacketKind::PlainData, session_id, sequence, payload)
     }
 
     /// 创建加密业务 packet。
-    pub(crate) fn secure_data(session_id: [u8; 16], sequence: u64, payload: Vec<u8>) -> Self {
+    pub fn secure_data(session_id: [u8; 16], sequence: u64, payload: Vec<u8>) -> Self {
         Self::new(WirePacketKind::SecureData, session_id, sequence, payload)
     }
 }
 
 /// 编码 wire packet。
-pub(crate) fn encode_wire_packet(packet: &WirePacket) -> Result<Vec<u8>, WireError> {
+pub fn encode_wire_packet(packet: &WirePacket) -> Result<Vec<u8>, WireError> {
     if packet.payload.len() > MAX_WIRE_PAYLOAD_LEN {
         return Err(WireError::PayloadTooLarge);
     }
@@ -145,7 +145,7 @@ pub(crate) fn encode_wire_packet(packet: &WirePacket) -> Result<Vec<u8>, WireErr
 }
 
 /// 解码 wire packet。
-pub(crate) fn decode_wire_packet(input: &[u8]) -> Result<WirePacket, WireError> {
+pub fn decode_wire_packet(input: &[u8]) -> Result<WirePacket, WireError> {
     if input.len() < WIRE_HEADER_LEN {
         return Err(WireError::PacketTooShort);
     }
@@ -198,9 +198,9 @@ mod tests {
         assert_eq!(decoded, packet);
     }
 
-    /// 验证魔数错误会被拒绝。
+    /// 验证长度不足会被拒绝。
     #[test]
-    fn wire_packet_rejects_invalid_magic() {
+    fn wire_packet_rejects_short_packet() {
         let error = decode_wire_packet(b"BAD").unwrap_err();
 
         assert!(matches!(error, WireError::PacketTooShort));

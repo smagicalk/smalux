@@ -31,11 +31,11 @@ impl ExportProtocol {
     }
 }
 
-/// 已编码完成、可以交给 transport 发送的导出消息。
+/// 已编码完成、可以交给 transport 发送的消息。
 ///
 /// `Binary` 的 body 是业务 payload，不一定是最终 WebSocket frame。Smalux 自有协议会在
 /// WebSocket transport 中再封成 `WirePacket`，并按 `wire_mode` 决定是否加密。
-pub(crate) enum EncodedExportMessage {
+pub(crate) enum EncodedTransportMessage {
     /// 文本消息。
     Text(String),
     /// 二进制业务数据，由具体 transport 决定是否封包或加密。
@@ -47,8 +47,8 @@ pub(crate) enum EncodedExportMessage {
     },
 }
 
-/// 从 transport 收到的导出消息。
-pub(crate) enum ExportInboundMessage {
+/// 从 transport 收到的入站消息。
+pub(crate) enum TransportInboundMessage {
     /// 文本消息。
     Text(String),
     /// 二进制消息。
@@ -56,10 +56,10 @@ pub(crate) enum ExportInboundMessage {
 }
 
 /// 把入站消息统一转成 UTF-8 文本。
-pub(crate) fn inbound_message_into_string(msg: ExportInboundMessage) -> anyhow::Result<String> {
+pub(crate) fn inbound_message_into_string(msg: TransportInboundMessage) -> anyhow::Result<String> {
     match msg {
-        ExportInboundMessage::Text(text) => Ok(text),
-        ExportInboundMessage::Binary(bytes) => Ok(String::from_utf8(bytes)?),
+        TransportInboundMessage::Text(text) => Ok(text),
+        TransportInboundMessage::Binary(bytes) => Ok(String::from_utf8(bytes)?),
     }
 }
 
@@ -126,14 +126,14 @@ fn normalize_endpoint_path(path: &str) -> anyhow::Result<&str> {
     Ok(path)
 }
 
-/// 可动态分发的消息监听器。
+/// 可动态分发的入站协议处理器。
 ///
 /// trait 方法返回 boxed future，避免 `async fn` 直接出现在 trait object 中导致无法 dyn 兼容。
-pub(crate) trait ExportMessageListener: Send + Sync + 'static {
+pub(crate) trait InboundProtocolHandler: Send + Sync + 'static {
     /// 收到 transport 消息后的回调。
     fn on_message(
         &self,
-        msg: ExportInboundMessage,
+        msg: TransportInboundMessage,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 }
 
@@ -148,15 +148,15 @@ pub(crate) trait ExportTransport {
     async fn send_text_message(&mut self, msg: &str) -> anyhow::Result<()>;
 
     /// 发送已经编码好的消息。
-    async fn send_encoded_export_message(
+    async fn send_encoded_transport_message(
         &mut self,
-        msg: EncodedExportMessage,
+        msg: EncodedTransportMessage,
     ) -> anyhow::Result<()>;
 
-    /// 设置服务端消息监听器。
-    async fn set_listener(
+    /// 设置服务端入站协议处理器。
+    async fn set_inbound_handler(
         &mut self,
-        listener: Box<dyn ExportMessageListener>,
+        handler: Box<dyn InboundProtocolHandler>,
     ) -> anyhow::Result<()>;
 
     /// 主动关闭连接。

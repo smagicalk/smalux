@@ -307,7 +307,7 @@ pub enum ServerPayload {
     /// 下发动态配置 patch。
     ///
     /// 这里使用通用 JSON 值承载 patch，避免协议 crate 直接依赖 agent 内部配置类型。
-    /// agent 会在 listener 层把它转换为当前版本的 `AgentConfigPatch`。
+    /// agent 会在 handler 层把它转换为当前版本的 `AgentConfigPatch`。
     ConfigPatch {
         /// 配置 patch JSON。
         patch: Value,

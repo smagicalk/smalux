@@ -8,6 +8,8 @@
 - 定义 agent 内部上报语义，例如 `OutboundReport`。
 - 定义首版上报 payload，例如 `snapshot`、`delta`、`heartbeat`、`ack`、`error`、`remote_task_result` 和 `remote_probe_result`。
 - 提供 JSON codec，供 WebSocket、HTTP 或后续 gRPC adapter 复用。
+- 提供 Smalux binary wire packet codec，也就是 `PlainData`、`Hello`、`Handshake`、`SecureData` 这些外层二进制包。
+- 提供 `secure_psk` 共享安全通道工具，包括 token 解析、HKDF-SHA256 PSK 派生、Noise initiator/responder 和 payload 加解密。
 - 维护协议版本、sequence 和基础错误结构。
 
 ## 不负责的内容
@@ -15,6 +17,7 @@
 - 不实现 WebSocket、HTTP 或 gRPC 连接。
 - 不做 agent 本机采集。
 - 不做 server 存储、查询或鉴权。
+- 不保存连接状态；Noise `TransportState` 的生命周期由 agent/server 的 transport 层持有。
 - 不放 `tonic` / `prost` 生成代码；后续需要 gRPC 时再新增独立 crate。
 
 ## 消息分层
@@ -216,14 +219,21 @@ server 按下面顺序实现，最容易先跑通闭环：
    -> 按当前 wire_mode 封成 PlainData 或 SecureData
 ```
 
-`smalux-protocol` 只定义解密后的 JSON frame，不定义 WebSocket wire header 和 Noise 状态机。`secure_psk` 的精确实现参数在 agent/server README 中维护：token 使用 `smx1.<key_id>.<secret_base64url>`，HKDF-SHA256 salt 是 `smalux secure psk v1 salt`，info 是 `smalux secure psk v1 ` 加 UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`，pattern 是 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`。server 对接前应先跑 agent/server README 里的 HKDF 测试向量，确认派生结果为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`。
+`smalux-protocol` 同时提供解密后的 JSON frame codec、二进制 wire packet codec 和 `secure_psk` Noise PSK 工具。agent 和 server 都应该直接复用：
+
+- `smalux_protocol::wire::encode_wire_packet()` / `decode_wire_packet()`
+- `smalux_protocol::secure::parse_secure_token()` / `decode_secure_hello()`
+- `smalux_protocol::secure::build_noise_initiator()` / `build_noise_responder()`
+- `smalux_protocol::secure::encrypt_payload()` / `decrypt_payload()`
+
+`secure_psk` 的精确参数在本 crate 的 `secure` 模块测试中固化：token 使用 `smx1.<key_id>.<secret_base64url>`，HKDF-SHA256 salt 是 `smalux secure psk v1 salt`，info 是 `smalux secure psk v1 ` 加 UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`，pattern 是 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`。server 对接前应先跑 `cargo test -p smalux-protocol secure::tests::secure_psk_hkdf_test_vector_is_stable`，确认派生结果为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`。
 
 ## 兼容边界
 
 - `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
 - `ack/error` 只对带 `sequence` 的 `ServerFrame` 有意义。
 - `target_agent_id` 不匹配时 agent 会丢弃命令，不回 `ack/error`。
-- 第三方兼容消息不进入本 crate 的稳定协议面，应在对应 adapter/listener 中转换成 agent 内部命令。
+- 第三方兼容消息不进入本 crate 的稳定协议面，应在对应 adapter/handler 中转换成 agent 内部命令。
 - server 如果没有 delta 基准，就应该发 `snapshot_request`，不要猜测补齐。
 - server 不要做字段级深度 merge，`snapshot` 是完整替换，`delta` 是顶层采集组替换。
 
@@ -292,7 +302,7 @@ server 发送建议：
 
 ## 第三方兼容扩展
 
-本 crate 只承载自有协议的稳定 frame。Komari 或后续其它服务端的特殊消息应留在 agent 的对应 adapter/listener 中处理，并转换为统一内部命令：
+本 crate 只承载自有协议的稳定 frame。Komari 或后续其它服务端的特殊消息应留在 agent 的对应 adapter/handler 中处理，并转换为统一内部命令：
 
 - 需要 agent/server 双方长期稳定理解、需要 `ack/error`、需要跨 transport 复用的命令，放入 `ServerPayload`。
 - 只属于某个第三方协议的字段、路径、事件名或文本格式，留在第三方兼容 adapter 中。

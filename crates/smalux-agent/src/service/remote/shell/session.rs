@@ -11,7 +11,7 @@ use super::stream::{RemoteShellFrame, RemoteShellInput, RemoteShellStreamCodecRe
 use crate::config::model::{ExportConfig, RemoteShellConfig};
 use crate::export::ws::{WebSocketClient, WebSocketConfig};
 use crate::export::{
-    EncodedExportMessage, ExportInboundMessage, ExportMessageListener, ExportTransport,
+    EncodedTransportMessage, ExportTransport, InboundProtocolHandler, TransportInboundMessage,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -76,7 +76,7 @@ impl RemoteShellSession {
         let (input_tx, input_rx) = mpsc::channel(SHELL_INPUT_CHANNEL_CAPACITY);
         let mut client = WebSocketClient::new_with_config(self.stream_config.clone());
         client
-            .set_listener(Box::new(RemoteShellStreamListener {
+            .set_inbound_handler(Box::new(RemoteShellStreamHandler {
                 input_tx,
                 codec: self.stream_codec.clone(),
             }))
@@ -182,7 +182,10 @@ impl ShellStreamSender {
                 let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
                 let mut stream = self.stream.lock().await;
                 stream
-                    .send_encoded_export_message(EncodedExportMessage::Binary { sequence, body })
+                    .send_encoded_transport_message(EncodedTransportMessage::Binary {
+                        sequence,
+                        body,
+                    })
                     .await
             }
         }
@@ -195,19 +198,19 @@ impl ShellStreamSender {
     }
 }
 
-/// shell stream listener，把 server 消息转换为输入事件。
-struct RemoteShellStreamListener {
+/// shell stream 入站处理器，把 server 消息转换为输入事件。
+struct RemoteShellStreamHandler {
     /// 输入事件发送端。
     input_tx: mpsc::Sender<RemoteShellInput>,
     /// stream codec。
     codec: RemoteShellStreamCodecRef,
 }
 
-impl ExportMessageListener for RemoteShellStreamListener {
+impl InboundProtocolHandler for RemoteShellStreamHandler {
     /// 收到 stream 消息后写入 shell 输入队列。
     fn on_message(
         &self,
-        msg: ExportInboundMessage,
+        msg: TransportInboundMessage,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         let input_tx = self.input_tx.clone();
         let codec = self.codec.clone();

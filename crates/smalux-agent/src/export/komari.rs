@@ -42,8 +42,8 @@ mod terminal;
 mod url;
 
 use super::{
-    ExportAdapter, ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec,
-    ExportMessageListener, TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
+    ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec, InboundProtocolHandler,
+    ProtocolAdapter, TransportId, TransportPlan, TransportRequest, TransportSpec, http, ws,
 };
 use crate::config::ConfigManager;
 use crate::config::model::ExportConfig;
@@ -57,16 +57,16 @@ use url::{
     komari_basic_info_url, komari_report_websocket_url, komari_task_result_url, redact_komari_url,
 };
 
-/// Komari 兼容 adapter。
+/// Komari 兼容协议 adapter。
 #[derive(Debug)]
-pub(crate) struct KomariAdapter {
+pub(crate) struct KomariProtocolAdapter {
     /// HTTP basic info URL。
     basic_info_url: Option<String>,
     /// HTTP task result URL。
     task_result_url: Option<String>,
 }
 
-impl Default for KomariAdapter {
+impl Default for KomariProtocolAdapter {
     /// 默认使用 WebSocket report，basic info 每 5 分钟刷新一次。
     fn default() -> Self {
         Self {
@@ -76,14 +76,14 @@ impl Default for KomariAdapter {
     }
 }
 
-impl KomariAdapter {
+impl KomariProtocolAdapter {
     /// Komari 需要 reporter 生成独立 basic info 事件。
     pub(super) const fn needs_basic_info() -> bool {
         true
     }
 }
 
-impl ExportAdapter for KomariAdapter {
+impl ProtocolAdapter for KomariProtocolAdapter {
     /// Komari 需要独立的 HTTP basic info 上报。
     fn needs_basic_info_events(&self) -> bool {
         Self::needs_basic_info()
@@ -231,12 +231,12 @@ fn komari_websocket_config(config: &ExportConfig) -> anyhow::Result<ws::WebSocke
     ws::WebSocketConfig::from_export_endpoint(config, endpoint)
 }
 
-/// 构造 Komari server 消息监听器。
-pub(crate) fn message_listener(
+/// 构造 Komari server 消息入站处理器。
+pub(crate) fn inbound_handler(
     config_manager: ConfigManager,
     commands: InboundCommandSender,
-) -> Box<dyn ExportMessageListener> {
-    message::message_listener(config_manager, commands)
+) -> Box<dyn InboundProtocolHandler> {
+    message::inbound_handler(config_manager, commands)
 }
 
 #[cfg(test)]
@@ -263,7 +263,7 @@ mod tests {
     /// 验证 WebSocket 模式会同时声明 report WS 和 basic info HTTP。
     #[test]
     fn komari_plan_uses_websocket_report_and_http_basic_info() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         let plan = adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -279,7 +279,7 @@ mod tests {
     /// 验证 base_url 根地址会自动使用 WebSocket report。
     #[test]
     fn komari_plan_uses_websocket_report_for_base_url() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         let plan = adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -295,7 +295,7 @@ mod tests {
     /// 验证带 path 的 URL 会被拒绝，避免配置混入 endpoint。
     #[test]
     fn komari_plan_rejects_base_url_with_path() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         let error = match adapter
             .transport_plan(&komari_config("https://example.com/api/clients/report"))
         {
@@ -311,7 +311,7 @@ mod tests {
     fn komari_http_transport_uses_unsafe_cert_config() {
         let mut config = komari_config("https://example.com");
         config.unsafe_cert = true;
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         let plan = adapter.transport_plan(&config).unwrap();
 
         let TransportSpec::Http { config, .. } = &plan.transports[1] else {
@@ -324,7 +324,7 @@ mod tests {
     /// 验证 Komari plan 显式声明 report 和 basic info 两个 delivery。
     #[test]
     fn komari_plan_declares_report_and_basic_info_deliveries() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         let plan = adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -349,7 +349,7 @@ mod tests {
     /// 验证 basic info 事件会生成 HTTP POST。
     #[test]
     fn komari_adapter_encodes_basic_info_event() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -371,7 +371,7 @@ mod tests {
     /// 验证 report delivery 会生成 WebSocket text。
     #[test]
     fn komari_adapter_encodes_websocket_report_delivery() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -393,7 +393,7 @@ mod tests {
     /// 验证非 snapshot 事件会被 Komari adapter 跳过。
     #[test]
     fn komari_adapter_skips_non_snapshot_report() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -414,7 +414,7 @@ mod tests {
     /// 验证 Komari 会把 remote task result 编码为 HTTP task/result 请求。
     #[test]
     fn komari_adapter_encodes_remote_task_result() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
@@ -456,7 +456,7 @@ mod tests {
     /// 验证 Komari 会把 remote probe result 编码为 WebSocket ping_result。
     #[test]
     fn komari_adapter_encodes_remote_probe_result() {
-        let mut adapter = KomariAdapter::default();
+        let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();

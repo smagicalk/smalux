@@ -1,7 +1,7 @@
-//! 导出格式 adapter。
+//! 协议格式 adapter。
 
 use super::{
-    ExportDeliveryId, ExportEndpointScheme, ExportMessageListener, TransportId, TransportPlan,
+    ExportDeliveryId, ExportEndpointScheme, InboundProtocolHandler, TransportId, TransportPlan,
     TransportRequest, TransportSpec, build_export_endpoint, komari, ws,
 };
 use crate::config::model::{ExportConfig, ExportFormat};
@@ -18,8 +18,8 @@ use smalux_protocol::{
 /// Smalux 自有协议主连接路径。
 const SMALUX_CONNECT_PATH: &str = "/api/agents/connect";
 
-/// 导出格式适配器。
-pub(crate) trait ExportAdapter {
+/// 协议格式适配器。
+pub(crate) trait ProtocolAdapter {
     /// 根据配置声明需要启动的 transport。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan>;
 
@@ -76,11 +76,11 @@ pub(crate) trait ExportAdapter {
     }
 }
 
-/// Smalux 默认 JSON adapter。
+/// Smalux 默认 JSON 协议 adapter。
 #[derive(Debug, Default)]
-struct SmaluxJsonAdapter;
+struct SmaluxJsonProtocolAdapter;
 
-impl ExportAdapter for SmaluxJsonAdapter {
+impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
     /// smalux_json 当前使用主 WebSocket transport。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan> {
         let endpoint = build_export_endpoint(
@@ -222,23 +222,25 @@ impl ExportAdapter for SmaluxJsonAdapter {
     }
 }
 
-/// 根据配置创建导出格式 adapter。
-pub(crate) fn build_export_adapter(format: ExportFormat) -> Box<dyn ExportAdapter + Send + Sync> {
+/// 根据配置创建协议格式 adapter。
+pub(crate) fn build_protocol_adapter(
+    format: ExportFormat,
+) -> Box<dyn ProtocolAdapter + Send + Sync> {
     match format {
-        ExportFormat::SmaluxJson => Box::<SmaluxJsonAdapter>::default(),
-        ExportFormat::Komari => Box::<komari::KomariAdapter>::default(),
+        ExportFormat::SmaluxJson => Box::<SmaluxJsonProtocolAdapter>::default(),
+        ExportFormat::Komari => Box::<komari::KomariProtocolAdapter>::default(),
     }
 }
 
 /// 返回导出格式是否需要 reporter 生成 basic info 事件。
 pub(crate) fn export_format_needs_basic_info(format: ExportFormat) -> bool {
-    build_export_adapter(format).needs_basic_info_events()
+    build_protocol_adapter(format).needs_basic_info_events()
 }
 
-/// 创建 Komari server 消息监听器。
-pub(crate) fn build_komari_message_listener(
+/// 创建 Komari server 消息入站处理器。
+pub(crate) fn build_komari_inbound_handler(
     config_manager: crate::config::ConfigManager,
     commands: crate::service::InboundCommandSender,
-) -> Box<dyn ExportMessageListener> {
-    komari::message_listener(config_manager, commands)
+) -> Box<dyn InboundProtocolHandler> {
+    komari::inbound_handler(config_manager, commands)
 }

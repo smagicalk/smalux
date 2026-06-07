@@ -103,7 +103,7 @@ mod tests {
 
     use super::*;
     use crate::config::model::{ExportConfig, RemoteShellConfig};
-    use crate::export::ExportInboundMessage;
+    use crate::export::TransportInboundMessage;
     use crate::export::ws::WebSocketConfig;
     use crate::service::remote::shell::session::shell_stream_config;
     use crate::service::remote::shell::{
@@ -140,11 +140,11 @@ mod tests {
         /// 测试 raw codec 直接把 binary 输入写入 PTY。
         fn decode_inbound(
             &self,
-            msg: ExportInboundMessage,
+            msg: TransportInboundMessage,
         ) -> anyhow::Result<Option<RemoteShellInput>> {
             match msg {
-                ExportInboundMessage::Binary(bytes) => Ok(Some(RemoteShellInput::Input(bytes))),
-                ExportInboundMessage::Text(text) => {
+                TransportInboundMessage::Binary(bytes) => Ok(Some(RemoteShellInput::Input(bytes))),
+                TransportInboundMessage::Text(text) => {
                     Ok(Some(RemoteShellInput::Input(text.into_bytes())))
                 }
             }
@@ -235,7 +235,7 @@ mod tests {
 
         assert_eq!(config.url, "ws://127.0.0.1/shell");
         assert!(config.unsafe_cert);
-        assert_eq!(config.heartbeat, 9);
+        assert_eq!(config.heartbeat, Duration::from_secs(9));
         assert!(!config.raw_binary_frames);
     }
 

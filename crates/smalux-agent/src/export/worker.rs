@@ -3,8 +3,8 @@
 //! worker 串行持有具体 transport client，并把真实发送结果回传给 export supervisor。
 
 use super::{
-    EncodedExportMessage, ExportMessageListener, ExportProtocol, ExportTransport,
-    ExportTransportClient, TransportId, TransportRequest,
+    EncodedTransportMessage, ExportProtocol, ExportTransport, ExportTransportClient,
+    InboundProtocolHandler, TransportId, TransportRequest,
 };
 use crate::export::ExportDeliveryId;
 use tokio::sync::{mpsc, oneshot};
@@ -57,10 +57,10 @@ enum TransportWorkerCommand {
         /// 连接结果回传。
         result_tx: oneshot::Sender<anyhow::Result<()>>,
     },
-    /// 设置服务端消息监听器。
-    SetListener {
-        /// listener 实例。
-        listener: Box<dyn ExportMessageListener>,
+    /// 设置服务端入站协议处理器。
+    SetInboundHandler {
+        /// handler 实例。
+        handler: Box<dyn InboundProtocolHandler>,
         /// 设置结果回传。
         result_tx: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -134,21 +134,18 @@ impl TransportWorkerHandle {
             .map_err(|_| anyhow::anyhow!("transport worker connect result channel is closed"))?
     }
 
-    /// 请求 worker 设置 listener。
-    pub(crate) async fn set_listener(
+    /// 请求 worker 设置入站协议处理器。
+    pub(crate) async fn set_inbound_handler(
         &self,
-        listener: Box<dyn ExportMessageListener>,
+        handler: Box<dyn InboundProtocolHandler>,
     ) -> anyhow::Result<()> {
         let (result_tx, result_rx) = oneshot::channel();
         self.commands
-            .send(TransportWorkerCommand::SetListener {
-                listener,
-                result_tx,
-            })
+            .send(TransportWorkerCommand::SetInboundHandler { handler, result_tx })
             .await
             .map_err(|_| anyhow::anyhow!("transport worker channel is closed"))?;
         result_rx.await.map_err(|_| {
-            anyhow::anyhow!("transport worker set listener result channel is closed")
+            anyhow::anyhow!("transport worker set inbound handler result channel is closed")
         })?
     }
 
@@ -218,11 +215,8 @@ async fn transport_worker_loop(
                 let result = connect_client(id, &mut client, &mut connected).await;
                 let _ = result_tx.send(result);
             }
-            TransportWorkerCommand::SetListener {
-                listener,
-                result_tx,
-            } => {
-                let result = client.set_listener(listener).await;
+            TransportWorkerCommand::SetInboundHandler { handler, result_tx } => {
+                let result = client.set_inbound_handler(handler).await;
                 let _ = result_tx.send(result);
             }
             TransportWorkerCommand::Send {
@@ -313,7 +307,7 @@ async fn send_worker_request(
             TransportRequest::WebSocketText { body, .. },
         ) => {
             transport
-                .send_encoded_export_message(EncodedExportMessage::Text(body))
+                .send_encoded_transport_message(EncodedTransportMessage::Text(body))
                 .await
         }
         (
@@ -321,7 +315,7 @@ async fn send_worker_request(
             TransportRequest::WebSocketBinary { sequence, body, .. },
         ) => {
             transport
-                .send_encoded_export_message(EncodedExportMessage::Binary { sequence, body })
+                .send_encoded_transport_message(EncodedTransportMessage::Binary { sequence, body })
                 .await
         }
         (

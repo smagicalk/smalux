@@ -3,7 +3,7 @@
 //! Router 负责把内部上报语义交给 adapter 编码，并把编码后的请求投递给 transport hub。
 //! 后续要把发送队列移动到长期 worker 时，可以优先改这里，service 层不需要理解每种 transport。
 
-use super::{ExportAdapter, ExportDeliveryId, TransportHub, TransportPlan, TransportRequest};
+use super::{ExportDeliveryId, ProtocolAdapter, TransportHub, TransportPlan, TransportRequest};
 use crate::config::model::ExportConfig;
 use crate::service::outbound::{
     BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
@@ -14,12 +14,12 @@ use smalux_protocol::OutboundReport;
 /// 导出路由器。
 pub(crate) struct ExportRouter {
     /// 当前导出格式 adapter。
-    adapter: Box<dyn ExportAdapter + Send + Sync>,
+    adapter: Box<dyn ProtocolAdapter + Send + Sync>,
 }
 
 impl ExportRouter {
     /// 创建导出路由器。
-    pub(crate) fn new(adapter: Box<dyn ExportAdapter + Send + Sync>) -> Self {
+    pub(crate) fn new(adapter: Box<dyn ProtocolAdapter + Send + Sync>) -> Self {
         Self { adapter }
     }
 
@@ -150,7 +150,7 @@ mod tests {
 
     use super::*;
     use crate::config::model::ExportFormat;
-    use crate::export::{TransportRequest, build_export_adapter};
+    use crate::export::{TransportRequest, build_protocol_adapter};
     use smalux_core::model::info::AgentReport;
 
     /// 验证 router 会复用 adapter 的编码结果。
@@ -159,7 +159,7 @@ mod tests {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
-        let mut router = ExportRouter::new(build_export_adapter(ExportFormat::SmaluxJson));
+        let mut router = ExportRouter::new(build_protocol_adapter(ExportFormat::SmaluxJson));
 
         let requests = router
             .encode_report(ExportDeliveryId::RealtimeReport, &outbound)

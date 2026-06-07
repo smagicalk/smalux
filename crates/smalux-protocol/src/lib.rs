@@ -1,11 +1,16 @@
 //! Smalux agent/server 共享通信协议。
 //!
-//! 本 crate 只定义传输无关的消息结构和 codec，不实现 WebSocket、HTTP 或 gRPC。
+//! 本 crate 定义 agent/server 必须共享的协议结构、JSON codec、二进制 wire packet
+//! 和 secure_psk 安全通道工具；具体 WebSocket、HTTP 或 gRPC 连接管理由 agent/server 实现。
 
 /// JSON 编解码。
 pub mod codec;
 /// 双向通信 frame 和 payload。
 pub mod frame;
+/// secure_psk 安全通道。
+pub mod secure;
+/// Smalux 二进制 wire packet。
+pub mod wire;
 
 pub use codec::{
     decode_client_frame, decode_remote_shell_stream_command, decode_server_frame,

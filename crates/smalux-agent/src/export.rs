@@ -1,9 +1,9 @@
 //! Agent 数据导出抽象。
 //!
-//! 这里定义发送端和消息监听器的通用 trait，具体协议实现放在子模块。service 层只关心
+//! 这里定义发送端和入站处理器的通用 trait，具体协议实现放在子模块。service 层只关心
 //! “要发送什么语义”，adapter 决定“编码成什么格式”，transport 决定“怎么发出去”。
 
-/// 导出格式 adapter。
+/// 协议格式 adapter。
 mod adapter;
 /// HTTP 导出实现。
 mod http;
@@ -19,24 +19,20 @@ mod plan;
 mod router;
 /// rustls 相关 TLS 适配。
 mod rustls;
-/// Smalux 自有协议安全通道。
-pub(crate) mod security;
-/// Smalux 自有二进制 wire packet。
-pub(crate) mod wire;
 /// Transport 后台发送 worker。
 mod worker;
 /// WebSocket 导出实现。
 pub(crate) mod ws;
 
 pub(crate) use adapter::{
-    ExportAdapter, build_export_adapter, build_komari_message_listener,
+    ProtocolAdapter, build_komari_inbound_handler, build_protocol_adapter,
     export_format_needs_basic_info,
 };
 pub(crate) use hub::{ExportTransportClient, TransportHub};
 pub(crate) use model::{
-    EncodedExportMessage, ExportEndpointScheme, ExportInboundMessage, ExportMessageListener,
-    ExportProtocol, ExportTransport, build_export_endpoint, inbound_message_into_string,
-    parse_export_base_url,
+    EncodedTransportMessage, ExportEndpointScheme, ExportProtocol, ExportTransport,
+    InboundProtocolHandler, TransportInboundMessage, build_export_endpoint,
+    inbound_message_into_string, parse_export_base_url,
 };
 pub(crate) use plan::{
     ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec, ExportDeliveryTrigger,
@@ -63,7 +59,7 @@ mod tests {
     #[test]
     fn smalux_json_adapter_plans_websocket_for_base_url() {
         let config = ExportConfig::default();
-        let mut adapter = build_export_adapter(config.format);
+        let mut adapter = build_protocol_adapter(config.format);
         let plan = adapter.transport_plan(&config).unwrap();
 
         assert_eq!(plan.transports.len(), 1);
@@ -128,7 +124,7 @@ mod tests {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let config = ExportConfig::default();
         adapter.transport_plan(&config).unwrap();
 
@@ -152,7 +148,7 @@ mod tests {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let token = format!(
             "smx1.agent-key.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8; 32])
@@ -181,7 +177,7 @@ mod tests {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
 
         assert!(matches!(outbound.kind, OutboundReportKind::Snapshot { .. }));
         assert!(
@@ -195,7 +191,7 @@ mod tests {
     /// 验证 smalux_json adapter 会输出远程任务结果。
     #[test]
     fn smalux_json_adapter_outputs_remote_task_result() {
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let result = RemoteTaskResultEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 9,
@@ -227,7 +223,7 @@ mod tests {
     /// 验证 smalux_json adapter 会输出远程探测结果。
     #[test]
     fn smalux_json_adapter_outputs_remote_probe_result() {
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let result = RemoteProbeResultEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 12,
@@ -264,7 +260,7 @@ mod tests {
     /// 验证 smalux_json adapter 会输出控制命令确认。
     #[test]
     fn smalux_json_adapter_outputs_control_ack() {
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let ack = ControlAckEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 10,
@@ -283,7 +279,7 @@ mod tests {
     /// 验证 smalux_json adapter 会输出控制命令错误。
     #[test]
     fn smalux_json_adapter_outputs_control_error() {
-        let mut adapter = build_export_adapter(ExportFormat::SmaluxJson);
+        let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let error = ControlErrorEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 11,

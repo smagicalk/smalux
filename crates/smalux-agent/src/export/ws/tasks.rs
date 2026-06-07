@@ -3,7 +3,7 @@
 mod handler;
 
 use crate::config::model::ExportWireMode;
-use crate::export::{ExportInboundMessage, ExportMessageListener};
+use crate::export::{InboundProtocolHandler, TransportInboundMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Interval, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite};
 
-/// 监听器消息队列的缓冲大小。
-pub(crate) const LISTENER_QUEUE_CAPACITY: usize = 128;
+/// 入站协议处理器消息队列的缓冲大小。
+pub(crate) const INBOUND_HANDLER_QUEUE_CAPACITY: usize = 128;
 /// 主动关闭后等待对端 close frame 的最长时间。
 pub(super) const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 后台任务退出的等待时间。
@@ -73,12 +73,12 @@ impl WebSocketWireState {
     }
 }
 
-/// 发送到监听器 worker 的服务端消息。
+/// 发送到入站协议处理器 worker 的服务端消息。
 pub(super) struct InboundMessageEvent {
     /// 入站消息内容。
-    pub(super) payload: ExportInboundMessage,
-    /// 处理该消息时使用的 listener 快照。
-    pub(super) listener: Arc<dyn ExportMessageListener>,
+    pub(super) payload: TransportInboundMessage,
+    /// 处理该消息时使用的 handler 快照。
+    pub(super) handler: Arc<dyn InboundProtocolHandler>,
 }
 
 /// WebSocket 写半边类型别名，避免处理函数签名过长。
@@ -91,48 +91,49 @@ pub(super) type WebSocketWriter = futures_util::stream::SplitSink<
 pub(crate) fn spawn_websocket_tasks(
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     commands: mpsc::Receiver<WebSocketCommand>,
-    heartbeat: u64,
+    heartbeat: Duration,
     wire_state: WebSocketWireState,
-    listener_lock: Arc<RwLock<Option<Arc<dyn ExportMessageListener>>>>,
+    handler_lock: Arc<RwLock<Option<Arc<dyn InboundProtocolHandler>>>>,
 ) -> (JoinHandle<()>, JoinHandle<()>) {
-    let (listener_tx, listener_rx) = mpsc::channel::<InboundMessageEvent>(LISTENER_QUEUE_CAPACITY);
-    let listener_task = tokio::spawn(listener_worker(listener_rx));
+    let (handler_tx, handler_rx) =
+        mpsc::channel::<InboundMessageEvent>(INBOUND_HANDLER_QUEUE_CAPACITY);
+    let handler_task = tokio::spawn(inbound_handler_worker(handler_rx));
     let websocket_task = tokio::spawn(websocket_loop(
         websocket,
         commands,
         heartbeat,
         wire_state,
-        listener_lock,
-        listener_tx,
+        handler_lock,
+        handler_tx,
     ));
 
-    (websocket_task, listener_task)
+    (websocket_task, handler_task)
 }
 
-/// 串行执行 listener 回调，避免业务处理阻塞 WebSocket 读循环。
-async fn listener_worker(mut listener_rx: mpsc::Receiver<InboundMessageEvent>) {
+/// 串行执行入站 handler 回调，避免业务处理阻塞 WebSocket 读循环。
+async fn inbound_handler_worker(mut handler_rx: mpsc::Receiver<InboundMessageEvent>) {
     tracing::debug!(
-        queue_capacity = LISTENER_QUEUE_CAPACITY,
-        "listener worker started"
+        queue_capacity = INBOUND_HANDLER_QUEUE_CAPACITY,
+        "inbound handler worker started"
     );
 
-    while let Some(event) = listener_rx.recv().await {
-        if let Err(e) = event.listener.on_message(event.payload).await {
-            tracing::error!(error = %e, "listener worker failed to process message");
+    while let Some(event) = handler_rx.recv().await {
+        if let Err(e) = event.handler.on_message(event.payload).await {
+            tracing::error!(error = %e, "inbound handler worker failed to process message");
         }
     }
 
-    tracing::debug!("listener worker stopped");
+    tracing::debug!("inbound handler worker stopped");
 }
 
 /// WebSocket 读写循环。
 async fn websocket_loop(
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     mut commands: mpsc::Receiver<WebSocketCommand>,
-    heartbeat: u64,
+    heartbeat: Duration,
     mut wire_state: WebSocketWireState,
-    listener_lock: Arc<RwLock<Option<Arc<dyn ExportMessageListener>>>>,
-    listener_tx: mpsc::Sender<InboundMessageEvent>,
+    handler_lock: Arc<RwLock<Option<Arc<dyn InboundProtocolHandler>>>>,
+    handler_tx: mpsc::Sender<InboundMessageEvent>,
 ) {
     let (mut write, mut read) = websocket.split();
     let mut ping_interval = heartbeat_interval(heartbeat);
@@ -141,7 +142,7 @@ async fn websocket_loop(
     let mut close_requested = false;
 
     tracing::debug!(
-        heartbeat_secs = heartbeat,
+        heartbeat_ms = heartbeat.as_millis(),
         wire_mode = wire_state.mode_name(),
         "websocket background task started"
     );
@@ -163,8 +164,8 @@ async fn websocket_loop(
                     msg,
                     &mut write,
                     &mut wire_state,
-                    &listener_lock,
-                    &listener_tx,
+                    &handler_lock,
+                    &handler_tx,
                     &mut close_requested,
                     close_timeout.as_mut(),
                 )
@@ -200,8 +201,8 @@ async fn websocket_loop(
 }
 
 /// 根据心跳配置创建定时器；0 表示禁用心跳。
-fn heartbeat_interval(heartbeat_secs: u64) -> Option<Interval> {
-    (heartbeat_secs > 0).then(|| tokio::time::interval(Duration::from_secs(heartbeat_secs)))
+fn heartbeat_interval(heartbeat: Duration) -> Option<Interval> {
+    (!heartbeat.is_zero()).then(|| tokio::time::interval(heartbeat))
 }
 
 /// 等待下一次心跳；心跳禁用时返回一个永远不完成的 future。

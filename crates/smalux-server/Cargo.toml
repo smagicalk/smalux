@@ -34,4 +34,5 @@ tonic = {version = "0.14.2",features = ["default"]}
 prost = {version = "0.14.3",features = ["default"]}
 
 smalux-core = { path = "../smalux-core"}
+smalux-protocol = { path = "../smalux-protocol" }
 

@@ -1,13 +1,13 @@
 //! Service 内部消息层。
 //!
-//! 协议 listener、入站命令和出站事件都集中在这里。外部 transport 只需要把
+//! 协议入站处理器、入站命令和出站事件都集中在这里。外部 transport 只需要把
 //! server 消息转换成入站命令，业务执行结果统一进入出站事件队列。
 
 use crate::telemetry::TelemetryUpdate;
 use tokio::sync::mpsc;
 
+pub(crate) mod handler;
 pub(crate) mod inbound;
-pub(crate) mod listener;
 pub(crate) mod outbound;
 
 /// telemetry update 队列容量。

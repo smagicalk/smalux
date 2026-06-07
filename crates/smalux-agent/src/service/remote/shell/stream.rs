@@ -8,7 +8,7 @@ use super::message::{
     parse_stream_command,
 };
 use crate::export::ws::WebSocketConfig;
-use crate::export::{ExportInboundMessage, inbound_message_into_string};
+use crate::export::{TransportInboundMessage, inbound_message_into_string};
 
 /// shell stream codec 共享引用。
 pub(crate) type RemoteShellStreamCodecRef = std::sync::Arc<dyn RemoteShellStreamCodec>;
@@ -47,8 +47,10 @@ pub(crate) trait RemoteShellStreamCodec: Send + Sync + std::fmt::Debug {
     }
 
     /// 将入站 WebSocket 消息转换为 shell 输入。
-    fn decode_inbound(&self, msg: ExportInboundMessage)
-    -> anyhow::Result<Option<RemoteShellInput>>;
+    fn decode_inbound(
+        &self,
+        msg: TransportInboundMessage,
+    ) -> anyhow::Result<Option<RemoteShellInput>>;
 
     /// 将 shell 事件转换为 WebSocket frame。
     fn encode_event(
@@ -70,7 +72,7 @@ impl RemoteShellStreamCodec for SmaluxShellCodec {
     /// Smalux shell stream 入站消息必须是 JSON command。
     fn decode_inbound(
         &self,
-        msg: ExportInboundMessage,
+        msg: TransportInboundMessage,
     ) -> anyhow::Result<Option<RemoteShellInput>> {
         let msg = inbound_message_into_string(msg)?;
         let command = parse_stream_command(&msg)?;

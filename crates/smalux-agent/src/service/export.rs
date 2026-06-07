@@ -19,8 +19,7 @@ use pending::{
     queue_control_error, queue_remote_probe_result, queue_remote_task_result, send_resume_events,
 };
 use pipeline::{
-    ConnectedExportPipeline, close_transport_hub, connect_export_pipeline,
-    rebuild_runtime_deliveries,
+    ConnectedExportPipeline, close_transport_hub, connect_export_pipeline, rebuild_delivery_states,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -318,7 +317,7 @@ pub(crate) async fn export_supervisor(
                     tracing::info!("export outbound config changed; updating export deliveries");
                     let export_config = pipeline.export_config.clone();
                     pipeline.deliveries =
-                        rebuild_runtime_deliveries(&mut pipeline.router, &export_config, &next.outbound)?;
+                        rebuild_delivery_states(&mut pipeline.router, &export_config, &next.outbound)?;
                     pipeline.outbound_config = next.outbound.clone();
                     if let Err(err) = send_ready_deliveries(
                         &mut pipeline.transport_hub,

@@ -1,9 +1,10 @@
 //! Agent 动态配置管理。
 
 use super::model::{AgentConfig, AgentConfigPatch, ExportAuthMode, ExportFormat, ExportWireMode};
-use crate::export::{parse_export_base_url, security::parse_secure_token};
+use crate::export::parse_export_base_url;
 use smalux_core::model::info::MetricLevel;
 use smalux_core::utils::validate::{ensure_interval_at_least, ensure_non_empty};
+use smalux_protocol::secure::parse_secure_token;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -123,7 +124,7 @@ pub(crate) fn validate_config(config: &AgentConfig) -> anyhow::Result<()> {
     config.remote_shell.validate()?;
     config.remote_task.validate()?;
     config.remote_probe.validate()?;
-    ensure_config_interval("export.heartbeat", config.export.heartbeat)?;
+    ensure_optional_export_heartbeat("export.heartbeat", config.export.heartbeat)?;
     ensure_config_interval(
         "export.reconnect_interval",
         config.export.reconnect_interval,
@@ -204,6 +205,15 @@ pub(crate) fn validate_socket_sampling_options(
 /// 校验间隔非零且不低于最小间隔。
 fn ensure_config_interval(name: &str, value: Duration) -> anyhow::Result<()> {
     ensure_interval_at_least(name, value, MIN_INTERVAL)
+}
+
+/// 校验 WebSocket ping 心跳间隔；0 是显式禁用，其它值仍要避免过高频率。
+fn ensure_optional_export_heartbeat(name: &str, value: Duration) -> anyhow::Result<()> {
+    if value.is_zero() {
+        return Ok(());
+    }
+
+    ensure_config_interval(name, value)
 }
 
 /// 校验返回条数上限在安全范围内。
@@ -471,6 +481,26 @@ mod tests {
                 .to_string()
                 .contains("report.force_snapshot_min_interval")
         );
+    }
+
+    /// 验证 WebSocket ping 心跳可以显式设置为 0 来禁用。
+    #[test]
+    fn validate_accepts_zero_export_heartbeat() {
+        let mut config = AgentConfig::default();
+        config.export.heartbeat = Duration::ZERO;
+
+        validate_config(&config).unwrap();
+    }
+
+    /// 验证非零 WebSocket ping 心跳仍然不能过小。
+    #[test]
+    fn validate_rejects_too_small_export_heartbeat() {
+        let mut config = AgentConfig::default();
+        config.export.heartbeat = Duration::from_millis(1);
+
+        let error = validate_config(&config).unwrap_err();
+
+        assert!(error.to_string().contains("export.heartbeat"));
     }
 
     /// 验证 basic info delivery 间隔过小会被拒绝。
