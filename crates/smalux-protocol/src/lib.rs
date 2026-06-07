@@ -8,13 +8,16 @@ pub mod codec;
 pub mod frame;
 
 pub use codec::{
-    decode_client_frame, decode_server_frame, encode_ack_as_smalux_json_bytes, encode_client_frame,
-    encode_outbound_report_as_smalux_json, encode_outbound_report_as_smalux_json_bytes,
-    encode_protocol_error_as_smalux_json_bytes, encode_remote_probe_result_as_smalux_json_bytes,
+    decode_client_frame, decode_remote_shell_stream_command, decode_server_frame,
+    encode_ack_as_smalux_json_bytes, encode_client_frame, encode_outbound_report_as_smalux_json,
+    encode_outbound_report_as_smalux_json_bytes, encode_protocol_error_as_smalux_json_bytes,
+    encode_remote_probe_result_as_smalux_json_bytes, encode_remote_shell_stream_event,
     encode_remote_task_result_as_smalux_json_bytes, encode_server_frame,
 };
 pub use frame::{
-    Ack, ClientFrame, ClientPayload, DeltaReport, Heartbeat, OutboundReport, OutboundReportKind,
-    ProtocolError, RemoteProbeRequest, RemoteProbeResult, RemoteProbeType, RemoteTaskResult,
-    RemoteTaskStatus, SMALUX_PROTOCOL_VERSION, ServerFrame, ServerPayload, SnapshotRequest,
+    Ack, ClientFrame, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest,
+    OutboundReport, OutboundReportKind, ProtocolError, RemoteProbeRequest, RemoteProbeResult,
+    RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
+    RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus,
+    SMALUX_PROTOCOL_VERSION, ServerFrame, ServerPayload, SnapshotRequest,
 };

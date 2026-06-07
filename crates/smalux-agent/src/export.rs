@@ -28,7 +28,10 @@ mod worker;
 /// WebSocket 导出实现。
 pub(crate) mod ws;
 
-pub(crate) use adapter::{ExportAdapter, build_export_adapter, build_komari_message_listener};
+pub(crate) use adapter::{
+    ExportAdapter, build_export_adapter, build_komari_message_listener,
+    export_format_needs_basic_info,
+};
 pub(crate) use hub::{ExportTransportClient, TransportHub};
 pub(crate) use model::{
     EncodedExportMessage, ExportEndpointScheme, ExportInboundMessage, ExportMessageListener,

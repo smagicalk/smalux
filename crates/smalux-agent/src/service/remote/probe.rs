@@ -1,6 +1,6 @@
 //! 远程网络探测执行器。
 //!
-//! 该模块只处理协议无关的探测请求、频率保护和结果投递；Komari 或自有协议的
+//! 该模块只处理协议无关的探测请求、频率保护和结果投递；外部协议的
 //! 字段映射放在各自 adapter 中。
 
 use crate::collect::unix_timestamp_secs;
@@ -318,7 +318,7 @@ async fn probe_tcp(target: &str, timeout: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 执行 HTTP/HTTPS 探测，按 Komari 约定发送 GET，但不读取响应 body。
+/// 执行 HTTP/HTTPS 探测，发送 GET 请求但不读取响应 body。
 async fn probe_http(
     client: &reqwest::Client,
     target: &str,

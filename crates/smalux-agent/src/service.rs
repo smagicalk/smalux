@@ -201,7 +201,7 @@ mod tests {
     use super::reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
     use super::{RemoteMetricPermission, ServiceOptions};
     use crate::collect::{CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample};
-    use crate::config::model::{AgentConfigPatch, ExportAuthMode, ExportFormat, GroupConfigPatch};
+    use crate::config::model::{ExportAuthMode, ExportFormat};
     use crate::export::wire;
     use crate::service::collector::{CollectorCommand, collector_command_channel};
     use crate::service::control::ServiceControlListener;
@@ -213,7 +213,9 @@ mod tests {
         SocketAccuracy, SocketInfo, SocketSource, SystemInfo,
     };
     use smalux_protocol::{
-        ClientPayload, ServerFrame, SnapshotRequest, decode_client_frame, encode_server_frame,
+        ClientPayload, MetricCollectionRequest, RemoteProbeRequest, RemoteProbeType,
+        RemoteShellOpenRequest, RemoteTaskRequest, ServerFrame, SnapshotRequest,
+        decode_client_frame, encode_server_frame,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -606,6 +608,13 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("inbound command channel closed"))?;
             self.dispatcher.dispatch(command)
         }
+
+        /// 解析一条预期被 listener 丢弃的消息。
+        async fn handle_dropped_message(&mut self, message: &str) -> anyhow::Result<()> {
+            self.listener.handle_message(message).await?;
+            assert!(self.command_rx.try_recv().is_err());
+            Ok(())
+        }
     }
 
     /// 构造测试用控制消息链路。
@@ -620,7 +629,7 @@ mod tests {
         let remote_probe_manager =
             make_remote_probe_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
         let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
-            config_manager: manager,
+            config_manager: manager.clone(),
             remote_shell: disabled_remote_shell_manager(),
             remote_task: remote_task_manager,
             remote_probe: remote_probe_manager,
@@ -632,7 +641,7 @@ mod tests {
         });
 
         ControlHarness {
-            listener: ServiceControlListener::new(inbound_commands),
+            listener: ServiceControlListener::new(manager, inbound_commands),
             dispatcher,
             command_rx,
             _outbound_rx: outbound_rx,
@@ -655,7 +664,7 @@ mod tests {
         let remote_probe_manager =
             make_remote_probe_manager(manager.clone(), outbound_tx.clone(), sequence.clone());
         let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
-            config_manager: manager,
+            config_manager: manager.clone(),
             remote_shell: disabled_remote_shell_manager(),
             remote_task: remote_task_manager,
             remote_probe: remote_probe_manager,
@@ -667,7 +676,7 @@ mod tests {
         });
 
         let harness = ControlHarness {
-            listener: ServiceControlListener::new(inbound_commands),
+            listener: ServiceControlListener::new(manager, inbound_commands),
             dispatcher,
             command_rx,
             _outbound_rx: outbound_rx,
@@ -1120,16 +1129,14 @@ mod tests {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager.clone());
+        let message = encode_server_frame(&ServerFrame::config_patch(
+            76,
+            100,
+            serde_json::json!({ "core": { "interval": "2s" } }),
+        ))
+        .unwrap();
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "config_patch",
-                    "patch": { "core": { "interval": "2s" } }
-                }"#,
-            )
-            .await
-            .unwrap();
+        harness.handle_message(&message).await.unwrap();
 
         assert_eq!(manager.current().core.interval, Duration::from_secs(2));
     }
@@ -1201,17 +1208,17 @@ mod tests {
         };
         let (mut harness, mut command_rx) =
             service_control_harness_with_commands(manager, diagnostics);
+        let message = encode_server_frame(&ServerFrame::collect_processes_once(
+            79,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Details),
+                limit: Some(5),
+            },
+        ))
+        .unwrap();
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "collect_processes_once",
-                    "level": "details",
-                    "limit": 5
-                }"#,
-            )
-            .await
-            .unwrap();
+        harness.handle_message(&message).await.unwrap();
 
         assert_eq!(
             command_rx.try_recv().unwrap(),
@@ -1233,17 +1240,17 @@ mod tests {
         };
         let (mut harness, mut command_rx) =
             service_control_harness_with_commands(manager, diagnostics);
+        let message = encode_server_frame(&ServerFrame::collect_sockets_once(
+            80,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Details),
+                limit: Some(7),
+            },
+        ))
+        .unwrap();
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "collect_sockets_once",
-                    "level": "details",
-                    "limit": 7
-                }"#,
-            )
-            .await
-            .unwrap();
+        harness.handle_message(&message).await.unwrap();
 
         assert_eq!(
             command_rx.try_recv().unwrap(),
@@ -1265,17 +1272,17 @@ mod tests {
         };
         let (mut harness, mut command_rx) =
             service_control_harness_with_commands(manager, diagnostics);
+        let message = encode_server_frame(&ServerFrame::collect_processes_once(
+            81,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Count),
+                limit: Some(5),
+            },
+        ))
+        .unwrap();
 
-        let error = harness
-            .handle_message(
-                r#"{
-                    "type": "collect_processes_once",
-                    "level": "count",
-                    "limit": 5
-                }"#,
-            )
-            .await
-            .unwrap_err();
+        let error = harness.handle_message(&message).await.unwrap_err();
 
         assert!(error.to_string().contains("allowed level is none"));
         assert!(command_rx.try_recv().is_err());
@@ -1292,17 +1299,17 @@ mod tests {
         };
         let (mut harness, mut command_rx) =
             service_control_harness_with_commands(manager, diagnostics);
+        let message = encode_server_frame(&ServerFrame::collect_sockets_once(
+            82,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Light),
+                limit: Some(7),
+            },
+        ))
+        .unwrap();
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "collect_sockets_once",
-                    "level": "light",
-                    "limit": 7
-                }"#,
-            )
-            .await
-            .unwrap();
+        harness.handle_message(&message).await.unwrap();
 
         assert_eq!(
             command_rx.try_recv().unwrap(),
@@ -1322,16 +1329,14 @@ mod tests {
             manager.clone(),
             ServiceOptions::default().diagnostics,
         );
+        let message = encode_server_frame(&ServerFrame::config_patch(
+            83,
+            100,
+            serde_json::json!({ "processes": { "level": "light" } }),
+        ))
+        .unwrap();
 
-        let error = harness
-            .handle_message(
-                r#"{
-                    "type": "config_patch",
-                    "patch": { "processes": { "level": "light" } }
-                }"#,
-            )
-            .await
-            .unwrap_err();
+        let error = harness.handle_message(&message).await.unwrap_err();
 
         assert!(error.to_string().contains("process light"));
         assert_eq!(manager.current().processes.level, MetricLevel::Count);
@@ -1344,46 +1349,44 @@ mod tests {
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let (mut harness, mut command_rx) =
             service_control_harness_with_commands(manager, ServiceOptions::default().diagnostics);
+        let message = encode_server_frame(&ServerFrame::collect_sockets_once(
+            84,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Details),
+                limit: Some(7),
+            },
+        ))
+        .unwrap();
 
-        let error = harness
-            .handle_message(
-                r#"{
-                    "type": "collect_sockets_once",
-                    "level": "details",
-                    "limit": 7
-                }"#,
-            )
-            .await
-            .unwrap_err();
+        let error = harness.handle_message(&message).await.unwrap_err();
 
         assert!(error.to_string().contains("socket details"));
         assert!(command_rx.try_recv().is_err());
     }
 
-    /// 验证未知 server 消息不会被静默吞掉。
+    /// 验证未知 server 消息会被丢弃且不进入内部命令队列。
     #[tokio::test]
-    async fn service_control_listener_rejects_unknown_message_type() {
+    async fn service_control_listener_drops_unknown_message_type() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
 
-        let error = harness
-            .handle_message(r#"{ "type": "unknown", "patch": {} }"#)
+        harness
+            .handle_dropped_message(r#"{ "type": "unknown", "patch": {} }"#)
             .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("unknown variant"));
+            .unwrap();
     }
 
-    /// 验证远程 shell 默认关闭时控制消息会被拒绝。
+    /// 验证 raw 远程 shell 打开消息会被丢弃，不再作为自有协议入口。
     #[tokio::test]
-    async fn service_control_listener_rejects_remote_shell_when_disabled() {
+    async fn service_control_listener_drops_raw_remote_shell_open() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
 
-        let error = harness
-            .handle_message(
+        harness
+            .handle_dropped_message(
                 r#"{
                     "type": "remote_shell_open",
                     "session_id": "shell-1",
@@ -1391,9 +1394,37 @@ mod tests {
                 }"#,
             )
             .await
-            .unwrap_err();
+            .unwrap();
+    }
+
+    /// 验证 framed 远程 shell 默认关闭时会保留 server sequence 并回 error。
+    #[tokio::test]
+    async fn service_control_listener_rejects_framed_remote_shell_when_disabled() {
+        let manager =
+            crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
+        let mut harness = service_control_harness(manager);
+        let message = encode_server_frame(&ServerFrame::remote_shell_open(
+            91,
+            100,
+            RemoteShellOpenRequest {
+                session_id: "shell-framed-disabled".to_string(),
+                stream_url: "ws://127.0.0.1:1/shell".to_string(),
+                cols: Some(120),
+                rows: Some(30),
+            },
+        ))
+        .unwrap();
+
+        let error = harness.handle_message(&message).await.unwrap_err();
 
         assert!(error.to_string().contains("remote shell is disabled"));
+        let event = harness._outbound_rx.recv().await.unwrap();
+        let OutboundEvent::ControlError(error) = event else {
+            panic!("expected control error");
+        };
+        assert_eq!(error.error.sequence, Some(91));
+        assert_eq!(error.error.code, "remote_shell_open_failed");
+        assert!(error.error.message.contains("remote shell is disabled"));
     }
 
     /// 验证远程任务默认关闭时不会执行，只回传 rejected 结果。
@@ -1402,19 +1433,19 @@ mod tests {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
+        let message = encode_server_frame(&ServerFrame::remote_task_run(
+            93,
+            100,
+            RemoteTaskRequest {
+                task_id: "task-disabled".to_string(),
+                program: "noop".to_string(),
+                args: Vec::new(),
+                timeout: Some(Duration::from_secs(1)),
+            },
+        ))
+        .unwrap();
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "remote_task_run",
-                    "task_id": "task-disabled",
-                    "program": "noop",
-                    "args": [],
-                    "timeout": "1s"
-                }"#,
-            )
-            .await
-            .unwrap();
+        harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
         let OutboundEvent::RemoteTaskResult(result) = event else {
@@ -1434,17 +1465,18 @@ mod tests {
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
 
-        harness
-            .handle_message(
-                r#"{
-                    "type": "remote_probe_run",
-                    "task_id": 123,
-                    "probe_type": "tcp",
-                    "target": "127.0.0.1:1"
-                }"#,
-            )
-            .await
-            .unwrap();
+        let message = encode_server_frame(&ServerFrame::remote_probe_run(
+            92,
+            100,
+            RemoteProbeRequest {
+                task_id: serde_json::Value::from(123),
+                probe_type: RemoteProbeType::Tcp,
+                target: "127.0.0.1:1".to_string(),
+            },
+        ))
+        .unwrap();
+
+        harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
         let OutboundEvent::RemoteProbeResult(result) = event else {
@@ -1462,38 +1494,19 @@ mod tests {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager.clone());
+        let message = encode_server_frame(&ServerFrame::config_patch(
+            94,
+            100,
+            serde_json::json!({ "core": { "interval": "1ms" } }),
+        ))
+        .unwrap();
 
-        let error = harness
-            .handle_message(
-                &serde_json::to_string(&ServerControlMessageForTest {
-                    message_type: "config_patch",
-                    patch: AgentConfigPatch {
-                        core: Some(GroupConfigPatch {
-                            interval: Some(Duration::from_millis(1)),
-                            ..GroupConfigPatch::default()
-                        }),
-                        ..AgentConfigPatch::default()
-                    },
-                })
-                .unwrap(),
-            )
-            .await
-            .unwrap_err();
+        let error = harness.handle_message(&message).await.unwrap_err();
 
         assert!(error.to_string().contains("must be at least"));
         assert_eq!(
             manager.current().core.interval,
             crate::config::AgentConfig::default().core.interval
         );
-    }
-
-    /// 测试专用 server 消息结构，避免手写复杂 JSON。
-    #[derive(serde::Serialize)]
-    struct ServerControlMessageForTest {
-        /// 消息类型字段。
-        #[serde(rename = "type")]
-        message_type: &'static str,
-        /// 配置 patch。
-        patch: AgentConfigPatch,
     }
 }

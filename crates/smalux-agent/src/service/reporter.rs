@@ -1,7 +1,9 @@
 //! Service 内部上报构建。
 
 use crate::config::AgentConfig;
+#[cfg(test)]
 use crate::config::model::ExportFormat;
+use crate::export::export_format_needs_basic_info;
 use crate::service::outbound::{
     BasicInfoEnvelope, OutboundEvent, OutboundSender, OutboundSequence, ReportEnvelope,
 };
@@ -338,7 +340,7 @@ fn delayed_interval(duration: std::time::Duration) -> tokio::time::Interval {
 
 /// 判断当前格式是否需要 reporter 产生 basic info 事件。
 fn basic_info_enabled(config: &AgentConfig) -> bool {
-    config.outbound.basic_info.enabled && config.export.format == ExportFormat::Komari
+    config.outbound.basic_info.enabled && export_format_needs_basic_info(config.export.format)
 }
 
 /// 判断是否需要在第一份 ready state 出现后立即发送 basic info。

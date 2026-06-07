@@ -75,7 +75,10 @@ crates/smalux-agent/src/
 - `secure_psk` 模式要求 `export.auth_mode=none`，并拒绝 WebSocket text 控制消息。
 - `export.secure_required=true` 是单向安全闸：要求 `smalux_json + secure_psk`，当前配置一旦为 `true`，server patch 不能关闭它或降级到明文/Komari。
 - `ack/error` 只表示带 `sequence` 的 `ServerFrame` 已被调度或拒绝，不表示 remote task/probe 已完成。
-- raw control JSON 当前支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run`，没有自动 ack。
+- `ServerFrame` 当前支持 `snapshot_request`、`remote_probe_run`、`remote_shell_open`，带 `sequence` 时会回控制层 `ack/error`。
+- raw control JSON 当前只支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`，没有自动 ack；自有协议的 `remote_shell_open` 和 `remote_probe_run` 必须走 `ServerFrame`。
+- remote shell stream 已改为 codec adapter 模式：核心 `RemoteShellManager` 只处理统一 shell 语义，`SmaluxShellCodec` 负责自有 binary wire payload，`KomariTerminalCodec` 负责第三方 terminal raw binary 兼容。
+- basic info 事件是否生成由 export adapter capability 决定，reporter 不再直接判断 `ExportFormat::Komari`；新增第三方兼容格式时，应在对应 adapter 声明是否需要独立 basic info 事件。
 
 ## Komari 兼容
 
@@ -83,9 +86,10 @@ crates/smalux-agent/src/
 - Komari report 走 WebSocket `/api/clients/report?token=...`。
 - Komari basic info 走 HTTP `POST /api/clients/uploadBasicInfo?token=...`，默认 `outbound.basic_info.refresh_interval=5m`。
 - Komari task result 走 HTTP `POST /api/clients/task/result?token=...`。
-- Komari `terminal` 复用 remote shell，`exec` 复用 remote task，`ping` 复用 remote probe。
+- Komari terminal 走 WebSocket `/api/clients/terminal?id=REQUEST_ID&token=...`；兼容代码在 `src/export/komari/terminal.rs`，启用 raw binary frame，PTY 输出直接发 binary，入站 binary 直接写入 PTY，入站 text 只作为兼容输入解析。
+- Komari `terminal` 复用 remote shell，`exec` 复用 remote task，`ping` 复用 remote probe；Komari adapter 只做协议转换，不直接执行远程能力。
 - Komari 只消费 snapshot；开启 delta 或业务 heartbeat 会被配置校验拒绝。
-- Komari 不使用 Smalux binary wire 和 secure_psk，保持第三方 text/query token 行为。
+- Komari 不使用 Smalux binary wire 和 secure_psk，保持第三方 text/query token 行为；terminal stream 依赖 `wss://` TLS 保护传输。
 
 ## 远程能力边界
 
@@ -98,9 +102,9 @@ crates/smalux-agent/src/
   - `remote_shell.max_sessions`、`idle_timeout`、`session_timeout`、`program`
   - `remote_task.max_concurrent`、`timeout`、`max_stdout_bytes`、`max_stderr_bytes`
   - `remote_probe.enabled`、`timeout`、`global_min_interval`、`target_min_interval`
-- remote shell 使用 `portable-pty`；每个会话打开独立临时 WebSocket stream，PTY 输出 base64 编码。
+- remote shell 使用 `portable-pty`；每个会话打开独立临时 WebSocket stream。核心层把 PTY 输出表示为 base64 `output` 事件，Smalux stream 通过 binary wire 发送该事件，Komari terminal adapter 会解回 raw binary 后发送。
 - remote task 是非交互命令，结果通过主出站队列回传。
-- remote probe 支持 TCP / HTTP；ICMP 当前返回 `value=-1`。
+- remote probe 支持 TCP / HTTP；ICMP 当前返回 `value=-1`。核心 probe 模块只处理协议无关的探测、频率保护和结果投递，第三方字段映射放在各自 export adapter 中。
 
 ## 验证结果
 
@@ -114,16 +118,19 @@ cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs
 cargo rustdoc -p smalux-protocol --lib -- -D missing_docs
 ```
 
-本轮 outbound/delivery 命名清理和文档同步后验证通过：
+本轮 remote shell 共享协议提升、stream codec adapter 重构、Komari terminal raw binary 端到端测试、remote probe 协议中性清理和 basic info adapter capability 下沉后验证通过：
 
 ```powershell
 cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo test --workspace
+cargo test -p smalux-agent
+cargo test -p smalux-protocol
 cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
 ```
 
-测试结果：agent `260 passed / 4 ignored`，core `10 passed`，protocol `11 passed`，server `0 tests`，doc-tests `0 tests`；`cargo check --workspace --all-targets` 无 warning，严格 clippy 无 warning。提交前还执行了旧字段残留扫描和 `git diff --check`，仅有 Windows LF/CRLF 提示。
+测试结果：agent `272 passed / 4 ignored`，protocol `18 passed`，workspace 测试全部通过；`cargo check --workspace --all-targets` 无 warning，严格 clippy 无 warning。提交前还执行了 raw shell/probe 残留、旧 stream encoding、Komari 核心泄漏、占位输出、reporter 对 Komari 的生产代码依赖和 `git diff --check` 检查，`git diff --check` 仅有 Windows LF/CRLF 提示。
 
 ## 下一步建议
 

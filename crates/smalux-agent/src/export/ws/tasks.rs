@@ -33,12 +33,16 @@ pub(crate) enum WebSocketCommand {
         /// 业务 payload。
         bytes: Vec<u8>,
     },
+    /// 发送一条不经过 Smalux wire 包装的原始二进制消息。
+    SendRawBinary(Vec<u8>),
     /// 主动关闭连接。
     Close,
 }
 
 /// WebSocket binary wire 状态。
 pub(crate) enum WebSocketWireState {
+    /// 裸二进制帧，不做 Smalux wire 解包或加密。
+    RawBinary,
     /// 明文 binary wire。
     BinaryPlain {
         /// 当前连接 session id。
@@ -54,12 +58,18 @@ pub(crate) enum WebSocketWireState {
 }
 
 impl WebSocketWireState {
-    /// 返回 wire 模式。
-    pub(super) fn mode(&self) -> ExportWireMode {
+    /// 返回 wire 模式名称。
+    pub(super) fn mode_name(&self) -> &'static str {
         match self {
-            Self::BinaryPlain { .. } => ExportWireMode::BinaryPlain,
-            Self::SecurePsk { .. } => ExportWireMode::SecurePsk,
+            Self::RawBinary => "raw_binary",
+            Self::BinaryPlain { .. } => ExportWireMode::BinaryPlain.as_str(),
+            Self::SecurePsk { .. } => ExportWireMode::SecurePsk.as_str(),
         }
+    }
+
+    /// 是否处于 secure_psk 模式。
+    pub(super) fn is_secure_psk(&self) -> bool {
+        matches!(self, Self::SecurePsk { .. })
     }
 }
 
@@ -132,7 +142,7 @@ async fn websocket_loop(
 
     tracing::debug!(
         heartbeat_secs = heartbeat,
-        wire_mode = wire_state.mode().as_str(),
+        wire_mode = wire_state.mode_name(),
         "websocket background task started"
     );
 

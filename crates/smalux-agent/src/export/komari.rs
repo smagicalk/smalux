@@ -76,7 +76,19 @@ impl Default for KomariAdapter {
     }
 }
 
+impl KomariAdapter {
+    /// Komari 需要 reporter 生成独立 basic info 事件。
+    pub(super) const fn needs_basic_info() -> bool {
+        true
+    }
+}
+
 impl ExportAdapter for KomariAdapter {
+    /// Komari 需要独立的 HTTP basic info 上报。
+    fn needs_basic_info_events(&self) -> bool {
+        Self::needs_basic_info()
+    }
+
     /// 根据 base_url 生成 Komari transport plan。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan> {
         self.basic_info_url = Some(komari_basic_info_url(config)?);

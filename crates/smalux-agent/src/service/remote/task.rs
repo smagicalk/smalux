@@ -11,7 +11,7 @@ use crate::service::message::outbound::{
 };
 use serde::Deserialize;
 use smalux_core::utils::validate::ensure_non_empty;
-use smalux_protocol::{RemoteTaskResult, RemoteTaskStatus};
+use smalux_protocol::{RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,6 +61,18 @@ impl RemoteTaskRunRequest {
         ensure_non_empty("remote_task.task_id", &self.task_id)?;
         ensure_non_empty("remote_task.program", &self.program)?;
         Ok(())
+    }
+}
+
+impl From<RemoteTaskRequest> for RemoteTaskRunRequest {
+    /// 从自有协议远程任务请求转换为 service 内部命令。
+    fn from(request: RemoteTaskRequest) -> Self {
+        Self {
+            task_id: request.task_id,
+            program: request.program,
+            args: request.args,
+            timeout: request.timeout,
+        }
     }
 }
 

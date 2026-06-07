@@ -13,7 +13,7 @@ use crate::service::options::DiagnosticOptions;
 use crate::service::reporter::{ReporterCommand, ReporterCommandSender};
 use crate::service::{
     probe::{RemoteProbeManager, RemoteProbeRunRequest},
-    shell::{RemoteShellManager, RemoteShellOpenRequest},
+    shell::{RemoteShellManager, RemoteShellOpenRequest, RemoteShellStreamCodecRef},
     task::{RemoteTaskManager, RemoteTaskRunRequest},
 };
 use smalux_core::model::info::MetricLevel;
@@ -67,6 +67,8 @@ pub(crate) enum InboundCommand {
         request: RemoteShellOpenRequest,
         /// 某些兼容协议需要独立的 shell stream 导出配置。
         stream_export_config: Option<ExportConfig>,
+        /// shell stream codec。
+        stream_codec: RemoteShellStreamCodecRef,
     },
     /// 执行远程非交互任务。
     RemoteTaskRun {
@@ -112,7 +114,7 @@ pub(crate) struct ServerCommandMeta {
 pub(crate) struct InboundCommandEnvelope {
     /// 控制命令。
     pub(crate) command: InboundCommand,
-    /// 可选响应元数据；legacy raw 消息和第三方兼容消息通常为空。
+    /// 可选响应元数据；第三方兼容消息通常为空。
     pub(crate) meta: Option<ServerCommandMeta>,
 }
 
@@ -204,7 +206,7 @@ impl ControlDispatcher {
         let meta = envelope.meta;
         let result = self.dispatch_command(envelope.command);
         // 只有带 server sequence 的 Smalux ServerFrame 才回 ack/error。
-        // legacy text 和第三方兼容消息没有可关联的 sequence，失败只在本地日志体现。
+        // 第三方兼容消息没有可关联的 sequence，失败只在本地日志或对应兼容结果中体现。
         if let Some(meta) = meta {
             self.queue_control_response(meta, command_name, result.as_ref().err());
         }
@@ -224,7 +226,8 @@ impl ControlDispatcher {
             InboundCommand::RemoteShellOpen {
                 request,
                 stream_export_config,
-            } => self.open_remote_shell(request, stream_export_config),
+                stream_codec,
+            } => self.open_remote_shell(request, stream_export_config, stream_codec),
             InboundCommand::RemoteTaskRun { request } => self.remote_task.start(request),
             InboundCommand::RemoteProbeRun { request } => self.remote_probe.start(request),
             InboundCommand::SnapshotRequest { reason } => self.request_snapshot(reason),
@@ -288,13 +291,18 @@ impl ControlDispatcher {
         &self,
         request: RemoteShellOpenRequest,
         stream_export_config: Option<ExportConfig>,
+        stream_codec: RemoteShellStreamCodecRef,
     ) -> anyhow::Result<()> {
         let current_config = self.config_manager.current();
         let session_id = request.session_id.clone();
         let export_config = stream_export_config.unwrap_or_else(|| current_config.export.clone());
 
-        self.remote_shell
-            .open(request, &export_config, &current_config.remote_shell)?;
+        self.remote_shell.open(
+            request,
+            &export_config,
+            &current_config.remote_shell,
+            stream_codec,
+        )?;
         tracing::info!(session_id = %session_id, "remote shell open accepted");
         Ok(())
     }

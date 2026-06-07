@@ -1,6 +1,6 @@
 # smalux-core
 
-`smalux-core` 是 workspace 的共享核心库，放 agent 和 server 都需要复用的模型、协议、转换和日志初始化能力。
+`smalux-core` 是 workspace 的共享核心库，放 agent 和 server 都需要复用的模型、单位换算、通用工具和日志初始化能力。
 
 ## 当前职责
 
@@ -17,7 +17,6 @@ src/
   lib.rs          # crate 入口
   log.rs          # tracing 初始化
   flow.rs         # 单位换算
-  convert.rs      # 内部模型和外部协议转换入口
   model.rs        # 内部领域模型入口
   model/info.rs   # 监控模型聚合入口
   model/info/     # CPU / memory / disk / network / process / socket 子模型

@@ -21,6 +21,8 @@ pub(crate) struct WebSocketConfig {
     pub(crate) auth: WebSocketAuth,
     /// Smalux 自有协议 wire 模式。
     pub(crate) wire_mode: ExportWireMode,
+    /// 是否直接收发裸二进制帧，不经过 Smalux wire。
+    pub(crate) raw_binary_frames: bool,
     /// secure_psk 模式下使用的安全 key。
     pub(crate) secure_key: Option<SecurePskKey>,
     /// 是否跳过 TLS 证书校验。
@@ -37,6 +39,7 @@ impl WebSocketConfig {
             query: Vec::new(),
             auth: WebSocketAuth::None,
             wire_mode: ExportWireMode::BinaryPlain,
+            raw_binary_frames: false,
             secure_key: None,
             unsafe_cert: false,
             heartbeat: DEFAULT_HEARTBEAT_SECS,
@@ -67,6 +70,12 @@ impl WebSocketConfig {
     ) -> Self {
         self.wire_mode = wire_mode;
         self.secure_key = secure_key;
+        self
+    }
+
+    /// 设置是否直接收发裸二进制帧。
+    pub(crate) fn with_raw_binary_frames(mut self, enabled: bool) -> Self {
+        self.raw_binary_frames = enabled;
         self
     }
 
@@ -150,6 +159,7 @@ impl Debug for WebSocketConfig {
             .field("query_count", &self.query.len())
             .field("auth", &self.auth)
             .field("wire_mode", &self.wire_mode.as_str())
+            .field("raw_binary_frames", &self.raw_binary_frames)
             .field(
                 "secure_key_id",
                 &self.secure_key.as_ref().map(|key| key.key_id.as_str()),

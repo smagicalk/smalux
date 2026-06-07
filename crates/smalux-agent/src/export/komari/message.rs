@@ -4,7 +4,6 @@
 //! 避免误解析成 smalux `config_patch`。
 
 use crate::config::ConfigManager;
-use crate::config::model::{ExportAuthMode, ExportConfig};
 use crate::export::{
     ExportInboundMessage, ExportMessageListener, inbound_message_into_string, komari::terminal,
 };
@@ -15,6 +14,7 @@ use crate::service::{
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// 构造 Komari server 消息监听器。
 pub(super) fn message_listener(
@@ -54,7 +54,7 @@ impl ExportMessageListener for KomariMessageListener {
                 let export_config = current_config.export;
                 let stream_url =
                     super::url::komari_terminal_url(&export_config, &event.request_id)?;
-                let stream_export_config = terminal_stream_export_config(export_config);
+                let stream_export_config = terminal::terminal_stream_export_config(export_config);
                 let session_id = event.request_id;
                 commands
                     .send(InboundCommandEnvelope::without_response(
@@ -66,6 +66,7 @@ impl ExportMessageListener for KomariMessageListener {
                                 rows: None,
                             },
                             stream_export_config: Some(stream_export_config),
+                            stream_codec: Arc::new(terminal::KomariTerminalCodec),
                         },
                     ))
                     .await
@@ -219,21 +220,19 @@ fn shell_command(command: String) -> (String, Vec<String>) {
     }
 }
 
-/// Komari terminal URL 已经包含 token/id/query，交给 shell manager 时避免重复追加认证 query。
-fn terminal_stream_export_config(mut export_config: ExportConfig) -> ExportConfig {
-    export_config.auth_mode = ExportAuthMode::None;
-    export_config.token = None;
-    export_config.query.clear();
-    export_config
-}
-
 #[cfg(test)]
 mod tests {
     //! Komari message listener 测试。
 
     use super::*;
     use crate::config::AgentConfig;
+    use crate::config::model::{ExportAuthMode, RemoteShellConfig};
+    use crate::service::shell::{RemoteShellManager, RemoteShellOptions};
     use crate::service::{InboundCommand, inbound_command_channel};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::protocol::Message;
 
     /// 验证 terminal 消息会转换为内部远程 shell 命令。
     #[tokio::test]
@@ -257,6 +256,7 @@ mod tests {
         let InboundCommand::RemoteShellOpen {
             request,
             stream_export_config,
+            stream_codec,
         } = command
         else {
             panic!("expected remote shell open command");
@@ -265,6 +265,117 @@ mod tests {
         assert_eq!(request.session_id, "term-1");
         assert!(request.stream_url.contains("/api/clients/terminal"));
         assert!(stream_export_config.unwrap().token.is_none());
+        assert_eq!(stream_codec.name(), "komari_terminal");
+    }
+
+    /// 验证 Komari terminal 消息可以打开真实 raw binary terminal stream。
+    #[tokio::test]
+    async fn listener_terminal_command_opens_raw_terminal_stream() {
+        let terminal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", terminal_listener.local_addr().unwrap());
+        let terminal_task = tokio::spawn(async move {
+            let (stream, _) = terminal_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut output_text = String::new();
+            let mut input_sent = false;
+
+            if !cfg!(windows) {
+                websocket
+                    .send(Message::Binary(bytes::Bytes::from_static(
+                        b"echo komari-terminal-e2e\r\nexit\r\n",
+                    )))
+                    .await
+                    .unwrap();
+                input_sent = true;
+            }
+
+            while let Some(message) = websocket.next().await {
+                match message.unwrap() {
+                    Message::Binary(bytes) => {
+                        output_text.push_str(&String::from_utf8_lossy(&bytes));
+                        if cfg!(windows) && !input_sent && output_text.contains("\u{1b}[6n") {
+                            websocket
+                                .send(Message::Binary(bytes::Bytes::from_static(
+                                    b"\x1b[24;1Recho komari-terminal-e2e\r\nexit\r\n",
+                                )))
+                                .await
+                                .unwrap();
+                            input_sent = true;
+                        }
+                        if output_text.contains("komari-terminal-e2e") {
+                            break;
+                        }
+                    }
+                    Message::Text(text) => {
+                        panic!("komari terminal output must be raw binary, got text: {text}");
+                    }
+                    Message::Ping(payload) => {
+                        websocket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Close(_frame) => break,
+                    _ => {}
+                }
+            }
+
+            output_text
+        });
+
+        let mut config = AgentConfig::default();
+        config.export.base_url = base_url;
+        config.export.auth_mode = ExportAuthMode::Query;
+        config.export.token = Some("secret-token".to_string());
+        let manager = ConfigManager::new(config).unwrap();
+        let (commands, mut command_rx) = inbound_command_channel();
+        let listener = message_listener(manager, commands);
+
+        listener
+            .on_message(ExportInboundMessage::Text(
+                r#"{ "message": "terminal", "request_id": "term-e2e" }"#.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let command = command_rx.try_recv().unwrap().command;
+        let InboundCommand::RemoteShellOpen {
+            request,
+            stream_export_config,
+            stream_codec,
+        } = command
+        else {
+            panic!("expected remote shell open command");
+        };
+
+        assert!(request.stream_url.contains("/api/clients/terminal"));
+        assert!(request.stream_url.contains("id=term-e2e"));
+        assert!(request.stream_url.contains("token=secret-token"));
+
+        RemoteShellManager::new(RemoteShellOptions { enabled: true })
+            .open(
+                request,
+                &stream_export_config.unwrap(),
+                &RemoteShellConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    session_timeout: Duration::from_secs(10),
+                    program: Some(if cfg!(windows) {
+                        "cmd.exe".to_string()
+                    } else {
+                        "/bin/sh".to_string()
+                    }),
+                    ..RemoteShellConfig::default()
+                },
+                stream_codec,
+            )
+            .unwrap();
+
+        let output_text = timeout(Duration::from_secs(12), terminal_task)
+            .await
+            .expect("timed out waiting for komari terminal stream")
+            .unwrap();
+
+        assert!(
+            output_text.contains("komari-terminal-e2e"),
+            "terminal output was: {output_text:?}"
+        );
     }
 
     /// 验证 exec 消息会转换为内部远程任务命令。

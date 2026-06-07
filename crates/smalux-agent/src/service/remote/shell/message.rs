@@ -1,126 +1,46 @@
-//! 远程 shell 控制消息和 stream 消息模型。
+//! 远程 shell 控制消息和 stream 辅助逻辑。
 //!
-//! 控制消息走主 WebSocket；stream 消息走每个 shell 会话独立的临时 WebSocket。
+//! 稳定 JSON 模型定义在 `smalux-protocol`，本模块只保留 agent 侧默认值、校验和
+//! PTY 字节转换，避免 server 和 agent 各自维护一份协议结构。
 
-use serde::{Deserialize, Serialize};
+pub(crate) use smalux_protocol::{
+    RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
+    RemoteShellStreamEvent,
+};
 
 /// 默认 PTY 列数。
 pub(crate) const DEFAULT_PTY_COLS: u16 = 80;
 /// 默认 PTY 行数。
 pub(crate) const DEFAULT_PTY_ROWS: u16 = 24;
 
-/// 主控制通道中的远程 shell 打开请求。
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub(crate) struct RemoteShellOpenRequest {
-    /// 本次 shell 会话 ID，由 server 生成并在 stream 消息中回显。
-    pub session_id: String,
-    /// 本次 shell 会话使用的临时 WebSocket stream 地址。
-    pub stream_url: String,
-    /// 初始终端列数。
-    #[serde(default)]
-    pub cols: Option<u16>,
-    /// 初始终端行数。
-    #[serde(default)]
-    pub rows: Option<u16>,
-}
-
-impl RemoteShellOpenRequest {
-    /// 校验打开请求的基础字段。
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.session_id.trim().is_empty() {
-            anyhow::bail!("remote_shell.session_id cannot be empty");
-        }
-        if self.stream_url.trim().is_empty() {
-            anyhow::bail!("remote_shell.stream_url cannot be empty");
-        }
-        if self.cols == Some(0) {
-            anyhow::bail!("remote_shell.cols must be greater than 0");
-        }
-        if self.rows == Some(0) {
-            anyhow::bail!("remote_shell.rows must be greater than 0");
-        }
-        Ok(())
+/// 校验打开请求的基础字段。
+pub(crate) fn validate_open_request(request: &RemoteShellOpenRequest) -> anyhow::Result<()> {
+    if request.session_id.trim().is_empty() {
+        anyhow::bail!("remote_shell.session_id cannot be empty");
     }
-
-    /// 返回打开 PTY 时使用的初始尺寸。
-    pub(crate) fn initial_size(&self) -> (u16, u16) {
-        (
-            self.cols.unwrap_or(DEFAULT_PTY_COLS),
-            self.rows.unwrap_or(DEFAULT_PTY_ROWS),
-        )
+    if request.stream_url.trim().is_empty() {
+        anyhow::bail!("remote_shell.stream_url cannot be empty");
     }
+    if request.cols == Some(0) {
+        anyhow::bail!("remote_shell.cols must be greater than 0");
+    }
+    if request.rows == Some(0) {
+        anyhow::bail!("remote_shell.rows must be greater than 0");
+    }
+    Ok(())
 }
 
-/// stream 数据编码。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RemoteShellDataEncoding {
-    /// UTF-8 文本。
-    Utf8,
-    /// base64 编码的原始字节。
-    Base64,
-}
-
-/// shell stream 上 server 发给 agent 的消息。
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum RemoteShellStreamCommand {
-    /// 写入 PTY 输入。
-    Input {
-        /// 输入数据。
-        data: String,
-        /// 输入数据编码，缺省按 UTF-8 文本处理。
-        #[serde(default)]
-        encoding: Option<RemoteShellDataEncoding>,
-    },
-    /// 调整 PTY 终端尺寸。
-    Resize {
-        /// 终端列数。
-        cols: u16,
-        /// 终端行数。
-        rows: u16,
-    },
-    /// 请求关闭 shell 会话。
-    Close,
-}
-
-/// shell stream 上 agent 发给 server 的消息。
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum RemoteShellStreamEvent {
-    /// shell 会话已经启动。
-    Opened {
-        /// shell 会话 ID。
-        session_id: String,
-    },
-    /// PTY 输出。
-    Output {
-        /// shell 会话 ID。
-        session_id: String,
-        /// 输出数据，当前使用 base64 保留原始字节。
-        data: String,
-        /// 输出数据编码。
-        encoding: RemoteShellDataEncoding,
-    },
-    /// shell 进程退出。
-    Exit {
-        /// shell 会话 ID。
-        session_id: String,
-        /// 退出码；被系统信号或强制关闭时可能为空。
-        code: Option<i32>,
-    },
-    /// shell 会话错误。
-    Error {
-        /// shell 会话 ID。
-        session_id: String,
-        /// 错误信息。
-        message: String,
-    },
+/// 返回打开 PTY 时使用的初始尺寸。
+pub(crate) fn open_request_initial_size(request: &RemoteShellOpenRequest) -> (u16, u16) {
+    (
+        request.cols.unwrap_or(DEFAULT_PTY_COLS),
+        request.rows.unwrap_or(DEFAULT_PTY_ROWS),
+    )
 }
 
 /// 解析 shell stream command。
 pub(crate) fn parse_stream_command(text: &str) -> anyhow::Result<RemoteShellStreamCommand> {
-    Ok(serde_json::from_str(text)?)
+    Ok(smalux_protocol::decode_remote_shell_stream_command(text)?)
 }
 
 /// 把输入 command 解码成 PTY 字节。
@@ -129,7 +49,9 @@ pub(crate) fn decode_input_bytes(command: RemoteShellStreamCommand) -> anyhow::R
         RemoteShellStreamCommand::Input { data, encoding } => {
             decode_data(data, encoding.unwrap_or(RemoteShellDataEncoding::Utf8))
         }
-        RemoteShellStreamCommand::Resize { .. } | RemoteShellStreamCommand::Close => {
+        RemoteShellStreamCommand::Resize { .. }
+        | RemoteShellStreamCommand::Close
+        | RemoteShellStreamCommand::Heartbeat => {
             anyhow::bail!("remote shell command does not carry input bytes")
         }
     }
@@ -137,7 +59,7 @@ pub(crate) fn decode_input_bytes(command: RemoteShellStreamCommand) -> anyhow::R
 
 /// 编码 shell stream event。
 pub(crate) fn encode_stream_event(event: &RemoteShellStreamEvent) -> anyhow::Result<String> {
-    Ok(serde_json::to_string(event)?)
+    Ok(smalux_protocol::encode_remote_shell_stream_event(event)?)
 }
 
 /// 把 PTY 输出编码成 stream event。
@@ -190,17 +112,34 @@ mod tests {
         assert_eq!(decode_input_bytes(command).unwrap(), vec![0, 1, 2]);
     }
 
+    /// 验证第三方 input 字段不会泄漏进 Smalux 核心 stream 协议。
+    #[test]
+    fn parse_stream_command_rejects_input_alias_without_data() {
+        let error = parse_stream_command(r#"{ "type": "input", "input": "echo third-party\n" }"#)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing field"));
+    }
+
+    /// 验证 stream heartbeat 可以解析并忽略额外字段。
+    #[test]
+    fn parse_stream_command_reads_heartbeat() {
+        let command =
+            parse_stream_command(r#"{ "type": "heartbeat", "timestamp": 1780660703 }"#).unwrap();
+
+        assert_eq!(command, RemoteShellStreamCommand::Heartbeat);
+    }
+
     /// 验证打开请求会拒绝空字段。
     #[test]
     fn open_request_rejects_blank_fields() {
-        let error = RemoteShellOpenRequest {
+        let request = RemoteShellOpenRequest {
             session_id: " ".to_string(),
             stream_url: "ws://127.0.0.1/shell".to_string(),
             cols: None,
             rows: None,
-        }
-        .validate()
-        .unwrap_err();
+        };
+        let error = validate_open_request(&request).unwrap_err();
 
         assert!(error.to_string().contains("session_id"));
     }
@@ -215,28 +154,29 @@ mod tests {
             rows: None,
         };
 
-        assert_eq!(request.initial_size(), (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS));
+        assert_eq!(
+            open_request_initial_size(&request),
+            (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)
+        );
     }
 
     /// 验证 PTY 尺寸不能为 0。
     #[test]
     fn open_request_rejects_zero_pty_size() {
-        let cols_error = RemoteShellOpenRequest {
+        let cols_request = RemoteShellOpenRequest {
             session_id: "shell-1".to_string(),
             stream_url: "ws://127.0.0.1/shell".to_string(),
             cols: Some(0),
             rows: Some(24),
-        }
-        .validate()
-        .unwrap_err();
-        let rows_error = RemoteShellOpenRequest {
+        };
+        let cols_error = validate_open_request(&cols_request).unwrap_err();
+        let rows_request = RemoteShellOpenRequest {
             session_id: "shell-1".to_string(),
             stream_url: "ws://127.0.0.1/shell".to_string(),
             cols: Some(80),
             rows: Some(0),
-        }
-        .validate()
-        .unwrap_err();
+        };
+        let rows_error = validate_open_request(&rows_request).unwrap_err();
 
         assert!(cols_error.to_string().contains("cols"));
         assert!(rows_error.to_string().contains("rows"));

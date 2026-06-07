@@ -99,6 +99,10 @@ impl WebSocketClient {
         &self,
         websocket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     ) -> anyhow::Result<WebSocketWireState> {
+        if self.config.raw_binary_frames {
+            return Ok(WebSocketWireState::RawBinary);
+        }
+
         match self.config.wire_mode {
             ExportWireMode::BinaryPlain => Ok(WebSocketWireState::BinaryPlain {
                 session_id: uuid::Uuid::new_v4().into_bytes(),
@@ -268,6 +272,12 @@ impl WebSocketClient {
     /// 将二进制内容送入后台发送队列。
     async fn enqueue_binary(&mut self, sequence: u64, bytes: Vec<u8>) -> anyhow::Result<()> {
         self.enqueue_command(WebSocketCommand::SendBinary { sequence, bytes })
+            .await
+    }
+
+    /// 将原始二进制内容送入后台发送队列，不经过 Smalux wire 包装。
+    pub(crate) async fn send_raw_binary_message(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.enqueue_command(WebSocketCommand::SendRawBinary(bytes))
             .await
     }
 

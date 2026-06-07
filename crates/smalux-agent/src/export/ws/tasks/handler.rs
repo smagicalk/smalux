@@ -4,7 +4,6 @@ use super::{
     CLOSE_HANDSHAKE_TIMEOUT, InboundMessageEvent, LISTENER_QUEUE_CAPACITY, WebSocketCommand,
     WebSocketWireState, WebSocketWriter,
 };
-use crate::config::model::ExportWireMode;
 use crate::export::security;
 use crate::export::wire::{self, WirePacket, WirePacketKind};
 use crate::export::{ExportInboundMessage, ExportMessageListener};
@@ -30,7 +29,7 @@ pub(super) async fn handle_incoming_message(
         Some(Ok(tungstenite::protocol::Message::Text(msg_bytes))) => {
             // secure_psk 模式下业务 JSON 必须走 SecureData，拒绝 text 可以避免控制命令
             // 绕过加密通道进入 ServiceControlListener。
-            if matches!(wire_state.mode(), ExportWireMode::SecurePsk) {
+            if wire_state.is_secure_psk() {
                 tracing::warn!("websocket text message rejected in secure_psk wire mode");
                 return false;
             }
@@ -50,10 +49,11 @@ pub(super) async fn handle_incoming_message(
         }
         Some(Ok(tungstenite::protocol::Message::Binary(bytes))) => {
             let len = bytes.len();
-            // binary frame 始终先按 Smalux wire 解包；payload 才是后续解析
-            // ServerFrame 或 raw control JSON 的 UTF-8 JSON bytes。
+            // 非 raw 模式下 binary frame 先按 Smalux wire 解包；payload 才是后续解析
+            // 自有协议 ServerFrame 的 UTF-8 JSON bytes；第三方兼容消息由对应 listener 处理。
             match decode_binary_payload(bytes.as_ref(), wire_state) {
                 Ok((packet, payload)) => {
+                    let payload_len = payload.len();
                     let handled = handle_data_message(
                         ExportInboundMessage::Binary(payload),
                         "binary",
@@ -69,12 +69,22 @@ pub(super) async fn handle_incoming_message(
                     .await;
 
                     if handled {
-                        tracing::debug!(
-                            packet_kind = packet.kind.as_str(),
-                            sequence = packet.sequence,
-                            payload_bytes = packet.payload.len(),
-                            "websocket binary wire packet received"
-                        );
+                        match packet {
+                            Some(packet) => {
+                                tracing::debug!(
+                                    packet_kind = packet.kind.as_str(),
+                                    sequence = packet.sequence,
+                                    payload_bytes = packet.payload.len(),
+                                    "websocket binary wire packet received"
+                                );
+                            }
+                            None => {
+                                tracing::debug!(
+                                    payload_bytes = payload_len,
+                                    "websocket raw binary message received"
+                                );
+                            }
+                        }
                     }
 
                     handled
@@ -182,6 +192,20 @@ pub(super) async fn handle_command(
             }
             true
         }
+        Some(WebSocketCommand::SendRawBinary(bytes)) => {
+            tracing::trace!(bytes = bytes.len(), "websocket sending raw binary message");
+            if let Err(e) = write
+                .send(tungstenite::Message::Binary(bytes::Bytes::from(bytes)))
+                .await
+            {
+                tracing::error!(
+                    error = %e,
+                    "websocket raw binary message send failed; stopping background task"
+                );
+                return false;
+            }
+            true
+        }
         Some(WebSocketCommand::Close) => {
             tracing::info!("websocket close command received; sending close frame");
             send_close_frame(write, close_requested, close_timeout.as_mut()).await
@@ -198,6 +222,7 @@ fn encode_binary_payload(
     // transport 不解析 JSON 内容，只按 wire_mode 给业务 payload 加壳或加密。
     // 这样 report、ack/error、remote task result 和 shell stream event 可以复用同一发送路径。
     let packet = match wire_state {
+        WebSocketWireState::RawBinary => return Ok(payload),
         WebSocketWireState::BinaryPlain { session_id } => {
             WirePacket::plain_data(*session_id, sequence, payload)
         }
@@ -217,9 +242,14 @@ fn encode_binary_payload(
 fn decode_binary_payload(
     input: &[u8],
     wire_state: &mut WebSocketWireState,
-) -> anyhow::Result<(WirePacket, Vec<u8>)> {
+) -> anyhow::Result<(Option<WirePacket>, Vec<u8>)> {
+    if matches!(wire_state, WebSocketWireState::RawBinary) {
+        return Ok((None, input.to_vec()));
+    }
+
     let packet = wire::decode_wire_packet(input)?;
     let payload = match wire_state {
+        WebSocketWireState::RawBinary => unreachable!("handled before wire decode"),
         WebSocketWireState::BinaryPlain { .. } => {
             // binary_plain 只接受 PlainData，避免握手包或密文包被误当成明文控制消息。
             if packet.kind != WirePacketKind::PlainData {
@@ -242,7 +272,7 @@ fn decode_binary_payload(
         }
     };
 
-    Ok((packet, payload))
+    Ok((Some(packet), payload))
 }
 
 /// 单条入站数据消息处理所需的读循环上下文。

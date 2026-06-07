@@ -21,6 +21,5 @@ const LOG_MAX_SIZE_MB: u64 = 64;
 fn main() -> anyhow::Result<()> {
     smalux_core::log::init_tracing(LOG_FILE, LOG_RETENTION_FILES, LOG_MAX_SIZE_MB)?;
     tracing::info!("smalux-server starting");
-    println!("Hello, world!");
     Ok(())
 }

@@ -11,9 +11,9 @@ use tokio::time::Instant;
 /// export delivery 调度检查间隔。
 pub(super) const EXPORT_DELIVERY_SCHEDULER_TICK: Duration = Duration::from_secs(1);
 
-/// 运行时 delivery 状态。
+/// 单个 delivery 的调度状态。
 #[derive(Debug, Clone)]
-pub(super) struct RuntimeDelivery {
+pub(super) struct DeliveryState {
     /// delivery 静态配置。
     pub(super) spec: ExportDeliverySpec,
     /// interval delivery 的下次触发时间。
@@ -24,7 +24,7 @@ pub(super) struct RuntimeDelivery {
     last_queued_sequence: Option<u64>,
 }
 
-impl RuntimeDelivery {
+impl DeliveryState {
     /// 从静态 delivery 配置创建运行状态。
     pub(super) fn from_spec(spec: ExportDeliverySpec) -> Self {
         let next_due = match spec.trigger {
@@ -82,7 +82,7 @@ impl RuntimeDelivery {
 pub(super) async fn send_ready_deliveries(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    deliveries: &mut [RuntimeDelivery],
+    deliveries: &mut [DeliveryState],
     latest_report: Option<&ReportEnvelope>,
 ) -> anyhow::Result<()> {
     send_due_interval_deliveries(transport_hub, router, deliveries, latest_report).await?;
@@ -93,7 +93,7 @@ pub(super) async fn send_ready_deliveries(
 async fn send_on_latest_report_deliveries(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    deliveries: &mut [RuntimeDelivery],
+    deliveries: &mut [DeliveryState],
     latest_report: Option<&ReportEnvelope>,
 ) -> anyhow::Result<()> {
     let Some(report) = latest_report else {
@@ -123,7 +123,7 @@ async fn send_on_latest_report_deliveries(
 pub(super) async fn send_due_interval_deliveries(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    deliveries: &mut [RuntimeDelivery],
+    deliveries: &mut [DeliveryState],
     latest_report: Option<&ReportEnvelope>,
 ) -> anyhow::Result<()> {
     let Some(report) = latest_report else {
@@ -151,7 +151,7 @@ pub(super) async fn send_due_interval_deliveries(
 }
 
 /// 判断当前运行时 delivery 列表是否包含 interval delivery。
-pub(super) fn has_interval_deliveries(deliveries: &[RuntimeDelivery]) -> bool {
+pub(super) fn has_interval_deliveries(deliveries: &[DeliveryState]) -> bool {
     deliveries
         .iter()
         .any(|delivery| matches!(delivery.spec.trigger, ExportDeliveryTrigger::Interval(_)))
@@ -161,7 +161,7 @@ pub(super) fn has_interval_deliveries(deliveries: &[RuntimeDelivery]) -> bool {
 async fn send_delivery_report(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    delivery: &mut RuntimeDelivery,
+    delivery: &mut DeliveryState,
     report: &ReportEnvelope,
 ) -> anyhow::Result<()> {
     if delivery.skip_initial_latest_report_if_needed(report) {
@@ -223,12 +223,12 @@ async fn send_delivery_report(
 }
 
 /// 从 transport plan 创建运行时 delivery 状态。
-pub(super) fn runtime_deliveries_from_plan(transport_plan: &TransportPlan) -> Vec<RuntimeDelivery> {
+pub(super) fn delivery_states_from_plan(transport_plan: &TransportPlan) -> Vec<DeliveryState> {
     transport_plan
         .deliveries()
         .iter()
         .cloned()
-        .map(RuntimeDelivery::from_spec)
+        .map(DeliveryState::from_spec)
         .collect()
 }
 
@@ -262,7 +262,7 @@ mod tests {
     fn on_latest_report_respects_send_on_start_false() {
         let mut spec = ExportDeliverySpec::on_latest_report(ExportDeliveryId::RealtimeReport);
         spec.send_on_start = false;
-        let mut delivery = RuntimeDelivery::from_spec(spec);
+        let mut delivery = DeliveryState::from_spec(spec);
 
         assert!(delivery.skip_initial_latest_report_if_needed(&report(7)));
         assert_eq!(delivery.last_queued_sequence, Some(7));
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn on_latest_report_send_on_start_true_does_not_skip_initial_report() {
         let spec = ExportDeliverySpec::on_latest_report(ExportDeliveryId::RealtimeReport);
-        let mut delivery = RuntimeDelivery::from_spec(spec);
+        let mut delivery = DeliveryState::from_spec(spec);
 
         assert!(!delivery.skip_initial_latest_report_if_needed(&report(7)));
         assert_eq!(delivery.last_queued_sequence, None);

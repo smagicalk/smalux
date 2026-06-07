@@ -23,6 +23,11 @@ pub(crate) trait ExportAdapter {
     /// 根据配置声明需要启动的 transport。
     fn transport_plan(&mut self, config: &ExportConfig) -> anyhow::Result<TransportPlan>;
 
+    /// 是否需要 reporter 生成低频 basic info 事件。
+    fn needs_basic_info_events(&self) -> bool {
+        false
+    }
+
     /// 将内部上报语义编码成零到多条 transport 请求。
     fn encode_report(
         &mut self,
@@ -223,6 +228,11 @@ pub(crate) fn build_export_adapter(format: ExportFormat) -> Box<dyn ExportAdapte
         ExportFormat::SmaluxJson => Box::<SmaluxJsonAdapter>::default(),
         ExportFormat::Komari => Box::<komari::KomariAdapter>::default(),
     }
+}
+
+/// 返回导出格式是否需要 reporter 生成 basic info 事件。
+pub(crate) fn export_format_needs_basic_info(format: ExportFormat) -> bool {
+    build_export_adapter(format).needs_basic_info_events()
 }
 
 /// 创建 Komari server 消息监听器。

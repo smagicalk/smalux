@@ -58,10 +58,12 @@
   - 只有带 `sequence` 的命令才会让 agent 回 `ack/error`。
 - `sent_at`
   - server 发送 frame 的 Unix 秒时间戳。
+- `target_agent_id`
+  - 可选目标 agent ID。
+  - 为空时表示当前连接上的 agent；不为空且和当前 agent 不匹配时，agent 会直接丢弃该命令。
+  - 该字段只做路由保护，不做认证。
 - `type`
-  - 当前稳定值包括 `snapshot_request` 和 `remote_probe_run`。
-- 兼容控制 JSON
-  - `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 目前是 raw control JSON，不在这个 crate 的稳定 `ServerPayload` 里。
+  - 当前稳定值包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run` 和 `remote_shell_open`。
 
 ## Frame JSON 示例
 
@@ -93,6 +95,44 @@ server 下发稳定命令时也是同样的顶层 `type`：
     "reason": "delta_base_missing"
   }
 }
+```
+
+远程 shell 打开请求也走稳定 `ServerFrame`，真实终端 IO 会在 `stream_url` 指向的临时 WebSocket 上继续交换：
+
+```jsonc
+{
+  "protocol_version": 1,
+  "sequence": 202,
+  "sent_at": 1710000002,
+  "type": "remote_shell_open",
+  "request": {
+    "session_id": "shell-1",
+    "stream_url": "wss://example.com/agent/shell/shell-1",
+    "cols": 120,
+    "rows": 30
+  }
+}
+```
+
+远程 shell stream 的业务 JSON 也定义在本 crate 中，agent 通过
+`decode_remote_shell_stream_command()` 解析 server 发来的 command，通过
+`encode_remote_shell_stream_event()` 编码 agent 发回的 event。transport 仍由外层决定：
+`binary_plain` 时它们是 `WirePacket(kind=PlainData)` 的 payload，`secure_psk` 时它们是解密后的
+`WirePacket(kind=SecureData)` payload，只有本地调试才建议直接走 WebSocket text。
+
+```jsonc
+{ "type": "input", "data": "echo hello\r\n" } // UTF-8 文本输入，encoding 缺省为 utf8
+{ "type": "input", "encoding": "base64", "data": "AAEC" } // 原始字节输入
+{ "type": "resize", "cols": 120, "rows": 30 } // 调整 PTY 尺寸
+{ "type": "close" } // 请求关闭本次 shell 会话
+{ "type": "heartbeat" } // 可选 stream 保活，不写入 PTY
+```
+
+```jsonc
+{ "type": "opened", "session_id": "shell-1" } // shell 已启动
+{ "type": "output", "session_id": "shell-1", "encoding": "base64", "data": "aGVsbG8NCg==" } // PTY 输出
+{ "type": "exit", "session_id": "shell-1", "code": null } // shell 退出；无进程退出码时固定带 null
+{ "type": "error", "session_id": "shell-1", "message": "..." } // 会话错误
 ```
 
 agent 回传 `ack/error` 时，`ack.sequence` 或 `error.sequence` 指向 server 的 `ServerFrame.sequence`，不是 agent 自己的 frame 序号：
@@ -171,8 +211,8 @@ server 按下面顺序实现，最容易先跑通闭环：
    -> remote_task_result / remote_probe_result: 关联任务结果
 
 5. 下发控制命令
-   -> snapshot_request / remote_probe_run 用 ServerFrame，可收到 ack/error
-   -> config_patch / collect_* / remote_shell_open / remote_task_run 当前走 raw control JSON
+   -> 自有协议命令统一构造 ServerFrame，可选 target_agent_id 做路由保护
+   -> snapshot_request / config_patch / collect_* / remote_task_run / remote_probe_run / remote_shell_open 都可收到 ack/error
    -> 按当前 wire_mode 封成 PlainData 或 SecureData
 ```
 
@@ -180,9 +220,10 @@ server 按下面顺序实现，最容易先跑通闭环：
 
 ## 兼容边界
 
-- `snapshot_request`、`remote_probe_run` 现在属于稳定 `ServerFrame`。
-- `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_shell_open`、`remote_task_run` 目前属于 agent 兼容 JSON，不是这个 crate 的稳定协议面。
+- `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
 - `ack/error` 只对带 `sequence` 的 `ServerFrame` 有意义。
+- `target_agent_id` 不匹配时 agent 会丢弃命令，不回 `ack/error`。
+- 第三方兼容消息不进入本 crate 的稳定协议面，应在对应 adapter/listener 中转换成 agent 内部命令。
 - server 如果没有 delta 基准，就应该发 `snapshot_request`，不要猜测补齐。
 - server 不要做字段级深度 merge，`snapshot` 是完整替换，`delta` 是顶层采集组替换。
 
@@ -220,7 +261,7 @@ JSON 解析建议：
 | `busy` | 并发已满，例如 remote shell session 已达到上限 | 稍后重试或让用户关闭旧会话 |
 | `internal_error` | agent 内部不可预期错误 | 记录上下文，避免无限重试 |
 
-错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。
+错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。当前 agent 对 `ServerFrame` 调度失败时会按 `{server_frame_type}_failed` 生成错误码，例如 `snapshot_request_failed`、`remote_probe_run_failed` 和 `remote_shell_open_failed`。
 
 server 自己的 ingest 错误可以使用另一套内部错误码，不必通过 `ClientFrame(type=error)` 回给 agent。agent 当前没有等待 server 对上报 frame 做协议级 ack，因此 server 收到非法 `snapshot` / `delta` 时优先记录、丢弃或发送 `snapshot_request`。
 
@@ -247,18 +288,15 @@ server 发送建议：
 - `ServerFrame.sequence` 在 server 侧按 agent 递增即可，不要求全局唯一。
 - 有副作用的命令需要业务 ID，例如 `remote_task_run.task_id`，避免重连或重试导致重复执行。
 - `snapshot_request` 可以重复发送，但 agent 有 `report.force_snapshot_min_interval` 合并保护；server 也应做自己的频率限制。
-- raw control JSON 没有协议级 `sequence`，不能期待 `ack/error`。如果某个 raw 命令需要标准确认，应先提升为 `ServerPayload`。
+- 自有协议下行不要发送 raw JSON 命令；所有 server 命令都应放进 `ServerFrame`。
 
-## 提升到 ServerFrame 的标准
+## 第三方兼容扩展
 
-raw control JSON 不是最终形态。后续一个 server 命令满足下面条件时，建议提升到 `ServerPayload`：
+本 crate 只承载自有协议的稳定 frame。Komari 或后续其它服务端的特殊消息应留在 agent 的对应 adapter/listener 中处理，并转换为统一内部命令：
 
-- 需要标准 `ack/error`，让 server 能确认命令是否被 agent 接收并调度。
-- 需要跨 transport 复用，例如 WebSocket、HTTP callback 或 gRPC 都要下发同一语义。
-- 需要稳定的协议测试和版本兼容。
-- 不再只是某个 adapter 的兼容行为。
-
-例如 `config_patch` 后续很可能提升到 `ServerPayload`，因为它是自有 server 的核心能力；而某些第三方兼容消息可以继续留在各自 adapter 中。
+- 需要 agent/server 双方长期稳定理解、需要 `ack/error`、需要跨 transport 复用的命令，放入 `ServerPayload`。
+- 只属于某个第三方协议的字段、路径、事件名或文本格式，留在第三方兼容 adapter 中。
+- adapter 可以复用内部 remote task、remote probe、remote shell manager，但不应把第三方 raw 消息暴露成自有协议格式。
 
 ## 扩展原则
 

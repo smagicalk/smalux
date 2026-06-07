@@ -6,7 +6,8 @@
 
 use crate::frame::{
     Ack, ClientFrame, ClientPayload, OutboundReport, OutboundReportKind, ProtocolError,
-    RemoteProbeResult, RemoteTaskResult, ServerFrame,
+    RemoteProbeResult, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskResult,
+    ServerFrame,
 };
 
 /// 将内部上报语义编码为 smalux 默认 JSON frame。
@@ -130,9 +131,26 @@ pub fn encode_server_frame(frame: &ServerFrame) -> serde_json::Result<String> {
 
 /// 解码 server 发往 agent 的 frame。
 ///
-/// 这里只识别稳定 `ServerFrame`。agent 兼容的 raw control JSON 会在
-/// `ServiceControlListener` 中单独解析，不走这个函数。
+/// 自有协议下行只识别稳定 `ServerFrame`。第三方兼容消息应由各自 adapter 转换。
 pub fn decode_server_frame(input: &str) -> serde_json::Result<ServerFrame> {
+    serde_json::from_str(input)
+}
+
+/// 编码远程 shell stream 事件。
+///
+/// 这里仅生成业务 JSON；WebSocket transport 会继续按当前 wire mode 封装或加密。
+pub fn encode_remote_shell_stream_event(
+    event: &RemoteShellStreamEvent,
+) -> serde_json::Result<String> {
+    serde_json::to_string(event)
+}
+
+/// 解码远程 shell stream 命令。
+///
+/// server 发给 agent 的临时 shell stream payload 应先按 wire mode 解包，再交给本函数解析。
+pub fn decode_remote_shell_stream_command(
+    input: &str,
+) -> serde_json::Result<RemoteShellStreamCommand> {
     serde_json::from_str(input)
 }
 
@@ -142,10 +160,14 @@ mod tests {
 
     use super::*;
     use crate::frame::{
-        Ack, ClientPayload, DeltaReport, Heartbeat, OutboundReport, ProtocolError,
-        RemoteProbeResult, RemoteProbeType, RemoteTaskResult, RemoteTaskStatus, ServerFrame,
-        ServerPayload, SnapshotRequest,
+        Ack, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest, OutboundReport,
+        ProtocolError, RemoteProbeResult, RemoteProbeType, RemoteShellDataEncoding,
+        RemoteShellOpenRequest, RemoteShellStreamCommand, RemoteShellStreamEvent,
+        RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus, ServerFrame, ServerPayload,
+        SnapshotRequest,
     };
+    use smalux_core::model::info::MetricLevel;
+    use std::time::Duration;
 
     /// 验证 client heartbeat frame 可以往返 JSON。
     #[test]
@@ -223,6 +245,162 @@ mod tests {
             }
             _ => panic!("expected snapshot request payload"),
         }
+    }
+
+    /// 验证 server config_patch frame 可以往返 JSON，并保留目标 agent ID。
+    #[test]
+    fn server_config_patch_roundtrips_json() {
+        let frame =
+            ServerFrame::config_patch(3, 100, serde_json::json!({ "core": { "interval": "2s" } }))
+                .with_target_agent_id("agent-1");
+
+        let json = encode_server_frame(&frame).unwrap();
+        let decoded = decode_server_frame(&json).unwrap();
+
+        assert_eq!(decoded.sequence, 3);
+        assert_eq!(decoded.target_agent_id.as_deref(), Some("agent-1"));
+        match decoded.payload {
+            ServerPayload::ConfigPatch { patch } => {
+                assert_eq!(patch["core"]["interval"], "2s");
+            }
+            _ => panic!("expected config patch payload"),
+        }
+    }
+
+    /// 验证一次性进程采集 frame 可以往返 JSON。
+    #[test]
+    fn server_collect_processes_once_roundtrips_json() {
+        let frame = ServerFrame::collect_processes_once(
+            4,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Details),
+                limit: Some(5),
+            },
+        );
+
+        let json = encode_server_frame(&frame).unwrap();
+        let decoded = decode_server_frame(&json).unwrap();
+
+        assert_eq!(decoded.sequence, 4);
+        match decoded.payload {
+            ServerPayload::CollectProcessesOnce { request } => {
+                assert_eq!(request.level, Some(MetricLevel::Details));
+                assert_eq!(request.limit, Some(5));
+            }
+            _ => panic!("expected collect processes once payload"),
+        }
+    }
+
+    /// 验证一次性 Socket 采集 frame 可以往返 JSON。
+    #[test]
+    fn server_collect_sockets_once_roundtrips_json() {
+        let frame = ServerFrame::collect_sockets_once(
+            5,
+            100,
+            MetricCollectionRequest {
+                level: Some(MetricLevel::Light),
+                limit: Some(7),
+            },
+        );
+
+        let json = encode_server_frame(&frame).unwrap();
+        let decoded = decode_server_frame(&json).unwrap();
+
+        assert_eq!(decoded.sequence, 5);
+        match decoded.payload {
+            ServerPayload::CollectSocketsOnce { request } => {
+                assert_eq!(request.level, Some(MetricLevel::Light));
+                assert_eq!(request.limit, Some(7));
+            }
+            _ => panic!("expected collect sockets once payload"),
+        }
+    }
+
+    /// 验证远程非交互任务 frame 可以往返 JSON。
+    #[test]
+    fn server_remote_task_run_roundtrips_json() {
+        let frame = ServerFrame::remote_task_run(
+            6,
+            100,
+            RemoteTaskRequest {
+                task_id: "task-1".to_string(),
+                program: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                timeout: Some(Duration::from_secs(3)),
+            },
+        );
+
+        let json = encode_server_frame(&frame).unwrap();
+        let decoded = decode_server_frame(&json).unwrap();
+
+        assert_eq!(decoded.sequence, 6);
+        match decoded.payload {
+            ServerPayload::RemoteTaskRun { request } => {
+                assert_eq!(request.task_id, "task-1");
+                assert_eq!(request.program, "echo");
+                assert_eq!(request.args, vec!["ok"]);
+                assert_eq!(request.timeout, Some(Duration::from_secs(3)));
+            }
+            _ => panic!("expected remote task run payload"),
+        }
+    }
+
+    /// 验证 server remote shell open frame 可以往返 JSON。
+    #[test]
+    fn server_remote_shell_open_roundtrips_json() {
+        let frame = ServerFrame::remote_shell_open(
+            3,
+            100,
+            RemoteShellOpenRequest {
+                session_id: "shell-1".to_string(),
+                stream_url: "wss://example.com/shell/shell-1".to_string(),
+                cols: None,
+                rows: None,
+            },
+        );
+
+        let json = encode_server_frame(&frame).unwrap();
+        let decoded = decode_server_frame(&json).unwrap();
+
+        assert_eq!(decoded.sequence, 3);
+        match decoded.payload {
+            ServerPayload::RemoteShellOpen { request } => {
+                assert_eq!(request.session_id, "shell-1");
+                assert_eq!(request.stream_url, "wss://example.com/shell/shell-1");
+            }
+            _ => panic!("expected remote shell open payload"),
+        }
+    }
+
+    /// 验证 shell stream command 可以通过 protocol codec 解码。
+    #[test]
+    fn remote_shell_stream_command_decodes_json() {
+        let decoded = decode_remote_shell_stream_command(
+            r#"{ "type": "input", "data": "echo ok\n", "encoding": "utf8" }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded,
+            RemoteShellStreamCommand::Input {
+                data: "echo ok\n".to_string(),
+                encoding: Some(RemoteShellDataEncoding::Utf8),
+            }
+        );
+    }
+
+    /// 验证 shell stream event 可以通过 protocol codec 编码。
+    #[test]
+    fn remote_shell_stream_event_encodes_json() {
+        let encoded = encode_remote_shell_stream_event(&RemoteShellStreamEvent::Exit {
+            session_id: "shell-1".to_string(),
+            code: None,
+        })
+        .unwrap();
+
+        assert!(encoded.contains(r#""type":"exit""#));
+        assert!(encoded.contains(r#""code":null"#));
     }
 
     /// 验证远程任务结果可以编码为 client frame。

@@ -4,7 +4,7 @@ use super::super::outbound::{
     BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
     RemoteTaskResultEnvelope, ReportEnvelope,
 };
-use super::delivery::{RuntimeDelivery, send_ready_deliveries};
+use super::delivery::{DeliveryState, send_ready_deliveries};
 use crate::export::{
     ExportDeliveryFailurePolicy, ExportDeliveryId, ExportRouter, TransportEvent, TransportHub,
 };
@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 /// 处理 transport worker 回传的真实发送结果。
 pub(super) fn handle_transport_event(
     event: TransportEvent,
-    deliveries: &mut [RuntimeDelivery],
+    deliveries: &mut [DeliveryState],
     pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
     pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
     pending_control_acks: &mut BTreeMap<u64, ControlAckEnvelope>,
@@ -141,7 +141,7 @@ pub(super) struct PendingResumeEvents<'a> {
 pub(super) async fn send_resume_events(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    deliveries: &mut [RuntimeDelivery],
+    deliveries: &mut [DeliveryState],
     latest_report: Option<&ReportEnvelope>,
     pending: PendingResumeEvents<'_>,
 ) -> anyhow::Result<()> {

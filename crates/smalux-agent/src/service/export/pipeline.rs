@@ -2,7 +2,7 @@
 
 use super::super::control::ServiceControlListener;
 use super::super::inbound::InboundCommandSender;
-use super::delivery::{RuntimeDelivery, runtime_deliveries_from_plan};
+use super::delivery::{DeliveryState, delivery_states_from_plan};
 use crate::config::ConfigManager;
 use crate::config::model::{ExportConfig, ExportFormat, OutboundConfig};
 use crate::export::{
@@ -13,17 +13,23 @@ use tokio::time::sleep;
 
 /// 已连接导出 pipeline 的运行时状态。
 ///
-/// 这个 tuple 只在 export supervisor 内部流转，代表“当前 adapter + transport hub +
+/// 这个结构只在 export supervisor 内部流转，代表“当前 adapter + transport hub +
 /// delivery 调度状态”的一整套连接。export 配置变更时整体重建，单纯 outbound 变更时
-/// 只重建 `RuntimeDelivery`，避免不必要断开 WebSocket。
-pub(super) type ConnectedExportPipeline = (
-    TransportHub,
-    TransportEventReceiver,
-    ExportRouter,
-    ExportConfig,
-    OutboundConfig,
-    Vec<RuntimeDelivery>,
-);
+/// 只重建 `DeliveryState`，避免不必要断开 WebSocket。
+pub(super) struct ConnectedExportPipeline {
+    /// 当前 transport 连接集合。
+    pub(super) transport_hub: TransportHub,
+    /// transport worker 回传的发送结果事件。
+    pub(super) transport_events: TransportEventReceiver,
+    /// 当前导出 adapter router。
+    pub(super) router: ExportRouter,
+    /// 当前生效的 export 配置。
+    pub(super) export_config: ExportConfig,
+    /// 当前生效的 outbound 配置。
+    pub(super) outbound_config: OutboundConfig,
+    /// 当前 delivery 调度状态。
+    pub(super) deliveries: Vec<DeliveryState>,
+}
 
 /// 使用当前配置创建 adapter、transport plan，并连接导出 transport。
 pub(super) async fn connect_export_pipeline(
@@ -39,7 +45,7 @@ pub(super) async fn connect_export_pipeline(
         let mut router = ExportRouter::new(build_export_adapter(export_config.format));
         let mut transport_plan = router.transport_plan(&export_config)?;
         transport_plan.apply_outbound_config(&outbound_config);
-        let deliveries = runtime_deliveries_from_plan(&transport_plan);
+        let deliveries = delivery_states_from_plan(&transport_plan);
         let (transport_event_tx, transport_events) = transport_event_channel();
         let mut transport_hub = TransportHub::from_plan(transport_plan, transport_event_tx)?;
         let transport_summary = transport_hub.summary();
@@ -56,14 +62,14 @@ pub(super) async fn connect_export_pipeline(
 
         match transport_hub.connect_all().await {
             Ok(()) => {
-                return Ok((
+                return Ok(ConnectedExportPipeline {
                     transport_hub,
                     transport_events,
                     router,
                     export_config,
                     outbound_config,
                     deliveries,
-                ));
+                });
             }
             Err(err) => {
                 tracing::warn!(
@@ -85,10 +91,10 @@ pub(super) fn rebuild_runtime_deliveries(
     router: &mut ExportRouter,
     export_config: &ExportConfig,
     outbound_config: &OutboundConfig,
-) -> anyhow::Result<Vec<RuntimeDelivery>> {
+) -> anyhow::Result<Vec<DeliveryState>> {
     let mut transport_plan = router.transport_plan(export_config)?;
     transport_plan.apply_outbound_config(outbound_config);
-    Ok(runtime_deliveries_from_plan(&transport_plan))
+    Ok(delivery_states_from_plan(&transport_plan))
 }
 
 /// 根据导出格式创建服务端消息监听器。
@@ -98,7 +104,10 @@ fn build_export_message_listener(
     inbound_commands: InboundCommandSender,
 ) -> Box<dyn ExportMessageListener> {
     match format {
-        ExportFormat::SmaluxJson => Box::new(ServiceControlListener::new(inbound_commands)),
+        ExportFormat::SmaluxJson => Box::new(ServiceControlListener::new(
+            config_manager,
+            inbound_commands,
+        )),
         ExportFormat::Komari => build_komari_message_listener(config_manager, inbound_commands),
     }
 }
