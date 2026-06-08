@@ -2,147 +2,220 @@
 
 ## 恢复目标
 
-这个文件用于在其他电脑或新会话中快速恢复当前开发上下文。项目路径为 `F:/code/rust/smalux`，当前仓库是 Rust 2024 workspace，主开发分支是 `dev`。
+用于在新电脑或新会话中快速恢复当前开发上下文。项目路径：`F:/code/rust/smalux`。当前分支：`dev`。
 
-## 快速恢复
+## 当前提交
 
-- 功能基线提交：`35106f5 refactor: regroup agent service modules`，已推送到远端 `dev`。
-- 最近提交以后续恢复时 `git log --oneline -1` 为准；当前文档对应 agent 导出、service/export 和 CLI 模块拆分后的状态。
-- 恢复后先执行：
+最新已提交并推送：
+
+```text
+a51229d refactor agent protocol and server structure
+```
+
+恢复时先执行：
 
 ```powershell
 git pull
 git status --short
-cargo check --workspace --all-targets
+cargo fmt --all --check
+cargo check -p smalux-agent
+cargo check -p smalux-server
 ```
 
 预期 `git status --short` 为空。若不为空，先确认是否是其他机器或用户的新改动，不要直接回滚。
 
-忽略文件可能包含本地验证重新生成的 `target/` 或运行日志；恢复时以 `git status --short` 判断源码是否干净。
+## 当前项目状态
 
-## 项目概况
+- `smalux-agent`：监控 agent，已有采集、动态配置、导出、Komari 兼容、remote task/probe/shell。
+- `smalux-core`：共享模型、日志、脱敏工具和公共工具。
+- `smalux-protocol`：共享 `ClientFrame`、`ServerFrame`、wire、secure_psk、remote payload。
+- `smalux-server`：当前还是骨架，但目录、依赖、README 和详细实现计划已经建立。
 
-- `crates/smalux-agent`：监控 agent，负责系统采集、动态配置、导出、Komari 兼容和远程能力。
-- `crates/smalux-core`：共享模型、单位转换、日志初始化和通用校验。
-- `crates/smalux-protocol`：agent/server 共享 frame、payload 和 JSON codec。
-- `crates/smalux-server`：server crate 仍是骨架，README 已写好 WebSocket/wire/ingest/存储建议。
-- 根目录 `src/main.rs` 是历史占位入口，不属于 workspace package，已在 `59caa61` 删除。
+## 关键决策
 
-## Agent 当前状态
+### 1. server 删除 query 模块
 
-- 采集：identity、system、CPU、单核 CPU、内存、swap、load average、磁盘、网络、公网 IP、进程、TCP/UDP socket。
-- 采样控制：core、disk、network、processes、sockets、public_ip、report、outbound delivery 都有独立频率。
-- 进程和 socket：支持 `count`、`light`、`details` 三层；总数字段在任一级别都会上报，除非对应采样组关闭。
-- 公网 IP：默认可选，启动会尝试获取，失败会上报状态而不是阻塞第一包；成功后低频刷新，默认 `24h`。
-- 上报：支持完整 `snapshot`、可选 `delta`、可选业务 `heartbeat`、server `snapshot_request` 强制完整快照。
-- 动态配置：启动配置来自默认值和 CLI；连接 server 后可接收 `config_patch`，缺省字段保持当前值，相同 patch 会被忽略。
-- 日志：读取 `RUST_LOG`；测试默认 `debug` 控制台输出，正式运行输出到控制台和滚动文件。日志字段只支持启动时设置，不接受 server patch。
-- 远程能力：remote shell、remote task 默认关闭且只能 CLI 开启；remote probe 默认关闭但可由 server patch 动态开启。
+`crates/smalux-server/src/query.rs` 和 `query/` 已删除。
 
-## 关键目录
+前端读模型不再单独放 `query/`：
+
+- agent 列表、latest、在线状态：`service/agent.rs`
+- dashboard 聚合：`service/dashboard.rs`
+- REST handler：`http/rest.rs`
+- 数据库存取：`storage/repository.rs`
+
+### 2. server HTTP 入口重新设计
+
+server 当前预留结构：
 
 ```text
-crates/smalux-agent/src/
-  main.rs          # CLI、日志、ConfigManager、service 启动入口
-  config.rs        # 配置入口
-  config/          # defaults、model、cli、manager
-    cli.rs         # CLI 模块入口和测试
-    cli/           # args / startup / value：参数定义、启动转换和 CLI enum
-  collect.rs       # 本机采集入口，持有 sysinfo 长生命周期对象
-  collect/         # CPU / memory / disk / network / process / socket
-  telemetry.rs     # latest state、ReportEvent、TelemetryAggregator
-  telemetry/       # state / aggregator
-  export.rs        # ExportAdapter、TransportHub、wire 抽象入口
-  export/          # WebSocket、HTTP、Komari、rustls、worker、security
-  service.rs       # agent 运行编排入口
-  service/
-    message.rs     # message 子模块入口
-    message/       # listener / inbound / outbound
-    remote.rs      # remote 子模块入口
-    remote/        # shell / task / probe
+crates/smalux-server/src/
+  main.rs
+  cli.rs
+  cli/args.rs
+  config.rs
+  config/model.rs
+  auth.rs
+  auth/agent.rs
+  auth/session.rs
+  http.rs
+  http/router.rs
+  http/rest.rs
+  http/agent.rs
+  http/realtime.rs
+  http/frontend.rs
+  http/middleware.rs
+  ingest.rs
+  ingest/frame.rs
+  ingest/report.rs
+  service.rs
+  service/agent.rs
+  service/dashboard.rs
+  service/command.rs
+  storage.rs
+  storage/entity.rs
+  storage/migration.rs
+  storage/repository.rs
 ```
 
-`service.rs` 仍保留旧模块别名导出，现有 `crate::service::outbound`、`crate::service::probe` 这类调用不需要一次性大改。
+路径规划：
 
-## 导出与协议
+```text
+/agent/v1/connect    # Smalux agent 主 WebSocket
+/api/v1/*            # 前端和管理端 REST API
+/live/v1/dashboard   # 前端实时通道，后续可用 WebSocket 或 SSE
+/                     # React/Vite 静态前端 fallback
+```
 
-- 默认导出格式是 `smalux_json`，默认 transport 是 WebSocket。
-- `export.format` 当前支持 `smalux_json` 和 `komari`。
-- `smalux_json` 使用 `smalux-protocol::ClientFrame`，可编码 `snapshot`、`delta`、业务 `heartbeat`、`ack/error`、`remote_task_result`、`remote_probe_result`。
-- `export.wire_mode=binary_plain` 时，WebSocket binary 承载 `WirePacket(kind=PlainData)`。
-- `export.wire_mode=secure_psk` 时，使用 `smx1.<key_id>.<secret_base64url>` token 派生 PSK，Noise 模式为 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`；secret 不通过 URL/header 明文发送。
-- `secure_psk` 的 HKDF 参数已写入 README：SHA-256，salt 为 `smalux secure psk v1 salt`，info 为 `smalux secure psk v1 ` + UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`；README 还包含 `agent-key` / 32 字节 `0x07` secret 的测试向量，派生 PSK hex 为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`；wire payload 上限 `1 MiB`，同一连接的 `session_id` 必须一致。
-- `secure_psk` 模式要求 `export.auth_mode=none`，并拒绝 WebSocket text 控制消息。
-- `export.secure_required=true` 是单向安全闸：要求 `smalux_json + secure_psk`，当前配置一旦为 `true`，server patch 不能关闭它或降级到明文/Komari。
-- `ack/error` 只表示带 `sequence` 的 `ServerFrame` 已被调度或拒绝，不表示 remote task/probe 已完成。
-- `ServerFrame` 当前支持 `snapshot_request`、`remote_probe_run`、`remote_shell_open`，带 `sequence` 时会回控制层 `ack/error`。
-- raw control JSON 当前只支持 `config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`，没有自动 ack；自有协议的 `remote_shell_open` 和 `remote_probe_run` 必须走 `ServerFrame`。
-- remote shell stream 已改为 codec adapter 模式：核心 `RemoteShellManager` 只处理统一 shell 语义，`SmaluxShellCodec` 负责自有 binary wire payload，`KomariTerminalCodec` 负责第三方 terminal raw binary 兼容。
-- basic info 事件是否生成由 export adapter capability 决定，reporter 不再直接判断 `ExportFormat::Komari`；新增第三方兼容格式时，应在对应 adapter 声明是否需要独立 basic info 事件。
+### 3. agent 已同步 server 主连接路径
 
-## Komari 兼容
+自有协议 `smalux_json` 的 agent 主连接路径已经从旧的 `/api/agents/connect` 改为：
 
-- Komari 兼容代码保留在 `crates/smalux-agent/src/export/komari/`，方便后续整体删除或替换。
-- Komari report 走 WebSocket `/api/clients/report?token=...`。
-- Komari basic info 走 HTTP `POST /api/clients/uploadBasicInfo?token=...`，默认 `outbound.basic_info.refresh_interval=5m`。
-- Komari task result 走 HTTP `POST /api/clients/task/result?token=...`。
-- Komari terminal 走 WebSocket `/api/clients/terminal?id=REQUEST_ID&token=...`；兼容代码在 `src/export/komari/terminal.rs`，启用 raw binary frame，PTY 输出直接发 binary，入站 binary 直接写入 PTY，入站 text 只作为兼容输入解析。
-- Komari `terminal` 复用 remote shell，`exec` 复用 remote task，`ping` 复用 remote probe；Komari adapter 只做协议转换，不直接执行远程能力。
-- Komari 只消费 snapshot；开启 delta 或业务 heartbeat 会被配置校验拒绝。
-- Komari 不使用 Smalux binary wire 和 secure_psk，保持第三方 text/query token 行为；terminal stream 依赖 `wss://` TLS 保护传输。
+```text
+/agent/v1/connect
+```
 
-## 远程能力边界
+关键文件：
 
-- CLI-only，只能启动时开启：
-  - `remote_shell.enabled`
-  - `remote_task.enabled`
-  - `diagnostics.allow_process_details`
-  - `diagnostics.allow_socket_details`
-- 动态配置，可由 CLI 给初始值，也可由 server patch 修改：
-  - `remote_shell.max_sessions`、`idle_timeout`、`session_timeout`、`program`
-  - `remote_task.max_concurrent`、`timeout`、`max_stdout_bytes`、`max_stderr_bytes`
-  - `remote_probe.enabled`、`timeout`、`global_min_interval`、`target_min_interval`
-- remote shell 使用 `portable-pty`；每个会话打开独立临时 WebSocket stream。核心层把 PTY 输出表示为 base64 `output` 事件，Smalux stream 通过 binary wire 发送该事件，Komari terminal adapter 会解回 raw binary 后发送。
-- remote task 是非交互命令，结果通过主出站队列回传。
-- remote probe 支持 TCP / HTTP；ICMP 当前返回 `value=-1`。核心 probe 模块只处理协议无关的探测、频率保护和结果投递，第三方字段映射放在各自 export adapter 中。
+- `crates/smalux-agent/src/export/adapter.rs`
+- `crates/smalux-agent/src/export.rs`
+- `crates/smalux-agent/README.md`
+- `crates/smalux-server/README.md`
+- `crates/smalux-server/plan.md`
 
-## 验证结果
+已确认：
 
-最近完整验证通过：
+```text
+rg -F '/api/agents/connect' crates/smalux-agent crates/smalux-server
+```
+
+无结果。
+
+Komari 路径保持不变：
+
+```text
+/api/clients/report
+/api/clients/uploadBasicInfo
+/api/clients/task/result
+/api/clients/terminal
+```
+
+### 4. React 前端托管规则
+
+最终决策：
+
+```text
+如果编译了 frontend-embed：
+  frontend enabled 时直接使用内置前端。
+
+如果没有编译 frontend-embed：
+  frontend enabled 时使用 frontend-dir 目录。
+
+如果 frontend disabled：
+  server 不托管前端，适合前端单独部署。
+```
+
+不再建议 `--frontend-mode disabled|dir|embedded`。
+
+建议 CLI：
+
+```text
+--frontend-enabled
+--frontend-dir
+--frontend-spa-fallback
+```
+
+配置模型建议：
+
+```rust
+pub struct FrontendConfig {
+    pub enabled: bool,
+    pub dir: PathBuf,
+    pub spa_fallback: bool,
+}
+```
+
+需要后续同步 `crates/smalux-server/README.md` 和 `crates/smalux-server/plan.md`，把旧的 `FrontendMode::Disabled | Dir | Embedded` 改成这套规则。
+
+## server 计划文档
+
+详细 server 实现计划已经写入：
+
+```text
+crates/smalux-server/plan.md
+```
+
+里面覆盖：
+
+- CLI/config
+- 日志和 bootstrap
+- MemoryRepository
+- SQLite/SeaORM
+- agent 认证
+- `/agent/v1/connect`
+- ingest snapshot/delta/heartbeat
+- command 下发和 ack/result/error
+- REST API
+- frontend realtime
+- React/Vite 托管
+- session
+- Komari 兼容
+- 安全、性能、测试和多轮检查流程
+
+## 当前验证结果
+
+最近验证通过：
 
 ```powershell
 cargo fmt --all --check
-cargo check --workspace --all-targets
-cargo test --workspace
-cargo rustdoc -p smalux-agent --bin smalux-agent -- -D missing_docs
-cargo rustdoc -p smalux-protocol --lib -- -D missing_docs
-```
-
-本轮 remote shell 共享协议提升、stream codec adapter 重构、Komari terminal raw binary 端到端测试、remote probe 协议中性清理和 basic info adapter capability 下沉后验证通过：
-
-```powershell
-cargo fmt --all --check
-cargo check --workspace --all-targets
-cargo test --workspace
+cargo check -p smalux-agent
+cargo check -p smalux-server
 cargo test -p smalux-agent
-cargo test -p smalux-protocol
-cargo clippy --workspace --all-targets -- -D warnings
-git diff --check
 ```
 
-测试结果：agent `272 passed / 4 ignored`，protocol `18 passed`，workspace 测试全部通过；`cargo check --workspace --all-targets` 无 warning，严格 clippy 无 warning。提交前还执行了 raw shell/probe 残留、旧 stream encoding、Komari 核心泄漏、占位输出、reporter 对 Komari 的生产代码依赖和 `git diff --check` 检查，`git diff --check` 仅有 Windows LF/CRLF 提示。
+`cargo test -p smalux-agent` 结果：
+
+```text
+278 passed, 4 ignored
+```
 
 ## 下一步建议
 
-1. 优先接 `smalux-server` WebSocket ingest：完成 upgrade、wire 解包、`ClientFrame` 解析和 latest state 更新。
-2. 先用内存 latest state 跑通 agent 到 server 闭环，再决定 SQLite 表结构和历史指标保留策略。
-3. 接 server 下发 `ServerFrame::snapshot_request` 和后续 desired config；下发前按 README 的控制消息边界实现幂等和限频。
-4. agent 后续采集项可继续补温度、GPU、电池；新功能先放现有 crate 的独立 module，只有依赖边界或复用边界明显时再拆新 crate。
+优先做 server：
+
+1. 更新 `crates/smalux-server/README.md` 和 `plan.md` 的前端托管规则，去掉运行时 `frontend-mode` 枚举。
+2. 实现 `cli/args.rs` 和 `config/model.rs`。
+3. `main.rs` 改成 async bootstrap。
+4. 实现最小 `GET /api/v1/health`。
+5. 实现 `/agent/v1/connect` 的最小 WebSocket upgrade。
+6. 先用 `MemoryRepository` 跑通 agent snapshot/heartbeat 到 latest state。
+7. 再接 REST `GET /api/v1/agents` 和 `GET /api/v1/agents/{agent_id}/latest`。
 
 ## 协作注意
 
-- 始终用简体中文沟通；代码标识符、命令、日志和报错保持原文。
+- 始终使用简体中文沟通；代码标识符、命令、日志、报错保持原文。
 - 代码注释用中文，日志内容用英文。
-- 读写含中文文件前检查 BOM；当前 `session.md` 是 UTF-8 无 BOM。
-- 修改现有文件优先用局部 patch，不要回滚用户未明确要求回滚的改动。
-- 新增复杂功能时同步更新 README、测试和本文件的恢复摘要。
+- 修改含中文文件前检查 BOM；当前 `session.md` 是 UTF-8 无 BOM。
+- 修改现有文件优先用 `apply_patch`。
+- 不要回滚用户未明确要求回滚的改动。
+- 新功能同步更新 README、测试和本文件。
