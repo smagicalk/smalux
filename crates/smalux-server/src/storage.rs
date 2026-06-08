@@ -1,3 +1,5 @@
-//! 存储模块。
-//!
-//! 后续持久化接口、数据库适配器、仓储实现等都放在这里。
+//! 存储模块入口，负责组织数据库实体、迁移和仓储访问层。
+
+pub mod entity;
+pub mod migration;
+pub mod repository;

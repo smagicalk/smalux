@@ -1,10 +1,89 @@
 //! 公网 IP 外部服务探测。
 
+use crate::collect::unix_timestamp_secs;
+use crate::config::PublicIpConfig;
 use futures_util::FutureExt;
 use futures_util::stream::StreamExt;
 use serde_json_path::JsonPath;
+use smalux_core::model::info::{NetworkInfo, PublicIpInfo, PublicIpSource};
 use std::net::IpAddr;
 use std::str::FromStr;
+
+/// 获取公网 IP，优先使用网卡公网候选地址。
+pub(crate) async fn resolve_public_ip(
+    network_info: &NetworkInfo,
+    config: &PublicIpConfig,
+) -> PublicIpInfo {
+    if !config.enabled {
+        return PublicIpInfo::disabled();
+    }
+
+    let attempted_at = unix_timestamp_secs();
+
+    if config.prefer_interface_candidate
+        && let Some(ip) = super::interface_public_ip_candidate(network_info)
+    {
+        tracing::info!(ip = %ip, "Public IP resolved from interface candidate");
+        let sampled_at = unix_timestamp_secs();
+        let mut public_ip =
+            PublicIpInfo::ready(ip, PublicIpSource::InterfaceCandidate, sampled_at, None);
+
+        if config.verify_interface_candidate
+            && let Ok(verified_ip) = lookup_external_public_ip(config).await
+        {
+            if Some(verified_ip) != public_ip.ip {
+                tracing::info!(
+                    interface_ip = %ip,
+                    verified_ip = %verified_ip,
+                    "Interface public IP candidate replaced by external verification"
+                );
+                public_ip = PublicIpInfo::ready(
+                    verified_ip,
+                    PublicIpSource::ExternalHttp,
+                    sampled_at,
+                    Some(unix_timestamp_secs()),
+                );
+            } else {
+                public_ip.verified_at = Some(unix_timestamp_secs());
+            }
+        }
+
+        return public_ip;
+    }
+
+    match lookup_external_public_ip(config).await {
+        Ok(ip) => {
+            let sampled_at = unix_timestamp_secs();
+            tracing::info!(ip = %ip, "Public IP resolved from external service");
+            PublicIpInfo::ready(
+                ip,
+                PublicIpSource::ExternalHttp,
+                sampled_at,
+                Some(sampled_at),
+            )
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, "Public IP lookup failed");
+            PublicIpInfo::failed(err.to_string(), attempted_at)
+        }
+    }
+}
+
+/// 通过外部服务获取公网 IP。
+async fn lookup_external_public_ip(config: &PublicIpConfig) -> anyhow::Result<IpAddr> {
+    let (v4, v6) = tokio::time::timeout(config.lookup_timeout, async {
+        futures_util::future::join(
+            get_public_network_v4_with_concurrency(config.max_concurrency),
+            get_public_network_v6_with_concurrency(config.max_concurrency),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Public IP lookup timed out"))?;
+
+    v4.or(v6)
+        .map_err(|err| anyhow::anyhow!("Public IP lookup failed: {err}"))
+}
 
 /// 并发获取公网 IPv4 和 IPv6，成功的地址会被加入结果。
 #[cfg(test)]

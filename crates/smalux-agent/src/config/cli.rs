@@ -27,6 +27,8 @@ mod tests {
             log_file: Some("logs/test-agent.log".to_string()),
             log_retention_files: Some(9),
             log_max_size_mb: Some(32),
+            log_payload: Some(true),
+            log_payload_max_bytes: Some(2048),
             base_url: Some("http://127.0.0.1:9000".to_string()),
             format: Some(CliExportFormat::SmaluxJson),
             core_interval: Some(Duration::from_secs(2)),
@@ -61,6 +63,8 @@ mod tests {
         assert_eq!(config.log_file, "logs/test-agent.log");
         assert_eq!(config.log_retention_files, 9);
         assert_eq!(config.log_max_size_mb, 32);
+        assert!(config.log_payload);
+        assert_eq!(config.log_payload_max_bytes, 2048);
         assert_eq!(config.export.base_url, "http://127.0.0.1:9000");
         assert_eq!(config.export.format, ExportFormat::SmaluxJson);
         assert_eq!(config.core.interval, Duration::from_secs(2));
@@ -107,6 +111,10 @@ mod tests {
             "5",
             "--log-max-size-mb",
             "16",
+            "--log-payload",
+            "true",
+            "--log-payload-max-bytes",
+            "1024",
             "-s",
             "http://127.0.0.1:9001",
             "-f",
@@ -176,6 +184,8 @@ mod tests {
         assert_eq!(config.log_file, "logs/short.log");
         assert_eq!(config.log_retention_files, 5);
         assert_eq!(config.log_max_size_mb, 16);
+        assert!(config.log_payload);
+        assert_eq!(config.log_payload_max_bytes, 1024);
         assert_eq!(config.export.base_url, "http://127.0.0.1:9001");
         assert_eq!(config.export.format, ExportFormat::SmaluxJson);
         assert_eq!(config.export.auth_mode, ExportAuthMode::Bearer);
@@ -267,6 +277,8 @@ mod tests {
             log_file: Some("logs/startup-only.log".to_string()),
             log_retention_files: Some(7),
             log_max_size_mb: Some(48),
+            log_payload: Some(true),
+            log_payload_max_bytes: Some(512),
             ..CliArgs::default()
         };
 
@@ -276,6 +288,8 @@ mod tests {
         assert_eq!(config.log_file, "logs/startup-only.log");
         assert_eq!(config.log_retention_files, 7);
         assert_eq!(config.log_max_size_mb, 48);
+        assert!(config.log_payload);
+        assert_eq!(config.log_payload_max_bytes, 512);
         assert_eq!(patch, AgentConfigPatch::default());
     }
 

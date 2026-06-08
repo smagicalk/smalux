@@ -38,6 +38,10 @@ pub(crate) async fn export_supervisor(
     let mut pending_events = PendingExportEvents::new();
     // pending 只保存“已经编码并投递给 transport，但还没有收到 Sent 事件”的即时消息。
     // 周期 report 不做 pending，因为 latest_report 会一直保留最新值，重连后按 delivery 再发即可。
+    // 这三类事件语义不同，不能合并成一个队列策略：
+    // - report 是 latest-only，慢连接时丢旧保新；
+    // - basic info 是低频辅助事件，失败后等下一轮自然重试；
+    // - ack/error/task/probe result 是 server 可能正在等待的一次性结果，Sent 前必须保留。
     let mut delivery_tick = interval(EXPORT_DELIVERY_SCHEDULER_TICK);
     delivery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Err(err) = send_ready_deliveries(
@@ -70,6 +74,11 @@ pub(crate) async fn export_supervisor(
                         // report 是 latest-state 语义：如果 export 端落后，只保留最新 report，
                         // 避免慢连接导致大量旧 snapshot/delta 堆积。
                         latest_report = Some(report);
+                        tracing::debug!(
+                            sequence = latest_report.as_ref().map(|report| report.sequence),
+                            pending_total = pending_events.total_len(),
+                            "latest report cached for export"
+                        );
                         if let Err(err) = send_ready_deliveries(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -97,6 +106,11 @@ pub(crate) async fn export_supervisor(
                     OutboundEvent::BasicInfo(info) => {
                         // basic info 是低频兼容事件，下一轮 interval 会自然重试。
                         // 这里不做 pending，也不因为 HTTP 辅助请求失败重建主连接。
+                        tracing::debug!(
+                            sequence = info.sequence,
+                            created_at = info.created_at,
+                            "basic info export requested"
+                        );
                         if let Err(err) = queue_basic_info(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -108,6 +122,11 @@ pub(crate) async fn export_supervisor(
                     OutboundEvent::ControlAck(ack) => {
                         // ack/error/task/probe 是一次性结果语义，必须在 Sent 前保留 pending，
                         // 否则重连窗口里会丢失 server 正在等待的命令响应。
+                        tracing::debug!(
+                            sequence = ack.sequence,
+                            ack_sequence = ack.ack.sequence,
+                            "control ack export requested"
+                        );
                         if let Err(err) = queue_control_ack(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -140,6 +159,12 @@ pub(crate) async fn export_supervisor(
                         }
                     }
                     OutboundEvent::ControlError(error) => {
+                        tracing::debug!(
+                            sequence = error.sequence,
+                            error_code = %error.error.code,
+                            error_sequence = error.error.sequence,
+                            "control error export requested"
+                        );
                         if let Err(err) = queue_control_error(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -172,6 +197,12 @@ pub(crate) async fn export_supervisor(
                         }
                     }
                     OutboundEvent::RemoteTaskResult(result) => {
+                        tracing::debug!(
+                            sequence = result.sequence,
+                            task_id = %result.result.task_id,
+                            status = ?result.result.status,
+                            "remote task result export requested"
+                        );
                         if let Err(err) = queue_remote_task_result(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -204,6 +235,13 @@ pub(crate) async fn export_supervisor(
                         }
                     }
                     OutboundEvent::RemoteProbeResult(result) => {
+                        tracing::debug!(
+                            sequence = result.sequence,
+                            task_id = %result.result.task_id,
+                            probe_type = result.result.probe_type.as_str(),
+                            value = result.result.value,
+                            "remote probe result export requested"
+                        );
                         if let Err(err) = queue_remote_probe_result(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
@@ -253,6 +291,8 @@ pub(crate) async fn export_supervisor(
                     continue;
                 };
 
+                // transport worker 的 Sent/Failed 是“真实发送结果”，不是 enqueue 成功。
+                // pending 即时事件只有在 Sent 后才能移除；Failed 会触发重连并重投。
                 if let Err(err) = handle_transport_event(
                     event,
                     &mut pipeline.deliveries,
@@ -277,6 +317,14 @@ pub(crate) async fn export_supervisor(
                         "transport event",
                     ).await?;
                 }
+                tracing::debug!(
+                    pending_total = pending_events.total_len(),
+                    pending_remote_task_results = pending_events.remote_task_results.len(),
+                    pending_remote_probe_results = pending_events.remote_probe_results.len(),
+                    pending_control_acks = pending_events.control_acks.len(),
+                    pending_control_errors = pending_events.control_errors.len(),
+                    "export transport event handled"
+                );
             }
             _ = delivery_tick.tick(), if has_interval_deliveries(&pipeline.deliveries) => {
                 if let Err(err) = send_due_interval_deliveries(
@@ -310,10 +358,15 @@ pub(crate) async fn export_supervisor(
 
                 let next = config_rx.borrow_and_update().clone();
                 if next.export == pipeline.export_config && next.outbound == pipeline.outbound_config {
-                    tracing::debug!("service config changed without export delivery changes");
+                    tracing::debug!(
+                        format = next.export.format.as_str(),
+                        "service config changed without export delivery changes"
+                    );
                     continue;
                 }
                 if next.export == pipeline.export_config {
+                    // outbound 只影响 delivery 开关和 send_on_start 语义，不需要断开当前
+                    // WebSocket。这样 server 调整 basic_info 或 realtime_report 开关时不会制造重连抖动。
                     tracing::info!("export outbound config changed; updating export deliveries");
                     let export_config = pipeline.export_config.clone();
                     pipeline.deliveries =
@@ -348,6 +401,7 @@ pub(crate) async fn export_supervisor(
                 tracing::info!(
                     format = next.export.format.as_str(),
                     reconnect_interval_ms = reconnect_interval.as_millis(),
+                    pending_total = pending_events.total_len(),
                     "export config changed; reconnecting export transport"
                 );
                 reconnect_pipeline_and_resume(
@@ -395,6 +449,14 @@ impl PendingExportEvents {
             control_errors: &mut self.control_errors,
         }
     }
+
+    /// 返回所有 pending 即时事件数量。
+    fn total_len(&self) -> usize {
+        self.remote_task_results.len()
+            + self.remote_probe_results.len()
+            + self.control_acks.len()
+            + self.control_errors.len()
+    }
 }
 
 /// 关闭旧 transport，按指定间隔等待后重建整套导出 pipeline。
@@ -404,9 +466,16 @@ async fn reconnect_pipeline(
     inbound_commands: &InboundCommandSender,
     reconnect_interval: Duration,
 ) -> anyhow::Result<()> {
+    // 先主动关闭旧 hub，确保旧 WebSocket 读写任务退出，再按配置退避重连。
+    // 如果直接创建新 hub，旧 inbound handler 可能仍在短时间内投递 server 命令。
+    tracing::info!(
+        reconnect_interval_ms = reconnect_interval.as_millis(),
+        "export transport reconnect scheduled"
+    );
     close_transport_hub(&mut pipeline.transport_hub).await;
     sleep(reconnect_interval).await;
     *pipeline = connect_export_pipeline(config_manager.clone(), inbound_commands.clone()).await?;
+    tracing::info!("export transport reconnected");
     Ok(())
 }
 
@@ -420,6 +489,12 @@ async fn reconnect_pipeline_and_resume(
     pending_events: &mut PendingExportEvents,
     context: &'static str,
 ) -> anyhow::Result<()> {
+    tracing::debug!(
+        context,
+        latest_report_sequence = latest_report.map(|report| report.sequence),
+        pending_total = pending_events.total_len(),
+        "export reconnect with resume requested"
+    );
     reconnect_pipeline(
         pipeline,
         config_manager,
@@ -427,6 +502,8 @@ async fn reconnect_pipeline_and_resume(
         reconnect_interval,
     )
     .await?;
+    // 恢复顺序固定为 latest report -> pending 即时事件。
+    // server 先拿到最新监控状态，再收到 ack/error 或 remote result 时更容易关联上下文。
     if let Err(err) = send_resume_events(
         &mut pipeline.transport_hub,
         &mut pipeline.router,

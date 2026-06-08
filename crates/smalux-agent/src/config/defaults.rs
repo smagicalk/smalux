@@ -48,6 +48,10 @@ pub(crate) const DEFAULT_LOG_FILE: &str = "logs/smalux-agent.log";
 pub(crate) const DEFAULT_LOG_RETENTION_FILES: usize = 14;
 /// 默认单个日志文件最大大小，单位 MB。
 pub(crate) const DEFAULT_LOG_MAX_SIZE_MB: u64 = 64;
+/// 默认不打印实际请求 payload，避免日志泄露上报数据或远程命令输出。
+pub(crate) const DEFAULT_LOG_PAYLOAD: bool = false;
+/// 默认 payload 日志预览最大原始字节数。
+pub(crate) const DEFAULT_LOG_PAYLOAD_MAX_BYTES: usize = 4096;
 /// 默认最大远程 shell 会话数。
 pub(crate) const DEFAULT_REMOTE_SHELL_MAX_SESSIONS: usize = 1;
 /// 默认远程 shell 空闲超时。

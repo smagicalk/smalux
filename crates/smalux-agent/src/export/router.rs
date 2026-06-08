@@ -9,18 +9,51 @@ use crate::service::outbound::{
     BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
     RemoteTaskResultEnvelope,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::Value;
+use smalux_core::log::{
+    redact_sensitive_json, redact_sensitive_json_bytes, redact_sensitive_json_text,
+    redact_sensitive_text,
+};
 use smalux_protocol::OutboundReport;
+
+/// 导出日志选项。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ExportLogOptions {
+    /// 是否允许 trace 日志输出实际 payload 预览。
+    payload_enabled: bool,
+    /// payload 预览最大原始字节数。
+    payload_max_bytes: usize,
+}
+
+impl ExportLogOptions {
+    /// 根据启动期日志配置创建导出日志选项。
+    pub(crate) const fn new(payload_enabled: bool, payload_max_bytes: usize) -> Self {
+        Self {
+            payload_enabled,
+            payload_max_bytes,
+        }
+    }
+}
 
 /// 导出路由器。
 pub(crate) struct ExportRouter {
     /// 当前导出格式 adapter。
     adapter: Box<dyn ProtocolAdapter + Send + Sync>,
+    /// 当前导出链路日志选项。
+    log_options: ExportLogOptions,
 }
 
 impl ExportRouter {
     /// 创建导出路由器。
-    pub(crate) fn new(adapter: Box<dyn ProtocolAdapter + Send + Sync>) -> Self {
-        Self { adapter }
+    pub(crate) fn new(
+        adapter: Box<dyn ProtocolAdapter + Send + Sync>,
+        log_options: ExportLogOptions,
+    ) -> Self {
+        Self {
+            adapter,
+            log_options,
+        }
     }
 
     /// 根据当前 adapter 生成 transport plan。
@@ -49,10 +82,17 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.encode_report(delivery_id, outbound)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = delivery_id.as_str(),
+            sequence = outbound.sequence,
+            request_count,
+            "export router encoded report"
+        );
 
         // adapter 可以返回 0 条请求，表示当前格式不支持或明确跳过该事件。
         // router 只负责投递，不把“跳过”当错误。
         for request in requests {
+            trace_transport_request(delivery_id, outbound.sequence, &request, self.log_options);
             transport_hub.enqueue(delivery_id, outbound.sequence, request)?;
         }
 
@@ -67,8 +107,20 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.adapter.encode_basic_info(info)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = ExportDeliveryId::BasicInfo.as_str(),
+            sequence = info.sequence,
+            request_count,
+            "export router encoded basic info"
+        );
 
         for request in requests {
+            trace_transport_request(
+                ExportDeliveryId::BasicInfo,
+                info.sequence,
+                &request,
+                self.log_options,
+            );
             transport_hub.enqueue(ExportDeliveryId::BasicInfo, info.sequence, request)?;
         }
 
@@ -83,8 +135,20 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.adapter.encode_remote_task_result(result)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = ExportDeliveryId::RemoteTaskResult.as_str(),
+            sequence = result.sequence,
+            request_count,
+            "export router encoded remote task result"
+        );
 
         for request in requests {
+            trace_transport_request(
+                ExportDeliveryId::RemoteTaskResult,
+                result.sequence,
+                &request,
+                self.log_options,
+            );
             transport_hub.enqueue(ExportDeliveryId::RemoteTaskResult, result.sequence, request)?;
         }
 
@@ -99,8 +163,20 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.adapter.encode_remote_probe_result(result)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = ExportDeliveryId::RemoteProbeResult.as_str(),
+            sequence = result.sequence,
+            request_count,
+            "export router encoded remote probe result"
+        );
 
         for request in requests {
+            trace_transport_request(
+                ExportDeliveryId::RemoteProbeResult,
+                result.sequence,
+                &request,
+                self.log_options,
+            );
             transport_hub.enqueue(
                 ExportDeliveryId::RemoteProbeResult,
                 result.sequence,
@@ -119,8 +195,20 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.adapter.encode_control_ack(ack)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = ExportDeliveryId::ControlAck.as_str(),
+            sequence = ack.sequence,
+            request_count,
+            "export router encoded control ack"
+        );
 
         for request in requests {
+            trace_transport_request(
+                ExportDeliveryId::ControlAck,
+                ack.sequence,
+                &request,
+                self.log_options,
+            );
             transport_hub.enqueue(ExportDeliveryId::ControlAck, ack.sequence, request)?;
         }
 
@@ -135,13 +223,219 @@ impl ExportRouter {
     ) -> anyhow::Result<usize> {
         let requests = self.adapter.encode_control_error(error)?;
         let request_count = requests.len();
+        tracing::trace!(
+            delivery = ExportDeliveryId::ControlError.as_str(),
+            sequence = error.sequence,
+            request_count,
+            "export router encoded control error"
+        );
 
         for request in requests {
+            trace_transport_request(
+                ExportDeliveryId::ControlError,
+                error.sequence,
+                &request,
+                self.log_options,
+            );
             transport_hub.enqueue(ExportDeliveryId::ControlError, error.sequence, request)?;
         }
 
         Ok(request_count)
     }
+}
+
+/// 记录单条 transport 请求的形态，不输出请求体内容。
+fn trace_transport_request(
+    delivery_id: ExportDeliveryId,
+    sequence: u64,
+    request: &TransportRequest,
+    log_options: ExportLogOptions,
+) {
+    match request {
+        TransportRequest::WebSocketText { transport, body } => {
+            let preview = log_options
+                .payload_enabled
+                .then(|| payload_preview_text(body, log_options.payload_max_bytes));
+            tracing::trace!(
+                delivery = delivery_id.as_str(),
+                sequence,
+                transport = transport.as_str(),
+                request_kind = "websocket_text",
+                body_bytes = body.len(),
+                payload_enabled = log_options.payload_enabled,
+                payload_preview = preview.as_deref(),
+                "export router enqueueing transport request"
+            );
+        }
+        TransportRequest::WebSocketBinary {
+            transport,
+            sequence: request_sequence,
+            body,
+        } => {
+            let preview = log_options
+                .payload_enabled
+                .then(|| payload_preview_binary(body, log_options.payload_max_bytes));
+            tracing::trace!(
+                delivery = delivery_id.as_str(),
+                sequence,
+                request_sequence,
+                transport = transport.as_str(),
+                request_kind = "websocket_binary",
+                body_bytes = body.len(),
+                payload_enabled = log_options.payload_enabled,
+                payload_preview = preview.as_deref(),
+                "export router enqueueing transport request"
+            );
+        }
+        TransportRequest::HttpJson {
+            transport,
+            method,
+            body,
+            ..
+        } => {
+            let body_bytes = json_body_len(body);
+            let preview = log_options
+                .payload_enabled
+                .then(|| payload_preview_json(body, log_options.payload_max_bytes));
+            tracing::trace!(
+                delivery = delivery_id.as_str(),
+                sequence,
+                transport = transport.as_str(),
+                method = method.as_str(),
+                request_kind = "http_json",
+                body_bytes,
+                payload_enabled = log_options.payload_enabled,
+                payload_preview = preview.as_deref(),
+                "export router enqueueing transport request"
+            );
+        }
+    }
+}
+
+/// 计算 JSON 请求体序列化后的字节数。
+fn json_body_len(body: &Value) -> usize {
+    serde_json::to_vec(body)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| body.to_string().len())
+}
+
+/// 生成文本 payload 预览，按原始字节截断并用 UTF-8 lossy 展示。
+fn payload_preview_text(body: &str, max_bytes: usize) -> String {
+    if let Some(redacted) = redact_sensitive_json_text(body) {
+        return payload_preview_from_bytes(
+            "json",
+            body.len(),
+            redacted.value.as_bytes(),
+            max_bytes,
+            PreviewEncoding::Utf8Lossy,
+            redacted.redacted,
+        );
+    }
+
+    let redacted = redact_sensitive_text(body);
+    payload_preview_from_bytes(
+        "text",
+        body.len(),
+        redacted.value.as_bytes(),
+        max_bytes,
+        PreviewEncoding::Utf8Lossy,
+        redacted.redacted,
+    )
+}
+
+/// 生成 JSON payload 预览。
+fn payload_preview_json(body: &Value, max_bytes: usize) -> String {
+    payload_preview_json_with_original_len(body, json_body_len(body), max_bytes)
+}
+
+/// 生成 JSON payload 预览，并保留原始 body 字节数用于日志判断。
+fn payload_preview_json_with_original_len(
+    body: &Value,
+    original_len: usize,
+    max_bytes: usize,
+) -> String {
+    let redacted = redact_sensitive_json(body);
+    let bytes = serde_json::to_vec(&redacted.value)
+        .unwrap_or_else(|_| redacted.value.to_string().into_bytes());
+    payload_preview_from_bytes(
+        "json",
+        original_len,
+        &bytes,
+        max_bytes,
+        PreviewEncoding::Utf8Lossy,
+        redacted.redacted,
+    )
+}
+
+/// 生成二进制 payload 预览；使用 base64，避免不可见字节污染日志。
+fn payload_preview_binary(body: &[u8], max_bytes: usize) -> String {
+    if let Ok(text) = std::str::from_utf8(body) {
+        if let Some(redacted) = redact_sensitive_json_bytes(body) {
+            return payload_preview_from_bytes(
+                "json",
+                body.len(),
+                redacted.value.as_bytes(),
+                max_bytes,
+                PreviewEncoding::Utf8Lossy,
+                redacted.redacted,
+            );
+        }
+
+        let redacted = redact_sensitive_text(text);
+        return payload_preview_from_bytes(
+            "binary_text",
+            body.len(),
+            redacted.value.as_bytes(),
+            max_bytes,
+            PreviewEncoding::Utf8Lossy,
+            redacted.redacted,
+        );
+    }
+
+    payload_preview_from_bytes(
+        "binary",
+        body.len(),
+        body,
+        max_bytes,
+        PreviewEncoding::Base64,
+        false,
+    )
+}
+
+/// payload 预览编码方式。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PreviewEncoding {
+    /// 文本用 UTF-8 lossy 展示。
+    Utf8Lossy,
+    /// 二进制用 base64 展示。
+    Base64,
+}
+
+/// 构造统一 payload 预览字符串，明确类型、原始长度、截断状态和编码方式。
+fn payload_preview_from_bytes(
+    kind: &str,
+    original_len: usize,
+    display_bytes: &[u8],
+    max_bytes: usize,
+    encoding: PreviewEncoding,
+    redacted: bool,
+) -> String {
+    let take_len = display_bytes.len().min(max_bytes);
+    let truncated = display_bytes.len() > take_len;
+    let preview = match encoding {
+        PreviewEncoding::Utf8Lossy => {
+            String::from_utf8_lossy(&display_bytes[..take_len]).to_string()
+        }
+        PreviewEncoding::Base64 => STANDARD.encode(&display_bytes[..take_len]),
+    };
+    let encoding = match encoding {
+        PreviewEncoding::Utf8Lossy => "utf8_lossy",
+        PreviewEncoding::Base64 => "base64",
+    };
+
+    format!(
+        "kind={kind}; encoding={encoding}; bytes={original_len}; redacted={redacted}; truncated={truncated}; preview={preview}",
+    )
 }
 
 #[cfg(test)]
@@ -159,7 +453,10 @@ mod tests {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
         let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
-        let mut router = ExportRouter::new(build_protocol_adapter(ExportFormat::SmaluxJson));
+        let mut router = ExportRouter::new(
+            build_protocol_adapter(ExportFormat::SmaluxJson),
+            ExportLogOptions::new(false, 4096),
+        );
 
         let requests = router
             .encode_report(ExportDeliveryId::RealtimeReport, &outbound)
@@ -169,5 +466,95 @@ mod tests {
             requests.as_slice(),
             [TransportRequest::WebSocketBinary { sequence: 1, .. }]
         ));
+    }
+
+    /// 验证文本 payload 预览按字节截断并标出截断状态。
+    #[test]
+    fn payload_preview_text_truncates_by_bytes() {
+        let preview = payload_preview_text("abcdef", 3);
+
+        assert!(preview.contains("kind=text"));
+        assert!(preview.contains("bytes=6"));
+        assert!(preview.contains("truncated=true"));
+        assert!(preview.contains("preview=abc"));
+    }
+
+    /// 验证二进制 payload 预览使用 base64。
+    #[test]
+    fn payload_preview_binary_uses_base64() {
+        let preview = payload_preview_binary(&[0xff, 0x00, 0x01, 0x02], 2);
+
+        assert!(preview.contains("kind=binary"));
+        assert!(preview.contains("encoding=base64"));
+        assert!(preview.contains("bytes=4"));
+        assert!(preview.contains("redacted=false"));
+        assert!(preview.contains("truncated=true"));
+        assert!(preview.contains("preview=/wA="));
+    }
+
+    /// 验证 JSON payload 会递归脱敏敏感字段。
+    #[test]
+    fn payload_preview_json_redacts_sensitive_fields() {
+        let body = serde_json::json!({
+            "token": "secret-token",
+            "nested": {
+                "api_key": "secret-key",
+                "normal": "visible"
+            },
+            "stdout": "command output"
+        });
+
+        let preview = payload_preview_json(&body, 4096);
+
+        assert!(preview.contains("redacted=true"));
+        assert!(preview.contains(r#""token":"<redacted>""#));
+        assert!(preview.contains(r#""api_key":"<redacted>""#));
+        assert!(preview.contains(r#""stdout":"<redacted>""#));
+        assert!(preview.contains(r#""normal":"visible""#));
+        assert!(!preview.contains("secret-token"));
+        assert!(!preview.contains("secret-key"));
+        assert!(!preview.contains("command output"));
+    }
+
+    /// 验证 shell stream 的 data 字段会按上下文脱敏。
+    #[test]
+    fn payload_preview_json_redacts_shell_stream_data() {
+        let body = serde_json::json!({
+            "type": "output",
+            "session_id": "shell-1",
+            "data": "base64-output"
+        });
+
+        let preview = payload_preview_json(&body, 4096);
+
+        assert!(preview.contains("redacted=true"));
+        assert!(preview.contains(r#""data":"<redacted>""#));
+        assert!(!preview.contains("base64-output"));
+    }
+
+    /// 验证非 JSON 文本 payload 会按 key-value 关键词脱敏。
+    #[test]
+    fn payload_preview_text_redacts_sensitive_assignments() {
+        let preview = payload_preview_text("token=secret&name=node command: whoami", 4096);
+
+        assert!(preview.contains("redacted=true"));
+        assert!(preview.contains("token=<redacted>"));
+        assert!(preview.contains("name=node"));
+        assert!(preview.contains("command: <redacted>"));
+        assert!(!preview.contains("secret"));
+        assert!(!preview.contains("whoami"));
+    }
+
+    /// 验证二进制 UTF-8 JSON payload 会先按 JSON 脱敏。
+    #[test]
+    fn payload_preview_binary_json_redacts_before_preview() {
+        let body = br#"{ "authorization": "Bearer secret", "value": 1 }"#;
+
+        let preview = payload_preview_binary(body, 4096);
+
+        assert!(preview.contains("kind=json"));
+        assert!(preview.contains("redacted=true"));
+        assert!(preview.contains(r#""authorization":"<redacted>""#));
+        assert!(!preview.contains("Bearer secret"));
     }
 }

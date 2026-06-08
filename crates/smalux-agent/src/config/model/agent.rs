@@ -1,9 +1,9 @@
 //! Agent 总配置模型。
 
 use super::super::defaults::{
-    DEFAULT_CORE_INTERVAL, DEFAULT_LOG_FILE, DEFAULT_LOG_MAX_SIZE_MB, DEFAULT_LOG_RETENTION_FILES,
-    DEFAULT_PROCESSES_INTERVAL, DEFAULT_PROCESSES_LIMIT, DEFAULT_SOCKETS_INTERVAL,
-    DEFAULT_SOCKETS_LIMIT,
+    DEFAULT_CORE_INTERVAL, DEFAULT_LOG_FILE, DEFAULT_LOG_MAX_SIZE_MB, DEFAULT_LOG_PAYLOAD,
+    DEFAULT_LOG_PAYLOAD_MAX_BYTES, DEFAULT_LOG_RETENTION_FILES, DEFAULT_PROCESSES_INTERVAL,
+    DEFAULT_PROCESSES_LIMIT, DEFAULT_SOCKETS_INTERVAL, DEFAULT_SOCKETS_LIMIT,
 };
 use super::disk::{DiskConfig, DiskConfigPatch};
 use super::export::{ExportConfig, ExportConfigPatch};
@@ -32,6 +32,10 @@ pub(crate) struct AgentConfig {
     pub log_retention_files: usize,
     /// 单个日志文件最大大小，单位 MB。
     pub log_max_size_mb: u64,
+    /// 是否允许 trace 日志打印截断后的实际 payload。
+    pub log_payload: bool,
+    /// 实际 payload 日志预览最大原始字节数。
+    pub log_payload_max_bytes: usize,
     /// 核心指标配置。
     pub core: GroupConfig,
     /// 磁盘指标配置。
@@ -66,6 +70,8 @@ impl Default for AgentConfig {
             log_file: DEFAULT_LOG_FILE.to_string(),
             log_retention_files: DEFAULT_LOG_RETENTION_FILES,
             log_max_size_mb: DEFAULT_LOG_MAX_SIZE_MB,
+            log_payload: DEFAULT_LOG_PAYLOAD,
+            log_payload_max_bytes: DEFAULT_LOG_PAYLOAD_MAX_BYTES,
             core: GroupConfig::new(true, DEFAULT_CORE_INTERVAL),
             disk: DiskConfig::default(),
             network: NetworkConfig::default(),

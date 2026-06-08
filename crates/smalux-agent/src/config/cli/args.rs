@@ -51,6 +51,12 @@ pub(crate) struct CliArgs {
     /// 单个日志文件最大大小，单位 MB。
     #[arg(long)]
     pub log_max_size_mb: Option<u64>,
+    /// 是否允许 trace 日志打印截断后的实际 payload，可能包含敏感数据。
+    #[arg(long)]
+    pub log_payload: Option<bool>,
+    /// 实际 payload 日志预览最大原始字节数。
+    #[arg(long)]
+    pub log_payload_max_bytes: Option<usize>,
 
     /// server 根地址，例如 `https://example.com`；adapter 会派生具体 endpoint。
     #[arg(short = 's', long = "server")]

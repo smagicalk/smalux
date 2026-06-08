@@ -16,7 +16,7 @@ use smalux_protocol::{
 };
 
 /// Smalux 自有协议主连接路径。
-const SMALUX_CONNECT_PATH: &str = "/api/agents/connect";
+const SMALUX_CONNECT_PATH: &str = "/agent/v1/connect";
 
 /// 协议格式适配器。
 pub(crate) trait ProtocolAdapter {

@@ -55,6 +55,12 @@ impl CliArgs {
         if let Some(log_max_size_mb) = self.log_max_size_mb {
             config.log_max_size_mb = log_max_size_mb;
         }
+        if let Some(log_payload) = self.log_payload {
+            config.log_payload = log_payload;
+        }
+        if let Some(log_payload_max_bytes) = self.log_payload_max_bytes {
+            config.log_payload_max_bytes = log_payload_max_bytes;
+        }
         if let Some(required_for_first_report) = self.public_ip_required {
             config.public_ip.required_for_first_report = required_for_first_report;
         }

@@ -2,6 +2,10 @@
 //!
 //! 本模块只处理 token、PSK 派生和 Noise 状态机，不绑定 WebSocket、HTTP 或 gRPC。
 //! agent 和 server 必须复用这里的参数，避免两端 HKDF、Noise pattern 或 packet 语义写偏。
+//!
+//! 重要边界：`key_id` 只用于查找 secret 和参与 HKDF info，不能单独作为认证成功。
+//! 只有双方用同一 secret 派生出的 PSK 完成 Noise 握手后，连接才算通过认证。
+//! 调试日志只能输出 key id 和握手阶段，不能输出完整 token、secret 或派生后的 PSK。
 
 use base64::Engine;
 use hkdf::Hkdf;

@@ -7,6 +7,11 @@ use std::path::PathBuf;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
+pub use crate::utils::redact::{
+    RedactedJson, RedactedText, is_sensitive_key, normalize_sensitive_key, redact_sensitive_json,
+    redact_sensitive_json_bytes, redact_sensitive_json_text, redact_sensitive_json_value,
+    redact_sensitive_text,
+};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 #[cfg(not(test))]

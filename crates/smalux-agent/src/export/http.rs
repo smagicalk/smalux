@@ -53,7 +53,7 @@ impl HttpMethod {
     }
 
     /// 转换为日志里的方法名。
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Post => "POST",
         }

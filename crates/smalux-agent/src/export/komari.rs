@@ -132,7 +132,7 @@ impl ProtocolAdapter for KomariProtocolAdapter {
                 let report_body = serde_json::to_string(&Report::from_agent_report(report))?;
                 tracing::debug!(
                     created_at = outbound.created_at,
-                    body = %report_body,
+                    body_bytes = report_body.len(),
                     "komari websocket report request encoded"
                 );
                 Ok(vec![TransportRequest::WebSocketText {
@@ -163,7 +163,7 @@ impl ProtocolAdapter for KomariProtocolAdapter {
             sequence = info.sequence,
             created_at = info.created_at,
             url = %redacted_url,
-            body = %body,
+            body_bytes = body.to_string().len(),
             "komari basic info request encoded"
         );
 
@@ -190,7 +190,7 @@ impl ProtocolAdapter for KomariProtocolAdapter {
             sequence = result.sequence,
             task_id = %result.result.task_id,
             url = %redacted_url,
-            body = %body,
+            body_bytes = body.to_string().len(),
             "komari task result request encoded"
         );
 
@@ -214,7 +214,7 @@ impl ProtocolAdapter for KomariProtocolAdapter {
             probe_type = result.result.probe_type.as_str(),
             target = %result.result.target,
             value = result.result.value,
-            body = %body,
+            body_bytes = body.len(),
             "komari ping result encoded"
         );
 

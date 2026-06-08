@@ -65,6 +65,20 @@ impl DueMetricGroups {
     fn any(self) -> bool {
         self.core || self.disk || self.network || self.processes || self.sockets
     }
+
+    /// 返回本次到期的采样组数量，用于日志排查调度合并是否符合预期。
+    fn count(self) -> usize {
+        [
+            self.core,
+            self.disk,
+            self.network,
+            self.processes,
+            self.sockets,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+    }
 }
 
 /// 采集调度表。
@@ -176,6 +190,15 @@ pub(crate) async fn collector_loop(
                 if !due.any() {
                     continue;
                 }
+                tracing::debug!(
+                    due_group_count = due.count(),
+                    core_due = due.core,
+                    disk_due = due.disk,
+                    network_due = due.network,
+                    processes_due = due.processes,
+                    sockets_due = due.sockets,
+                    "collector sampling due metric groups"
+                );
                 if let Some(update) = sample_due_groups(&mut collector, &config, due)
                     && !publish_update(&telemetry_tx, update).await
                 {
@@ -206,7 +229,19 @@ pub(crate) async fn collector_loop(
                 let next = config_rx.borrow().clone();
                 schedule = MetricSchedule::new(&next);
                 config = next;
-                tracing::info!("Collector config updated");
+                tracing::info!(
+                    core_enabled = config.core.enabled,
+                    core_interval_ms = config.core.interval.as_millis(),
+                    disk_enabled = config.disk.enabled,
+                    disk_interval_ms = config.disk.interval.as_millis(),
+                    network_enabled = config.network.enabled,
+                    network_interval_ms = config.network.interval.as_millis(),
+                    processes_enabled = config.processes.enabled,
+                    processes_interval_ms = config.processes.interval.as_millis(),
+                    sockets_enabled = config.sockets.enabled,
+                    sockets_interval_ms = config.sockets.interval.as_millis(),
+                    "Collector config updated"
+                );
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -227,33 +262,81 @@ fn sample_due_groups(
     let mut updates = Vec::new();
 
     if due.core {
-        updates.push(TelemetryUpdate::Core(collector.sample_core()));
+        let core = collector.sample_core();
+        tracing::debug!(
+            sampled_at = core.sampled_at,
+            cpu_usage = core.value.cpu.cpu_usage,
+            memory_usage_bytes = core.value.memory.memory_usage,
+            memory_total_bytes = core.value.memory.memory_total,
+            load1 = core.value.load_avg.one,
+            "core metrics sampled"
+        );
+        updates.push(TelemetryUpdate::Core(core));
     }
 
     if due.disk {
-        updates.push(TelemetryUpdate::Disk(
-            collector.sample_disk(config.disk.include_per_device),
-        ));
+        let disk = collector.sample_disk(config.disk.include_per_device);
+        tracing::debug!(
+            sampled_at = disk.sampled_at,
+            warmed_up = disk.value.warmed_up,
+            include_per_device = config.disk.include_per_device,
+            device_count = disk.value.disks.len(),
+            total_space_bytes = disk.value.total_space,
+            available_space_bytes = disk.value.available_space,
+            io_bytes_per_sec = disk.value.io_bytes_per_sec,
+            "disk metrics sampled"
+        );
+        updates.push(TelemetryUpdate::Disk(disk));
     }
 
     if due.network {
-        updates.push(TelemetryUpdate::Network(collector.sample_network(
+        let network = collector.sample_network(
             config.network.include_per_interface,
             &config.network.include_interfaces,
             &config.network.exclude_interfaces,
-        )));
+        );
+        tracing::debug!(
+            sampled_at = network.sampled_at,
+            warmed_up = network.value.warmed_up,
+            include_per_interface = config.network.include_per_interface,
+            interface_count = network.value.networks.len(),
+            received_bytes_per_sec = network.value.received_bytes_per_sec,
+            transmitted_bytes_per_sec = network.value.transmitted_bytes_per_sec,
+            network_bytes_per_sec = network.value.network_bytes_per_sec,
+            used_traffic_bytes = network.value.used_traffic_bytes,
+            "network metrics sampled"
+        );
+        updates.push(TelemetryUpdate::Network(network));
     }
 
     if due.processes {
-        updates.push(TelemetryUpdate::Processes(
-            collector.sample_processes(config.processes.level, config.processes.limit),
-        ));
+        let processes = collector.sample_processes(config.processes.level, config.processes.limit);
+        tracing::debug!(
+            sampled_at = processes.sampled_at,
+            level = ?processes.value.level,
+            status = ?processes.value.status,
+            process_count = processes.value.count,
+            light_count = processes.value.light.as_ref().map(|light| light.items.len()),
+            detail_count = processes.value.details.as_ref().map(|details| details.items.len()),
+            "process metrics sampled"
+        );
+        updates.push(TelemetryUpdate::Processes(processes));
     }
 
     if due.sockets {
-        updates.push(TelemetryUpdate::Sockets(
-            collector.sample_sockets(config.sockets.level, config.sockets.limit),
-        ));
+        let sockets = collector.sample_sockets(config.sockets.level, config.sockets.limit);
+        tracing::debug!(
+            sampled_at = sockets.sampled_at,
+            level = ?sockets.value.level,
+            status = ?sockets.value.status,
+            tcp_count = sockets.value.tcp,
+            udp_count = sockets.value.udp,
+            source = ?sockets.value.source,
+            accuracy = ?sockets.value.accuracy,
+            detail_count = sockets.value.details.as_ref().map(|details| details.items.len()),
+            "socket metrics sampled"
+        );
+        updates.push(TelemetryUpdate::Sockets(sockets));
     }
 
     compact_updates(updates)
@@ -297,7 +380,14 @@ async fn handle_collector_command(
 async fn publish_update(telemetry_tx: &TelemetryUpdateSender, update: TelemetryUpdate) -> bool {
     let kind = update.kind();
     match telemetry_tx.send(update).await {
-        Ok(()) => true,
+        Ok(()) => {
+            tracing::debug!(
+                kind,
+                queue_capacity = telemetry_tx.max_capacity(),
+                "telemetry update published"
+            );
+            true
+        }
         Err(_) => {
             tracing::warn!(
                 kind,

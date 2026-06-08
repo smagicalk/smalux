@@ -12,7 +12,7 @@ use crate::telemetry::ReportEvent;
 #[cfg(test)]
 use crate::telemetry::TelemetryUpdate;
 use crate::telemetry::{LatestTelemetry, TelemetryAggregator};
-use smalux_protocol::OutboundReport;
+use smalux_protocol::{OutboundReport, OutboundReportKind};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
@@ -130,6 +130,11 @@ pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
     loop {
         tokio::select! {
             _ = report_tick.tick(), if config.report.enabled => {
+                tracing::debug!(
+                    report_interval_ms = config.report.interval.as_millis(),
+                    force_snapshot_pending,
+                    "reporter interval tick"
+                );
                 if force_snapshot_pending
                     && force_snapshot_due(last_forced_snapshot_at, config.report.force_snapshot_min_interval)
                 {
@@ -164,6 +169,11 @@ pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
                 }
             }
             _ = basic_info_tick.tick(), if basic_info_enabled(&config) => {
+                tracing::debug!(
+                    refresh_interval_ms = config.outbound.basic_info.refresh_interval.as_millis(),
+                    send_on_start = config.outbound.basic_info.send_on_start,
+                    "basic info interval tick"
+                );
                 match queue_basic_info_if_ready(&state, agent_version, &outbound_tx, &sequence).await {
                     Ok(true) => basic_info_initial_sent = true,
                     Ok(false) => {}
@@ -201,7 +211,13 @@ pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
                 };
                 let kind = update.kind();
                 state.apply_update(update);
-                tracing::debug!(kind, "Telemetry update applied");
+                tracing::debug!(
+                    kind,
+                    report_enabled = config.report.enabled,
+                    delta_enabled = config.report.delta_enabled,
+                    heartbeat_enabled = config.report.heartbeat_enabled,
+                    "Telemetry update applied"
+                );
                 if !config.report.enabled {
                     continue;
                 }
@@ -244,6 +260,11 @@ pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
                             force_snapshot_reason = reason;
                         }
                         force_snapshot_pending = true;
+                        tracing::debug!(
+                            reason = force_snapshot_reason.as_deref(),
+                            min_interval_ms = config.report.force_snapshot_min_interval.as_millis(),
+                            "Forced snapshot requested"
+                        );
                         if !config.report.enabled {
                             tracing::debug!("Forced snapshot requested while reporting is disabled");
                             continue;
@@ -319,7 +340,17 @@ pub(crate) async fn reporter_loop(parts: ReporterLoopParts) {
                         }
                     }
                 }
-                tracing::info!("Reporter config updated");
+                tracing::info!(
+                    report_enabled = config.report.enabled,
+                    report_interval_ms = config.report.interval.as_millis(),
+                    delta_enabled = config.report.delta_enabled,
+                    snapshot_interval_ms = config.report.snapshot_interval.as_millis(),
+                    heartbeat_enabled = config.report.heartbeat_enabled,
+                    heartbeat_interval_ms = config.report.heartbeat_interval.as_millis(),
+                    basic_info_enabled = config.outbound.basic_info.enabled,
+                    basic_info_refresh_interval_ms = config.outbound.basic_info.refresh_interval.as_millis(),
+                    "Reporter config updated"
+                );
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -391,7 +422,16 @@ async fn queue_next_report(
     let event = aggregator.next_report_event(state, agent_version, config, || sequence.next());
 
     match event {
-        Ok(Some(event)) => queue_report_event(outbound_tx, event.into_outbound()).await,
+        Ok(Some(event)) => {
+            let outbound = event.into_outbound();
+            tracing::debug!(
+                sequence = outbound.sequence,
+                report_kind = outbound_report_kind(&outbound.kind),
+                created_at = outbound.created_at,
+                "reporter generated agent report"
+            );
+            queue_report_event(outbound_tx, outbound).await
+        }
         Ok(None) => {
             tracing::debug!("Agent report unchanged; no business heartbeat due");
             Ok(())
@@ -416,8 +456,9 @@ async fn queue_forced_snapshot(
         .force_snapshot_event(state, agent_version, || sequence.next())?
         .into_outbound();
     let sequence = outbound.sequence;
+    let created_at = outbound.created_at;
     queue_report_event(outbound_tx, outbound).await?;
-    tracing::info!(sequence, reason, "Forced agent snapshot queued");
+    tracing::info!(sequence, created_at, reason, "Forced agent snapshot queued");
     Ok(())
 }
 
@@ -427,13 +468,25 @@ async fn queue_report_event(
     outbound: OutboundReport,
 ) -> anyhow::Result<()> {
     let sequence = outbound.sequence;
+    let created_at = outbound.created_at;
+    let report_kind = outbound_report_kind(&outbound.kind);
     let event = OutboundEvent::Report(ReportEnvelope::from_outbound(outbound));
     outbound_tx
         .send(event)
         .await
         .map_err(|_| anyhow::anyhow!("outbound event queue is closed"))?;
-    tracing::debug!(sequence, "Agent report queued");
+    tracing::debug!(sequence, created_at, report_kind, "Agent report queued");
     Ok(())
+}
+
+/// 返回上报语义的稳定日志名称。
+fn outbound_report_kind(kind: &OutboundReportKind) -> &'static str {
+    match kind {
+        OutboundReportKind::Snapshot { .. } => "snapshot",
+        OutboundReportKind::Heartbeat { .. } => "heartbeat",
+        OutboundReportKind::Delta { .. } => "delta",
+        OutboundReportKind::Ack { .. } => "ack",
+    }
 }
 
 #[cfg(test)]

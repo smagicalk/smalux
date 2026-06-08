@@ -4,38 +4,200 @@
 
 ## 当前职责
 
-- 初始化 server 日志。
-- 预留 HTTP 路由、agent 接入、查询和存储模块。
+- 当前只保留 crate 依赖配置和实现文档。
+- `src/` 当前只有目录骨架和最小 `main.rs`，server 业务代码由你后续重新编写。
 - 后续接收 `smalux-agent` 上报的 `ClientFrame`，完成校验、标准化、持久化和查询。
 
 ## 目录结构
 
+当前 `src/` 只保留最小可编译入口和按 agent 风格预建的目录骨架。`crates/smalux-server` 已在 workspace `members` 中，后续可以直接在这些目录里继续写 server 业务代码。
+
+当前预留结构：
+
 ```text
 src/
-  main.rs      # 二进制入口，当前只初始化日志
-  config.rs    # server 运行配置
-  http.rs      # axum router、handler、中间件
-  ingest.rs    # agent 上报接入和校验
-  storage.rs   # 持久化接口和数据库适配
-  query.rs     # 查询读模型和 API 编排
+  main.rs      # 最小可编译入口，当前只包含 fn main() {}
+  cli/         # server 启动参数、环境变量和命令行默认值解析
+    args/      # clap 参数结构和启动输入解析规则
+  config/      # server 运行配置模型、默认值和校验
+    model/     # 配置模型、默认值和校验
+  auth/        # agent 认证、secure_psk 识别、管理后台 session 和授权边界
+    agent/     # agent token、key_id、secure_psk 认证
+    session/   # 管理后台 session 和用户登录态
+  http/        # axum router、REST API、agent 接入、前端实时通道、静态前端资源和中间件
+    router/    # REST、agent 接入、前端实时通道、静态资源和中间件的路由组合
+    rest/      # 前端 REST API handler 和 route 组织
+    agent/     # agent WebSocket upgrade、连接生命周期和控制帧发送
+    realtime/  # 前端 dashboard live update、事件订阅和管理端实时反馈
+    frontend/  # 静态前端资源、SPA fallback 和前端入口页面服务
+    middleware/# axum/tower middleware，例如 trace、CORS、限流、request id
+  ingest/      # agent 上报接入、协议分发和校验
+    frame/     # ClientFrame/ServerFrame 分发和序列号语义
+    report/    # AgentReport snapshot/delta/heartbeat 校验与应用
+  storage/     # 持久化接口、内存状态和数据库适配
+    entity/    # SeaORM entity
+    migration/ # SeaORM migration
+    repository/# latest state、pending command、remote result 仓储
+  service/     # server 后台服务编排、连接状态和控制命令调度
+    agent/     # agent 连接注册、在线状态和 latest 状态协调
+    dashboard/ # dashboard 聚合状态、摘要指标和前端展示数据
+    command/   # server 下发命令、ack/error、超时和幂等处理
 ```
+
+## 当前 crate 依赖配置
+
+`smalux-server` 现在先只配置后续 server 会用到的相关 crate，模块内部暂时保持骨架。版本按当前已确认的 crates.io / `cargo info` 最新可用版本固定，避免未来自动跳版本带来不可控变化。
+
+这次配置的目标是“server 基础设施尽量一次配全”：HTTP/WebSocket、Tower 中间件、限流、会话、SQLite ORM、迁移、协议复用、错误处理、时间、ID、校验和密钥包装都先放进 crate；认证方案、OpenAPI、gRPC、密码哈希、外部 API 客户端这些会绑定业务设计，暂时不硬塞进来。
+
+- `tokio 1.52.3`: 异步运行时。
+- `tokio-util 0.7.18`: stream、codec、IO 适配、超时工具。
+- `axum 0.8.9`: HTTP / WebSocket 服务框架，已启用 `http2`、`ws`、`macros`、`multipart`。
+- `axum-extra 0.12.6`: typed headers、cookie、扩展 extractor、typed routing、JSON Lines、文件流、multipart 等 axum 扩展能力。
+- `tower 0.5.3`: 启用官方 `full` feature，覆盖 balance、buffer、filter、hedge、limit、load-shed、reconnect、retry、timeout、util 等通用 service middleware。
+- `tower-http 0.6.11`: 启用官方 `full` feature，覆盖 trace、CORS、压缩/解压、request id、敏感 header、panic catch、request 校验、静态文件、metrics、redirect 等 HTTP middleware。
+- `tower_governor 0.8.0`: Tower/axum 限流中间件，只启用 `axum` 和 `tracing`，不启用默认 `tonic`。
+- `tower-sessions 0.15.0`: Tower/axum session 中间件，启用 signed/private cookie，后续可用于管理后台登录态；当前先只配置 crate。
+- `clap 4.6.1`: 后续启动参数解析，启用 `derive`、`env`、`unicode`、`wrap_help`。
+- `serde 1.0.228` / `serde_json 1.0.150`: 后续 JSON API 和协议辅助。
+- `tracing 0.1.44`: server 运行日志。
+- `sea-orm 2.0.0-rc.40`: server 数据库 ORM，当前按 SQLite + Tokio/Rustls 配置；这是当前 crates.io 可搜索到的最新可用版本，但属于 RC，不是稳定线。
+- `sea-orm-migration 2.0.0-rc.40`: SeaORM 迁移能力，关闭默认 CLI feature，只保留 Tokio/Rustls + SQLite 迁移运行能力。
+- `sea-query 1.0.1`: 后续手写动态 SQL、迁移辅助或复杂查询构建时使用，当前只开 SQLite 后端。
+- `anyhow 1.0.102` / `thiserror 2.0.18`: 启动错误和后续领域错误建模。
+- `async-trait 0.1.89`: 后续存储 trait、服务 trait 需要 async 方法时使用。
+- `futures-util 0.3.32`: WebSocket split/sink/stream 等异步组合工具。
+- `bytes 1.11.1`: WebSocket、HTTP body、二进制协议 buffer。
+- `http 1.4.1` / `headers 0.4.1`: HTTP 类型和 typed header。
+- `validator 0.20.0`: API 请求 DTO、管理后台表单和配置 patch 的结构化校验。
+- `uuid 1.23.2`: connection id、command id、task id 等服务端生成 ID。
+- `time 0.3.47`: server 收包时间、过期时间、日志/数据库时间字段。
+- `secrecy 0.10.3`: token、secret、PSK 等敏感值包装，降低误打印风险。
+- `smalux-core`: 复用日志初始化和通用工具。
+- `smalux-protocol`: 后续 server 解包 `ClientFrame`、wire packet 和 `secure_psk` 时复用协议实现。
+
+数据库依赖现在只按 SQLite 驱动收敛，没有启用 `sqlx-all`，也没有启用 SQLx 的 MySQL/Postgres 驱动。SeaORM 自身会给 `sea-query` 开多个 SQL 方言的 query builder backend，这是 SeaORM 内部建模能力，不等于启用了多个数据库驱动。当前依赖树已经确认 `sqlx-mysql`、`sqlx-postgres`、`tonic` 都没有被 `smalux-server` 拉入。
+
+暂时没有把 gRPC、系统采集类依赖、OpenAPI、密码哈希、外部 HTTP client 作为 server 直接依赖。原因是这些依赖会强绑定后续功能边界：gRPC 要看是否真的做独立传输协议，OpenAPI 要看 API 文档生成方式，密码哈希要等管理后台认证模型确定，外部 HTTP client 要等 server 是否主动调用第三方服务。后续需要时再加，比提前把业务方向锁死更稳。
+
+`tower-sessions-sqlx-store` 和 `tower-sessions-seaorm-store` 也暂时没有加入：前者当前最新版本依赖的 `tower-sessions-core` 版本和 `tower-sessions 0.15.0` 不一致，后者版本较早且默认偏 Postgres。首版可以先用 `tower-sessions` 的内存 store 跑通管理后台登录态；如果要持久化 session，建议等 session 表结构确定后自己用 SeaORM 写 store 或等待生态版本对齐。
 
 ## 后续接入点
 
-- `http.rs`: 构建 axum router。
-- `ingest.rs`: 接收 `ClientFrame`，校验 agent 身份和 payload。
-- `storage.rs`: 定义存储 trait，接入数据库。
-- `query.rs`: 面向仪表盘或 API 提供查询模型。
+- `cli/`: 定义 server 启动参数、环境变量和命令行默认值解析。
+- `config/`: 定义 server 运行配置模型、默认值和校验。
+- `auth/`: 处理 agent 认证、secure key 查找、管理后台 session 和权限边界。
+- `http/`: 构建 axum router，处理前端 REST API、agent 接入、前端实时通道、静态前端资源和 HTTP middleware。
+- `ingest/`: 接收 `ClientFrame`，校验 agent 身份和 payload。
+- `storage/`: 定义存储 trait，接入数据库。
+- `service/`: 编排连接状态、控制命令、后台任务和业务服务。
 
 建议职责边界：
 
-- `http.rs` 只处理 HTTP/WebSocket 框架细节：路由、upgrade、请求参数、响应码、连接超时。
-- `ingest.rs` 只处理协议语义：decode `ClientFrame`、校验、snapshot/delta/heartbeat 分发、控制响应关联。
-- `storage.rs` 只处理持久化：latest state、pending command、remote task/probe result，不直接依赖 axum。
-- `query.rs` 只处理读模型：把 storage 数据转换成 API 返回结构，不直接解析 wire frame。
-- `config.rs` 只放 server 启动参数，例如监听地址、数据库路径、wire mode、token/secret 加载方式。
+- `http/` 只处理 axum/HTTP 框架细节：路由、upgrade、请求参数、响应码、连接超时、middleware 和静态前端资源。
+- `auth/` 只处理身份和权限：token/key 查找、secure_psk 认证、session、控制权限判定。
+- `ingest/` 只处理协议语义：decode `ClientFrame`、校验、snapshot/delta/heartbeat 分发、控制响应关联。
+- `storage/` 只处理持久化：latest state、pending command、remote task/probe result，不直接依赖 axum。
+- `cli/` 只处理启动输入，例如监听地址、数据库路径、wire mode、token/secret 加载方式的命令行或环境变量来源。
+- `config/` 只放运行配置模型、默认值和校验，不直接依赖 clap。
+- `service/` 只做服务级编排，例如连接注册、命令投递、latest 读取、dashboard 聚合、后台清理和状态协调。
 
-这样后续增加 REST、gRPC 或 Web UI 时，不需要重写 agent 上报接入逻辑；只新增入口层或查询层。
+这样后续增加 REST 或 Web UI 时，不需要重写 agent 上报接入逻辑；都继续走 `http/`、`ingest/`、`storage/` 的边界。未来如果真的加 gRPC，再新增同级 `grpc/`，不要提前把当前 axum 入口泛化成不清晰的名字。
+
+### 目录去重决策
+
+server 同时服务 agent、前端 REST 和前端实时连接时，最容易混乱的是把所有 HTTP 入口都塞进 `api` 或 `ws`。当前约定是：`http/rest.rs` 只放前端 REST handler，`http/agent.rs` 只放 agent 主连接，`http/realtime.rs` 只放前端实时推送，`http/frontend.rs` 只放 React/Vite 静态资源服务，`http/router.rs` 负责把这些入口组合起来。
+
+`query/` 模块已经删除。前端查询读模型不再单独占一个目录，agent 列表、latest report 和在线状态放在 `service/agent.rs`，dashboard 摘要和聚合数据放在 `service/dashboard.rs`，REST handler 通过 service 获取数据，不直接访问数据库细节。
+
+空目录不提前保留。当前只保留已经有 `.rs` 模块入口或真实子模块的目录；例如 `auth/agent.rs` 暂时只有文件，没有继续保留空的 `auth/agent/`。后续当某个模块需要拆成多个文件时，再创建同名目录，例如 `auth/agent/token.rs`、`auth/agent/secure_psk.rs`，同时由 `auth/agent.rs` 引入它们。
+
+当前目录职责总结：
+
+| 目录 | 主要调用方 | 负责内容 | 不负责内容 |
+| --- | --- | --- | --- |
+| `http/router.rs` | main/bootstrap | 组合 REST、agent、realtime、frontend 和 middleware | 不写业务逻辑 |
+| `http/rest.rs` | 前端 REST 请求 | axum handler、route 组织、请求/响应转换 | 不直接写 SQL，不解析 agent wire |
+| `http/agent.rs` | agent | `/agent/v1/connect`、主连接、远程 shell stream | 不处理 dashboard 推送 |
+| `http/realtime.rs` | 前端 | dashboard live update、事件订阅 | 不处理 agent ClientFrame |
+| `http/frontend.rs` | 浏览器 | 静态前端资源、SPA fallback | 不处理 agent 上报 |
+| `ingest/*` | agent 连接处理 | ClientFrame、snapshot、delta、heartbeat 语义 | 不处理前端 DTO |
+| `service/agent.rs` | HTTP / ingest / storage | 连接状态、latest report、在线状态、agent 列表 | 不直接暴露 HTTP route |
+| `service/dashboard.rs` | HTTP / storage / realtime | dashboard 聚合数据和摘要指标 | 不解析 wire frame |
+| `service/command.rs` | HTTP / agent connection / storage | 命令调度、ack/error、远程任务结果关联 | 不直接暴露 HTTP route |
+| `storage/*` | service | entity、migration、repository 和持久化 | 不依赖 axum handler |
+
+### 推荐实现顺序和文件落点
+
+server 还没正式实现时，优先把“能连接、能解包、能保存最新 snapshot”跑通。建议按下面顺序写：
+
+1. `cli/`
+   - 定义监听地址、数据库路径、允许的 wire mode、开发期 token 或 `key_id -> secret` 加载方式的启动输入。
+   - 只负责把命令行和环境变量解析成启动输入，不直接做数据库连接或 HTTP 启动。
+2. `config/`
+   - 定义运行配置模型、默认值和校验，把 CLI 启动输入转换成稳定配置。
+   - 不在这里放 agent 上报 JSON 结构，JSON 结构来自 `smalux-protocol` 和 `smalux-core`。
+3. `http/`
+   - 建立 `/agent/v1/connect` WebSocket endpoint。
+   - 建立 `/api/v1/*` 前端 REST endpoint。
+   - 建立 `/live/v1/dashboard` 前端实时 endpoint。
+   - 根据配置选择是否服务 React/Vite 静态资源。
+   - 收到 agent binary/text 后只交给 frame 解包和 ingest，不直接操作 storage。
+4. `auth/`
+   - 定义 agent 认证方式、`key_id -> secret` 查找接口和后台 session 边界。
+   - `secure_psk` 只在 Noise 握手成功后认为认证通过，不把 `key_id` 当成认证成功。
+5. `ingest/`
+   - 调用 `smalux_protocol::wire` / `secure` / `codec` 还原 `ClientFrame`。
+   - 按 `ClientPayload` 分发到 `apply_snapshot()`、`apply_delta()`、`apply_heartbeat()`、`apply_control_response()`。
+   - 负责生成下行 `ServerFrame`，但不直接决定 WebSocket 怎么加密发送。
+6. `storage/`
+   - 先实现 latest state：`agent_id -> latest_report + delta_base_sequence + last_seen_at`。
+   - 再实现 pending command、remote task result、remote probe result。
+   - 需要 SQLite 时在这里接入，避免 axum handler 直接写 SQL。
+7. `service/`
+   - 把 http、auth、ingest、storage 串起来。
+   - 在 `service/agent.rs` 提供 agent 列表、latest report 和在线状态读取。
+   - 在 `service/dashboard.rs` 提供 dashboard 聚合数据。
+   - 后续远程任务、控制命令、连接清理和 desired config 下发都放在这里编排。
+
+首版可以暂时只实现 `binary_plain + snapshot + heartbeat + snapshot_request`，确认 agent 能稳定在线后，再接 `delta`、`secure_psk`、remote task/probe/shell。这样每一步失败时都能明确定位在 http、wire、ingest 或 storage 哪一层。
+
+### 前端服务模式
+
+Rust server 不直接运行 React 源码。React/Vite 前端应先构建成静态资源，再由 server 按配置选择是否服务这些资源。这样可以同时支持开发期前后端独立运行和生产期整体部署。
+
+建议后续在配置模型中使用枚举，而不是让用户手写随意字符串：
+
+```text
+FrontendMode::Disabled
+  -> 不服务前端，只提供 `/api/v1/*`、`/agent/v1/connect` 和 `/live/v1/*`。
+
+FrontendMode::Dir
+  -> 使用 tower-http ServeDir 从 React/Vite dist 目录读取静态资源。
+  -> 适合第一版生产部署，前端更新时只替换 dist，不需要重新编译 Rust。
+
+FrontendMode::Embedded
+  -> 通过可选 feature 把 dist 嵌入 server 二进制。
+  -> 适合单文件发布，但前端每次变化都需要重新编译 Rust，二进制体积也会变大。
+```
+
+推荐默认：
+
+```text
+开发期:
+  React/Vite dev server  -> http://127.0.0.1:5173
+  smalux-server          -> http://127.0.0.1:3000
+  Vite proxy             -> /api/v1、/live/v1 代理到 smalux-server
+
+生产期:
+  pnpm build
+  smalux-server --frontend-mode dir --frontend-dir apps/smalux-web/dist
+
+单文件发布:
+  cargo build --release -p smalux-server --features frontend-embed
+```
+
+`http/frontend.rs` 只负责前端静态资源和 SPA fallback，不处理 REST handler，也不处理 agent 上报。`http/router.rs` 负责把 frontend route 放在 fallback 位置，避免静态资源路由抢走 `/api/v1/*`、`/agent/v1/connect` 或 `/live/v1/*`。
 
 ## Agent 上报接入设计
 
@@ -48,7 +210,7 @@ src/
 建议首版使用 WebSocket：
 
 ```text
-GET /api/agents/connect
+GET /agent/v1/connect
   -> WebSocket upgrade
   -> 按 wire mode 做连接级识别；binary_plain 可用 query/bearer，secure_psk 不使用明文 token
   -> 接收 smalux binary wire frame；开发兼容模式可接收 text frame
@@ -73,7 +235,7 @@ gRPC adapter      ┘
 server 第一版按下面流程写，能覆盖 agent 当前自有协议闭环：
 
 ```text
-agent connects /api/agents/connect
+agent connects /agent/v1/connect
   -> server 按 wire mode 选择连接识别方式
      -> binary_plain: 可按 query token / bearer token / none 识别
      -> secure_psk: 先只接收 Hello，Noise 握手成功后才算认证通过
@@ -273,7 +435,7 @@ on_delta(frame):
 
 ### 校验规则
 
-`ingest.rs` 首版只做轻量 fail-fast 校验：
+`ingest/` 首版只做轻量 fail-fast 校验：
 
 - `protocol_version` 必须等于当前支持版本 `1`。
 - `agent_id` 必须非空，并且 snapshot 中 `report.identity.agent_id` 应与 frame 顶层 `agent_id` 一致。
@@ -609,13 +771,13 @@ remote_probe_results
 
 ### 查询接口
 
-首版查询可以先提供两个只读接口：
+首版前端 REST 查询可以先提供两个只读接口，统一放在 `/api/v1` 下：
 
 ```text
-GET /agents
+GET /api/v1/agents
   -> 返回 agent 列表和 last_seen_at、hostname、public_ip_status
 
-GET /agents/{agent_id}
+GET /api/v1/agents/{agent_id}
   -> 返回该 agent 的 latest_report
 ```
 
@@ -631,24 +793,27 @@ GET /agents/{agent_id}
 
 | 端点 | 方法 | 作用 | 首版是否需要 |
 | --- | --- | --- | --- |
-| `/api/agents/connect` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
-| `/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
-| `/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
-| `/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_run` | 可后做 |
-| `/agents/{agent_id}/commands/{command_id}` | `GET` | 查询 pending command 的 ack/error 状态 | 可后做 |
-| `/agents/{agent_id}/tasks/{task_id}` | `GET` | 查询 remote task 结果 | 可后做 |
-| `/agents/{agent_id}/probes/{task_id}` | `GET` | 查询 remote probe 结果 | 可后做 |
+| `/agent/v1/connect` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
+| `/api/v1/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
+| `/api/v1/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
+| `/api/v1/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_run` | 可后做 |
+| `/api/v1/commands/{command_id}` | `GET` | 查询 pending command 的 ack/error 状态 | 可后做 |
+| `/api/v1/agents/{agent_id}/tasks/{task_id}` | `GET` | 查询 remote task 结果 | 可后做 |
+| `/api/v1/agents/{agent_id}/probes/{task_id}` | `GET` | 查询 remote probe 结果 | 可后做 |
+| `/live/v1/dashboard` | `GET` upgrade 或 SSE | 前端 dashboard 实时推送、事件订阅和命令反馈 | 可后做 |
 
 端点职责建议：
 
-- `/api/agents/connect` 不直接做复杂查询，只负责连接、解包、分发和发送控制消息。
+- `/agent/v1/connect` 不直接做复杂查询，只负责连接、解包、分发和发送控制消息。
+- `/api/v1/*` 只给前端和管理端 REST 使用，不承载 agent 主连接。
+- `/live/v1/*` 只给前端实时订阅使用，不承载 agent 上报。
 - 查询端点只读 storage，不直接访问 WebSocket sink。
 - 创建控制命令时先写 `pending_commands`，再投递到当前在线连接；如果 agent 离线，按命令类型决定是拒绝、排队还是只保存 desired config。
 - `config_patch` 更像 desired config，不建议作为普通一次性命令长期排队；agent 重连后 server 可以比较 desired config 和当前 effective 状态后再下发。
 
 ### Ingest 分发伪代码
 
-server 的 `ingest.rs` 可以把 transport 细节隔离掉，只接收已经解包出来的 JSON bytes：
+server 的 `ingest/` 可以把 transport 细节隔离掉，只接收已经解包出来的 JSON bytes：
 
 ```text
 handle_client_json(connection, json_bytes):
@@ -694,17 +859,20 @@ handle_client_json(connection, json_bytes):
 
 建议按下面顺序写代码：
 
-1. 在 `storage.rs` 定义 latest-only 存储 trait 和内存实现。
-2. 在 `ingest.rs` 实现 `validate_report()` 和 `handle_report()`。
-3. 在 `ingest.rs` 实现 `apply_snapshot()` / `apply_delta()` / `apply_heartbeat()`。
-4. 在 `http.rs` 增加 `/api/agents/connect` WebSocket handler。
-5. 实现 `binary_plain` wire 解包和 `ClientFrame` 分发。
-6. 增加本地测试：合法 report 写入成功、schema 不匹配失败、同 agent 覆盖旧快照、delta base 不匹配会请求 snapshot。
-7. 再补 `GET /agents` 和 `GET /agents/{agent_id}` 查询接口。
-8. 增加 `pending_commands` 和 desired config 状态，支持手动发送 `snapshot_request` 和 `config_patch`。
-9. 最后接 `secure_psk`、remote task/probe/shell、历史指标落库和 Web UI。
+1. 在 `storage/` 定义 latest-only 存储 trait 和内存实现。
+2. 在 `auth/` 定义 agent 认证接口和 secure key 查找接口。
+3. 在 `ingest/` 实现 `validate_report()` 和 `handle_report()`。
+4. 在 `ingest/` 实现 `apply_snapshot()` / `apply_delta()` / `apply_heartbeat()`。
+5. 在 `http/agent.rs` 增加 `/agent/v1/connect` WebSocket handler。
+6. 实现 `binary_plain` wire 解包和 `ClientFrame` 分发。
+7. 增加本地测试：合法 report 写入成功、schema 不匹配失败、同 agent 覆盖旧快照、delta base 不匹配会请求 snapshot。
+8. 再补 `GET /api/v1/agents` 和 `GET /api/v1/agents/{agent_id}` 查询接口。
+9. 增加 `pending_commands` 和 desired config 状态，支持手动发送 `snapshot_request` 和 `config_patch`。
+10. 最后接 `secure_psk`、remote task/probe/shell、历史指标落库和 Web UI。
 
 ## 常用命令
+
+当前 `main.rs` 只是最小占位入口，server 业务逻辑还没实现。可以运行下面命令检查 crate：
 
 ```powershell
 cargo check -p smalux-server

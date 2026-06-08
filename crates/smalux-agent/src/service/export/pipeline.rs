@@ -6,7 +6,7 @@ use super::delivery::{DeliveryState, delivery_states_from_plan};
 use crate::config::ConfigManager;
 use crate::config::model::{ExportConfig, ExportFormat, OutboundConfig};
 use crate::export::{
-    ExportRouter, InboundProtocolHandler, TransportEventReceiver, TransportHub,
+    ExportLogOptions, ExportRouter, InboundProtocolHandler, TransportEventReceiver, TransportHub,
     build_komari_inbound_handler, build_protocol_adapter, transport_event_channel,
 };
 use tokio::time::sleep;
@@ -42,7 +42,9 @@ pub(super) async fn connect_export_pipeline(
         let outbound_config = config.outbound.clone();
         let reconnect_interval = export_config.reconnect_interval;
         let format = export_config.format.as_str();
-        let mut router = ExportRouter::new(build_protocol_adapter(export_config.format));
+        let log_options = ExportLogOptions::new(config.log_payload, config.log_payload_max_bytes);
+        let mut router =
+            ExportRouter::new(build_protocol_adapter(export_config.format), log_options);
         let mut transport_plan = router.transport_plan(&export_config)?;
         transport_plan.apply_outbound_config(&outbound_config);
         let deliveries = delivery_states_from_plan(&transport_plan);

@@ -5,7 +5,7 @@
 use crate::config::PublicIpConfig;
 use smalux_core::model::info::{
     CoreInfo, CpuInfo, DiskInfo, IdentityInfo, LoadAverageInfo, MemoryInfo, MetricLevel,
-    NetworkInfo, ProcessInfo, PublicIpInfo, PublicIpSource, SocketInfo, SystemInfo,
+    NetworkInfo, ProcessInfo, SocketInfo, SystemInfo,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, Networks, System};
@@ -190,7 +190,7 @@ impl LocalCollector {
         self.identity_networks.refresh(true);
         let network_info = network::build_network_info(&self.identity_networks);
         let local_ips = network::local_ips(&network_info);
-        let public_ip = resolve_public_ip(&network_info, public_ip_config).await;
+        let public_ip = network::resolve_public_ip(&network_info, public_ip_config).await;
 
         IdentityInfo {
             agent_id,
@@ -255,79 +255,6 @@ fn elapsed_since(last_sampled_at: &mut Option<Instant>) -> Option<f64> {
     last_sampled_at
         .replace(now)
         .map(|last| now.duration_since(last).as_secs_f64())
-}
-
-/// 获取公网 IP，优先使用网卡公网候选地址。
-async fn resolve_public_ip(network_info: &NetworkInfo, config: &PublicIpConfig) -> PublicIpInfo {
-    if !config.enabled {
-        return PublicIpInfo::disabled();
-    }
-
-    let attempted_at = unix_timestamp_secs();
-
-    if config.prefer_interface_candidate
-        && let Some(ip) = network::interface_public_ip_candidate(network_info)
-    {
-        tracing::info!(ip = %ip, "Public IP resolved from interface candidate");
-        let sampled_at = unix_timestamp_secs();
-        let mut public_ip =
-            PublicIpInfo::ready(ip, PublicIpSource::InterfaceCandidate, sampled_at, None);
-
-        if config.verify_interface_candidate
-            && let Ok(verified_ip) = lookup_external_public_ip(config).await
-        {
-            if Some(verified_ip) != public_ip.ip {
-                tracing::info!(
-                    interface_ip = %ip,
-                    verified_ip = %verified_ip,
-                    "Interface public IP candidate replaced by external verification"
-                );
-                public_ip = PublicIpInfo::ready(
-                    verified_ip,
-                    PublicIpSource::ExternalHttp,
-                    sampled_at,
-                    Some(unix_timestamp_secs()),
-                );
-            } else {
-                public_ip.verified_at = Some(unix_timestamp_secs());
-            }
-        }
-
-        return public_ip;
-    }
-
-    match lookup_external_public_ip(config).await {
-        Ok(ip) => {
-            let sampled_at = unix_timestamp_secs();
-            tracing::info!(ip = %ip, "Public IP resolved from external service");
-            PublicIpInfo::ready(
-                ip,
-                PublicIpSource::ExternalHttp,
-                sampled_at,
-                Some(sampled_at),
-            )
-        }
-        Err(err) => {
-            tracing::warn!(error = ?err, "Public IP lookup failed");
-            PublicIpInfo::failed(err.to_string(), attempted_at)
-        }
-    }
-}
-
-/// 通过外部服务获取公网 IP。
-async fn lookup_external_public_ip(config: &PublicIpConfig) -> anyhow::Result<std::net::IpAddr> {
-    let (v4, v6) = tokio::time::timeout(config.lookup_timeout, async {
-        futures_util::future::join(
-            network::get_public_network_v4_with_concurrency(config.max_concurrency),
-            network::get_public_network_v6_with_concurrency(config.max_concurrency),
-        )
-        .await
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("Public IP lookup timed out"))?;
-
-    v4.or(v6)
-        .map_err(|err| anyhow::anyhow!("Public IP lookup failed: {err}"))
 }
 
 #[cfg(test)]
@@ -495,7 +422,7 @@ mod tests {
         )
         .await
         .unwrap();
-        println!("{}", serde_json::to_string_pretty(&ip).unwrap());
+        tracing::debug!(public_ip = ?ip, "public network fetched from external service");
     }
 
     /// 同时尝试 IPv4 和 IPv6 公网地址获取。
@@ -504,7 +431,10 @@ mod tests {
     #[ignore = "requires external network access"]
     #[tokio::test]
     async fn test_get_public_network() {
-        println!("{:?}", network::get_public_network().await)
+        tracing::debug!(
+            result = ?network::get_public_network().await,
+            "public network lookup completed"
+        );
     }
 
     /// 获取 IPv4 公网地址。
@@ -514,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_public_network_v4() {
         let ip_v4 = network::get_public_network_v4().await.unwrap();
-        println!("{:?}", ip_v4);
+        tracing::debug!(ip = ?ip_v4, "public IPv4 lookup completed");
     }
 
     /// 获取 IPv6 公网地址。
@@ -524,6 +454,6 @@ mod tests {
     #[tokio::test]
     async fn test_get_public_network_v6() {
         let ip_v6 = network::get_public_network_v6().await.unwrap();
-        println!("{:?}", ip_v6);
+        tracing::debug!(ip = ?ip_v6, "public IPv6 lookup completed");
     }
 }

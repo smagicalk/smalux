@@ -228,6 +228,31 @@ server 按下面顺序实现，最容易先跑通闭环：
 
 `secure_psk` 的精确参数在本 crate 的 `secure` 模块测试中固化：token 使用 `smx1.<key_id>.<secret_base64url>`，HKDF-SHA256 salt 是 `smalux secure psk v1 salt`，info 是 `smalux secure psk v1 ` 加 UTF-8 `key_id`，输出 32 字节并放入 Noise `psk(0)`，pattern 是 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`。server 对接前应先跑 `cargo test -p smalux-protocol secure::tests::secure_psk_hkdf_test_vector_is_stable`，确认派生结果为 `a65b2aff12b67e9d25fae7094b24248133a043a1f2f2ba16157279806b2d62a2`。
 
+### Server 复用函数对照
+
+server 首版不要重新写 wire、frame 或加密细节。按下面顺序把 transport 收到的 bytes 逐层还原即可：
+
+| 阶段 | 输入 | 调用 | 输出 | 说明 |
+| --- | --- | --- | --- | --- |
+| WebSocket binary | WebSocket binary frame | `wire::decode_wire_packet(bytes)` | `WirePacket` | 先校验 magic/version/kind/长度；失败属于连接级错误 |
+| `binary_plain` 上行 | `WirePacket(kind=PlainData)` | 直接取 `packet.payload` | JSON bytes | 开发期可额外接受 text，但正式自有协议建议始终用 binary wire |
+| `secure_psk` hello | `WirePacket(kind=Hello)` | `secure::decode_secure_hello(&packet.payload)` | `key_id` + pattern | `key_id` 只能用于查 secret，不能单独当认证成功 |
+| `secure_psk` 握手 | server 保存的 secret | 查询 secret 后按本 crate 相同规则派生 PSK，调用 `secure::build_noise_responder()` | `HandshakeState` | Rust server 可以用同一套 secure 工具；其它语言必须复现 HKDF 参数 |
+| `secure_psk` 密文 | `WirePacket(kind=SecureData)` | `secure::decrypt_payload(&mut transport, &packet.payload)` | JSON bytes | 解密失败应关闭连接，不要降级到明文解析 |
+| JSON 上行 | JSON UTF-8 | `codec::decode_client_frame(text)` | `ClientFrame` | 再按 `ClientPayload` 分发 snapshot/delta/heartbeat 等 |
+| JSON 下行 | `ServerFrame` | `codec::encode_server_frame(&frame)` | JSON text | 下发前再按当前 wire mode 封成 `PlainData` 或 `SecureData` |
+| binary 下行 | JSON bytes | `WirePacket::plain_data()` / `WirePacket::secure_data()` + `wire::encode_wire_packet()` | WebSocket binary frame | `secure_psk` 需要先 `secure::encrypt_payload()` |
+
+解包后再进入业务分发，不要让 HTTP/WebSocket 入口直接修改数据库。推荐 server 层次是：
+
+```text
+transport adapter
+  -> wire / secure
+  -> codec::decode_client_frame()
+  -> ingest::handle_client_frame()
+  -> storage / query
+```
+
 ## 兼容边界
 
 - `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。

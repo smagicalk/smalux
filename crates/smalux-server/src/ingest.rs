@@ -1,3 +1,4 @@
-//! Agent 上报接入模块。
-//!
-//! 后续负责校验、接收、标准化 agent 上报的数据，再交给存储或事件流。
+//! 上报接入模块入口，负责组织 agent frame 解码、report 入库和状态更新流程。
+
+pub mod frame;
+pub mod report;

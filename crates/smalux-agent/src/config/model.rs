@@ -183,7 +183,9 @@ mod tests {
             r#"{
                 "log_file": "logs/server.log",
                 "log_retention_files": 1,
-                "log_max_size_mb": 1
+                "log_max_size_mb": 1,
+                "log_payload": true,
+                "log_payload_max_bytes": 1024
             }"#,
         )
         .unwrap_err();

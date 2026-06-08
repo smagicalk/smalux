@@ -38,7 +38,7 @@ pub(crate) use plan::{
     ExportDeliveryFailurePolicy, ExportDeliveryId, ExportDeliverySpec, ExportDeliveryTrigger,
     TransportId, TransportPlan, TransportRequest, TransportSpec,
 };
-pub(crate) use router::ExportRouter;
+pub(crate) use router::{ExportLogOptions, ExportRouter};
 pub(crate) use worker::{TransportEvent, TransportEventReceiver, transport_event_channel};
 
 #[cfg(test)]
@@ -103,11 +103,11 @@ mod tests {
         let endpoint = build_export_endpoint(
             "https://example.com",
             ExportEndpointScheme::WebSocket,
-            "/api/agents/connect",
+            "/agent/v1/connect",
         )
         .unwrap();
 
-        assert_eq!(endpoint, "wss://example.com/api/agents/connect");
+        assert_eq!(endpoint, "wss://example.com/agent/v1/connect");
     }
 
     /// 验证 base URL 不能使用 ws/wss endpoint。

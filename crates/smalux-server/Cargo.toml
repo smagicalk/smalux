@@ -4,35 +4,59 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = {version = "1.49.0",features = ["full"]}
-axum = {version = "0.8.8",features = ["default","http2","multipart","ws","macros"]}
-axum-extra = {version = "0.12.5",features = ["middleware"]}
-tower-http = {version = "0.6.8",features = []}
-tower = {version = "0.5.3",features = []}
-
-
+# 异步运行时，server 的网络、数据库和后台任务都基于 Tokio。
+tokio = { version = "1.52.3", features = ["full"] }
+# Tokio 扩展工具，用于 codec、IO 适配、超时和 stream 辅助。
+tokio-util = { version = "0.7.18", features = ["codec", "io", "io-util", "time", "rt"] }
+# HTTP/WebSocket 服务框架，后续用于 agent 接入、管理 API 和查询 API。
+axum = { version = "0.8.9", features = ["http2", "ws", "macros", "multipart"] }
+# axum 扩展能力，提供 typed header、cookie、typed routing、文件流、JSON Lines 等能力。
+axum-extra = { version = "0.12.6", features = ["async-read-body", "attachment", "cached", "cookie", "cookie-key-expansion", "cookie-private", "cookie-signed", "erased-json", "error-response", "file-stream", "form", "handler", "json-deserializer", "json-lines", "middleware", "multipart", "optional-path", "query", "routing", "scheme", "typed-header", "typed-routing", "with-rejection"] }
+# 通用 service 中间件，覆盖超时、限流、重试、buffer、load-shed、reconnect 等能力。
+tower = { version = "0.5.3", features = ["full"] }
+# HTTP 专用中间件，覆盖 trace、CORS、压缩、request id、静态文件、panic catch 等能力。
+tower-http = { version = "0.6.11", features = ["full"] }
+# Tower/axum 限流中间件，用于限制 API、agent 连接或高频控制请求。
+tower_governor = { version = "0.8.0", default-features = false, features = ["axum", "tracing"] }
+# Tower/axum session 中间件，后续管理后台登录态可以复用。
+tower-sessions = { version = "0.15.0", features = ["signed", "private"] }
+# 命令行参数解析，server 启动参数、环境变量读取和帮助信息使用。
+clap = { version = "4.6.1", features = ["derive", "env", "unicode", "wrap_help"] }
+# 序列化/反序列化基础能力，API DTO、数据库 JSON 和协议结构都会用到。
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = {version = "1.0.149"}
-
-sea-orm = {version = "2.0.0-rc.29",features = ["default","runtime-tokio-rustls","macros","sqlx-all"]}
-sea-query = {version = "1.0.0-rc.30",features = ["default","sea-orm","serde"]}
-
-tracing = {version = "0.1.44",features = ["log","std"]}
-tracing-subscriber = {version = "0.3.22",features = ["env-filter","json","local-time"]}
-
-config = {version = "0.15.19",features = ["default"]}
-dotenvy = {version = "0.15.7",features = []}
-
-
-anyhow = {version = "1.0.100",features = ["default"]}
-thiserror = {version = "2.0.18",features = ["default"]}
-
-sysinfo = {version = "0.38.0",features = []}
-reqwest = {version = "0.13.1",features = ["http2","rustls","multipart"]}
-
-tonic = {version = "0.14.2",features = ["default"]}
-prost = {version = "0.14.3",features = ["default"]}
-
-smalux-core = { path = "../smalux-core"}
+# JSON 编解码，HTTP API、agent 上报和配置 patch 都需要。
+serde_json = { version = "1.0.150" }
+# 结构化日志入口，server 日志和中间件 trace 使用。
+tracing = { version = "0.1.44", features = ["log", "std"] }
+# SeaORM 数据库 ORM，当前只启用 SQLite + Tokio/Rustls。
+sea-orm = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+# SeaORM 数据库迁移能力，关闭默认 CLI，只保留运行迁移所需能力。
+sea-orm-migration = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+# SQL 构建器，用于动态查询、迁移辅助和复杂 SQL 拼装。
+sea-query = { version = "1.0.1", default-features = false, features = ["derive", "backend-sqlite", "serde", "with-json", "with-chrono", "with-time", "with-uuid", "sea-orm"] }
+# 应用启动和顶层错误封装，适合 main/bootstrap 这类边界层。
+anyhow = { version = "1.0.102", features = ["default"] }
+# 领域错误和模块错误定义，适合 storage、ingest、http 等内部错误类型。
+thiserror = { version = "2.0.18", features = ["default"] }
+# async trait 支持，后续存储接口、服务接口需要 async 方法时使用。
+async-trait = { version = "0.1.89" }
+# Future/Stream/Sink 工具，WebSocket split、发送队列和异步组合会用到。
+futures-util = { version = "0.3.32", features = ["sink", "io"] }
+# 二进制 buffer 类型，wire frame、WebSocket binary 和 HTTP body 会用到。
+bytes = { version = "1.11.1" }
+# HTTP 标准类型，便于在 axum、tower 和自定义中间件之间共享类型。
+http = { version = "1.4.1" }
+# typed header 支持，认证 header、请求 header 和响应 header 可以强类型处理。
+headers = { version = "0.4.1" }
+# 请求 DTO 和配置 patch 校验，后续 API 层可以直接 derive Validate。
+validator = { version = "0.20.0", features = ["derive"] }
+# UUID 生成与序列化，用于 connection id、command id、task id 等服务端 ID。
+uuid = { version = "1.23.2", features = ["v4", "serde"] }
+# 时间处理与序列化，用于收包时间、过期时间、数据库字段和格式化。
+time = { version = "0.3.47", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
+# 敏感值包装，避免 token、secret、PSK 被 Debug 或日志误打印。
+secrecy = { version = "0.10.3", features = ["serde"] }
+# 项目通用核心库，复用日志、公共工具和跨 crate 类型。
+smalux-core = { path = "../smalux-core" }
+# 项目协议库，server 解包 ClientFrame、WirePacket 和 secure_psk 时复用。
 smalux-protocol = { path = "../smalux-protocol" }
-

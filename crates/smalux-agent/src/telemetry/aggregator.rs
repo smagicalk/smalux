@@ -73,8 +73,21 @@ impl TelemetryAggregator {
         let report = state.build_report(agent_version)?;
         let now = unix_timestamp_secs();
         let now_instant = Instant::now();
+        tracing::trace!(
+            has_last_report = self.last_report.is_some(),
+            last_report_sequence = self.last_report_sequence,
+            last_snapshot_sequence = self.last_snapshot_sequence,
+            delta_enabled = config.report.delta_enabled,
+            heartbeat_enabled = config.report.heartbeat_enabled,
+            "telemetry aggregator evaluating report policy"
+        );
 
         if self.should_send_snapshot(now_instant, config) {
+            tracing::trace!(
+                reason = snapshot_reason(self.last_report.is_some(), config.report.delta_enabled),
+                snapshot_interval_ms = config.report.snapshot_interval.as_millis(),
+                "telemetry aggregator selected snapshot"
+            );
             return Ok(Some(self.snapshot(
                 report,
                 now,
@@ -86,6 +99,16 @@ impl TelemetryAggregator {
         if config.report.delta_enabled
             && let Some(delta) = self.build_delta(&report, now)
         {
+            tracing::trace!(
+                base_sequence = delta.base_sequence,
+                identity_changed = delta.identity.is_some(),
+                core_changed = delta.core.is_some(),
+                disk_changed = delta.disk.is_some(),
+                network_changed = delta.network.is_some(),
+                processes_changed = delta.processes.is_some(),
+                sockets_changed = delta.sockets.is_some(),
+                "telemetry aggregator selected delta"
+            );
             return Ok(Some(self.delta(
                 report,
                 delta,
@@ -96,6 +119,11 @@ impl TelemetryAggregator {
         }
 
         if self.should_send_heartbeat(now_instant, config) {
+            tracing::trace!(
+                heartbeat_interval_ms = config.report.heartbeat_interval.as_millis(),
+                last_snapshot_sequence = self.last_snapshot_sequence,
+                "telemetry aggregator selected heartbeat"
+            );
             return Ok(Some(self.heartbeat(
                 &report,
                 now,
@@ -104,6 +132,7 @@ impl TelemetryAggregator {
             )));
         }
 
+        tracing::trace!("telemetry aggregator skipped report; no delta or heartbeat due");
         Ok(None)
     }
 
@@ -231,6 +260,17 @@ fn elapsed_at_least(previous_at: Option<Instant>, now: Instant, interval: Durati
     previous_at
         .map(|previous| now.duration_since(previous) >= interval)
         .unwrap_or(true)
+}
+
+/// 返回 snapshot 被选中的原因，方便 trace 日志解释聚合策略。
+fn snapshot_reason(has_last_report: bool, delta_enabled: bool) -> &'static str {
+    if !has_last_report {
+        "initial_report"
+    } else if !delta_enabled {
+        "delta_disabled"
+    } else {
+        "snapshot_interval_due"
+    }
 }
 
 /// 用 serde JSON 值比较两个上报片段，避免要求所有模型派生 PartialEq。

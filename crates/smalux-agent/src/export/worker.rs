@@ -212,10 +212,19 @@ async fn transport_worker_loop(
     while let Some(command) = command_rx.recv().await {
         match command {
             TransportWorkerCommand::Connect { result_tx } => {
+                tracing::trace!(
+                    transport = id.as_str(),
+                    connected,
+                    "transport worker connect command received"
+                );
                 let result = connect_client(id, &mut client, &mut connected).await;
                 let _ = result_tx.send(result);
             }
             TransportWorkerCommand::SetInboundHandler { handler, result_tx } => {
+                tracing::trace!(
+                    transport = id.as_str(),
+                    "transport worker inbound handler update command received"
+                );
                 let result = client.set_inbound_handler(handler).await;
                 let _ = result_tx.send(result);
             }
@@ -224,6 +233,7 @@ async fn transport_worker_loop(
                 sequence,
                 request,
             } => {
+                trace_worker_request(id, delivery, sequence, &request);
                 let result = send_worker_request(id, &mut client, &mut connected, request).await;
                 let event = match result {
                     Ok(()) => TransportEvent::Sent {
@@ -238,6 +248,7 @@ async fn transport_worker_loop(
                         error: error.to_string(),
                     },
                 };
+                trace_worker_event(&event);
 
                 if event_tx.send(event).await.is_err() {
                     tracing::warn!(
@@ -248,6 +259,11 @@ async fn transport_worker_loop(
                 }
             }
             TransportWorkerCommand::Shutdown { result_tx } => {
+                tracing::trace!(
+                    transport = id.as_str(),
+                    connected,
+                    "transport worker shutdown command received"
+                );
                 let result = close_client(&mut client, &mut connected).await;
                 let _ = result_tx.send(result);
                 break;
@@ -265,6 +281,11 @@ async fn connect_client(
     connected: &mut bool,
 ) -> anyhow::Result<()> {
     if *connected {
+        tracing::trace!(
+            transport = id.as_str(),
+            protocol = client.protocol().as_str(),
+            "export transport already connected"
+        );
         return Ok(());
     }
 
@@ -284,9 +305,11 @@ async fn close_client(
     connected: &mut bool,
 ) -> anyhow::Result<()> {
     if !*connected {
+        tracing::trace!("export transport close skipped; already disconnected");
         return Ok(());
     }
 
+    tracing::trace!("export transport closing");
     client.close().await?;
     *connected = false;
     Ok(())
@@ -306,6 +329,11 @@ async fn send_worker_request(
             ExportTransportClient::WebSocket(transport),
             TransportRequest::WebSocketText { body, .. },
         ) => {
+            tracing::trace!(
+                transport = id.as_str(),
+                body_bytes = body.len(),
+                "transport worker sending websocket text request"
+            );
             transport
                 .send_encoded_transport_message(EncodedTransportMessage::Text(body))
                 .await
@@ -314,6 +342,12 @@ async fn send_worker_request(
             ExportTransportClient::WebSocket(transport),
             TransportRequest::WebSocketBinary { sequence, body, .. },
         ) => {
+            tracing::trace!(
+                transport = id.as_str(),
+                sequence,
+                body_bytes = body.len(),
+                "transport worker sending websocket binary request"
+            );
             transport
                 .send_encoded_transport_message(EncodedTransportMessage::Binary { sequence, body })
                 .await
@@ -323,7 +357,15 @@ async fn send_worker_request(
             TransportRequest::HttpJson {
                 method, url, body, ..
             },
-        ) => transport.send_json(method, &url, &body).await,
+        ) => {
+            tracing::trace!(
+                transport = id.as_str(),
+                method = method.as_str(),
+                body_bytes = body.to_string().len(),
+                "transport worker sending http json request"
+            );
+            transport.send_json(method, &url, &body).await
+        }
         (transport, request) => {
             anyhow::bail!(
                 "transport request does not match transport: transport={}, request={}",
@@ -331,5 +373,49 @@ async fn send_worker_request(
                 request.transport_id().as_str()
             )
         }
+    }
+}
+
+/// 记录 worker 收到的发送请求，不输出请求体。
+fn trace_worker_request(
+    transport: TransportId,
+    delivery: ExportDeliveryId,
+    sequence: u64,
+    request: &TransportRequest,
+) {
+    tracing::trace!(
+        transport = transport.as_str(),
+        delivery = delivery.as_str(),
+        sequence,
+        request_transport = request.transport_id().as_str(),
+        "transport worker send command received"
+    );
+}
+
+/// 记录 worker 产生的发送结果事件。
+fn trace_worker_event(event: &TransportEvent) {
+    match event {
+        TransportEvent::Sent {
+            transport,
+            delivery,
+            sequence,
+        } => tracing::trace!(
+            transport = transport.as_str(),
+            delivery = delivery.as_str(),
+            sequence,
+            "transport worker produced sent event"
+        ),
+        TransportEvent::Failed {
+            transport,
+            delivery,
+            sequence,
+            error,
+        } => tracing::trace!(
+            transport = transport.as_str(),
+            delivery = delivery.as_str(),
+            sequence,
+            error,
+            "transport worker produced failed event"
+        ),
     }
 }

@@ -62,6 +62,37 @@ src/
   export/komari/   # Komari model、URL、server message、terminal/exec 消息解析
 ```
 
+## 代码阅读路线
+
+第一次阅读 agent 代码时建议按“入口 -> 数据生成 -> 数据发送 -> 入站控制 -> 远程能力”的顺序看，不要从某个长文件随机跳入：
+
+1. `src/main.rs`
+   - 只做启动装配：CLI、日志、`ConfigManager` 和 `service::run()`。
+   - 如果启动参数行为不符合预期，先看 `src/config/cli/args.rs` 和 `src/config/cli/startup.rs`。
+2. `src/service.rs`
+   - 看 `run()` 如何创建队列、启动 `export_supervisor()`、`collector_loop()`、`public_ip_refresh_loop()` 和 `reporter_loop()`。
+   - 这里只看生命周期，具体业务细节继续进入子模块。
+3. `src/service/collector.rs` + `src/collect.rs`
+   - `collector_loop()` 决定什么时候采样。
+   - `LocalCollector` 和 `collect/*` 决定采样内容如何映射成内部 sample。
+4. `src/service/reporter.rs` + `src/telemetry/*`
+   - `reporter_loop()` 是 latest telemetry 的唯一拥有者。
+   - `TelemetryAggregator` 决定本次发送 `snapshot`、`delta`、`heartbeat`，还是跳过。
+5. `src/service/export.rs` + `src/export/*`
+   - `export_supervisor()` 消费出站事件，维护最新 report、pending 即时事件和重连恢复。
+   - `ProtocolAdapter` 只做格式转换，`TransportHub` 只做 transport 投递。
+6. `src/service/message/*`
+   - `SmaluxControlHandler` 把自有 `ServerFrame` 转成 `InboundCommand`。
+   - `ControlDispatcher` 执行配置更新、一次性诊断、远程 task/probe/shell，并回 `ack/error`。
+7. `src/service/remote/*`
+   - `task.rs` 是非交互命令执行。
+   - `probe.rs` 是远程网络探测。
+   - `shell/*` 是交互式 PTY 和临时 stream 桥接。
+8. `src/export/komari/*`
+   - Komari 兼容集中放这里；删除或替换第三方兼容时优先从这个目录和 `export/komari.rs` 入手。
+
+排查运行问题时可以先按日志里的关键词定位：`collector` 看采样，`reporter` 看是否生成 report，`export` 看是否投递，`websocket wire` 看二进制封包和 `secure_psk`，`control` 看 server 下发命令调度。
+
 ## 扩展边界
 
 这一节不是描述“当前实现细节”，而是约束后续扩展时应该把代码放在哪里、哪些扩展点允许扩、哪些耦合暂时保留。
@@ -229,6 +260,8 @@ CliArgs::parse()
 | `log_file` | `logs/smalux-agent.log` | `--log-file` / `-l` | 不支持 | 日志文件路径，启动时初始化 tracing |
 | `log_retention_files` | `14` | `--log-retention-files` / `-L` | 不支持 | 保留最近 N 个滚动日志文件，必须大于 0 |
 | `log_max_size_mb` | `64` | `--log-max-size-mb` | 不支持 | 单个日志文件最大大小，单位 MB，必须大于 0 |
+| `log_payload` | `false` | `--log-payload true|false` | 不支持 | 是否允许 `trace` 日志打印截断、脱敏后的实际导出 payload 预览；仍可能包含非敏感上报数据 |
+| `log_payload_max_bytes` | `4096` | `--log-payload-max-bytes` | 不支持 | 实际 payload 日志预览最大原始字节数，必须大于 0 |
 
 导出连接参数：
 
@@ -356,6 +389,8 @@ CliArgs::parse()
   "log_file": "logs/smalux-agent.log", // 日志文件路径；仅启动初始化 tracing 时生效
   "log_retention_files": 14, // 保留最近 N 个滚动日志文件，必须大于 0
   "log_max_size_mb": 64, // 单个日志文件最大大小，单位 MB，必须大于 0
+  "log_payload": false, // 是否允许 trace 日志打印截断、脱敏后的实际导出 payload 预览；仅启动时生效
+  "log_payload_max_bytes": 4096, // 实际 payload 日志预览最大原始字节数，必须大于 0
   "core": {
     "enabled": true, // 是否采集 CPU / memory / load
     "interval": "1s" // 核心指标采样间隔
@@ -729,9 +764,18 @@ Komari 兼容约束：
 - WebSocket 模式收到 `{ "message": "ping", "ping_task_id": 123, "ping_type": "tcp", "ping_target": "host:443" }` 时，会转换成内部 `remote_probe`。默认不发包并回 `value=-1`；server 可通过 `config_patch.remote_probe.enabled=true` 动态开启，频率受 `remote_probe.global_min_interval` 和 `remote_probe.target_min_interval` 限制。
 - 重复敏感 query 参数会被拒绝，例如 `export.query` 已经包含 `token=...` 时不要再同时使用 `-a query -t ...`。
 
-`log_file`、`log_retention_files` 和 `log_max_size_mb` 只在启动阶段生效，不接受 server patch。当前 `tracing` subscriber 初始化后不会热切换日志文件、保留数量或大小阈值；如果后续确实需要热切换日志，需要单独设计 reloadable writer。
+`log_file`、`log_retention_files`、`log_max_size_mb`、`log_payload` 和 `log_payload_max_bytes` 只在启动阶段生效，不接受 server patch。当前 `tracing` subscriber 初始化后不会热切换日志文件、保留数量或大小阈值；payload 日志也不会由 server 动态开启，避免远端把敏感内容写入本机日志。如果后续确实需要热切换日志，需要单独设计 reloadable writer。
 
 日志文件使用 `tracing-rolling-file` 滚动，并通过 `tracing_appender::non_blocking` 后台线程写入，避免业务路径直接阻塞在磁盘 IO。滚动条件是“按天”或“当前文件达到 `log_max_size_mb` MB”，任一条件满足都会切换文件；当前文件使用 `log_file` 路径，历史文件使用 `log_file.1`、`log_file.2` 这种序号后缀。默认保留最近 `14` 个滚动文件，单文件默认 `64MB`。`log_retention_files` 和 `log_max_size_mb` 都必须大于 0。
+
+默认日志不会打印实际导出请求体，只记录 `body_bytes`、delivery、transport、sequence 等元信息。需要排查协议内容时同时满足两个条件才会输出实际 payload 预览：
+
+1. `RUST_LOG` 打开到对应模块的 `trace`，例如 `RUST_LOG=smalux_agent=trace`。
+2. 启动参数显式传入 `--log-payload true`，并可用 `--log-payload-max-bytes 4096` 控制预览上限。
+
+payload 预览会标出 `kind`、`encoding`、原始 `bytes`、`redacted`、`truncated` 和 `preview`。JSON 会递归按字段名脱敏，文本会按常见 `key=value` / `key: value` 关键词脱敏，UTF-8 二进制如果能解析为 JSON 也会先按 JSON 脱敏；无法识别的二进制仍只按 base64 预览。当前敏感字段包括 `token`、`access_token`、`authorization`、`password`、`secret`、`api_key`、`private_key`、`psk`、`command`、`stdout`、`stderr`，并会对 shell stream 的 `data` 和 Komari task result 的 `result` 做上下文脱敏。开启后仍可能包含非敏感 telemetry JSON 或第三方兼容 payload，生产环境建议只在短时间排障时开启。
+
+脱敏实现位于 `smalux-core::utils::redact`，并通过 `smalux_core::log` re-export 常用入口。server 需要记录请求或协议 payload 时可以直接复用 `smalux_core::log::redact_sensitive_json()`、`redact_sensitive_json_text()`、`redact_sensitive_json_bytes()` 和 `redact_sensitive_text()`，避免 agent/server 使用不同规则。
 
 未通过 `--agent-id` 或 `SMALUX_AGENT_ID` 显式设置时，agent 会在本次进程启动时生成一个 UUID v4。当前没有本地持久化 ID，因此重启后会得到新的默认 ID；生产环境如果需要同一台机器长期稳定识别，应显式传入 `--agent-id` 或设置 `SMALUX_AGENT_ID`。
 
@@ -741,7 +785,7 @@ service 层只依赖 `ExportRouter` 和 `TransportHub`，不直接依赖 `WebSoc
 
 当前已实现的组合：
 
-- `smalux_json`：用户配置 `http` / `https` 根地址，adapter 派生主 WebSocket endpoint `/api/agents/connect`；上报通过 binary wire 发送，server 控制消息由 `SmaluxControlHandler` 解析。
+- `smalux_json`：用户配置 `http` / `https` 根地址，adapter 派生主 WebSocket endpoint `/agent/v1/connect`；上报通过 binary wire 发送，server 控制消息由 `SmaluxControlHandler` 解析。
 - `komari`：用户配置 `http` / `https` 根地址，adapter 派生 Komari 固定路径；实时 report 走 WebSocket `/api/clients/report`，basic info 走 HTTP `/api/clients/uploadBasicInfo`，exec 结果走 HTTP `/api/clients/task/result`，terminal 走 WebSocket `/api/clients/terminal`，ping result 走实时 WebSocket。
 
 后续新增 gRPC 等协议时应增加 transport spec 和 driver；新增第三方兼容格式时应增加 adapter，而不是改 service 生命周期逻辑。
@@ -926,7 +970,7 @@ server 侧 secure_psk 最小实现步骤：
 自己写 server 时，先按最小闭环实现，不需要一次做完全部功能：
 
 ```text
-1. WebSocket /api/agents/connect 接入
+1. WebSocket /agent/v1/connect 接入
    -> binary_plain 按 export.auth_mode 校验 none/query/bearer
    -> secure_psk 要求 export.auth_mode=none，后续 Noise 握手成功才算认证通过
    -> 如果 export.wire_mode=binary_plain，只接收 WebSocket binary frame
@@ -961,13 +1005,13 @@ server 侧 secure_psk 最小实现步骤：
 
 delta 合并规则要简单：server 不做字段级深度合并。`snapshot` 覆盖完整状态；`delta` 出现哪个顶层采样组，就整体覆盖该采样组；采样组为 `null` 时清空该组。server 如果没有对应 `base_sequence`，直接发 `snapshot_request`，不要尝试猜测补齐。
 
-server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_max_size_mb`、`diagnostics.*`、`remote_shell.enabled` 和 `remote_task.enabled` 都不是 server 可动态打开的字段；`remote_probe.enabled` 可以动态开启，但 agent 本地仍会用 `global_min_interval` 和 `target_min_interval` 做频率保护。
+server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_max_size_mb`、`log_payload`、`log_payload_max_bytes`、`diagnostics.*`、`remote_shell.enabled` 和 `remote_task.enabled` 都不是 server 可动态打开的字段；`remote_probe.enabled` 可以动态开启，但 agent 本地仍会用 `global_min_interval` 和 `target_min_interval` 做频率保护。
 
 ### Server 最小实现 Checklist
 
 第一版 server 只要完成下面这些，就能和当前 agent 跑通自有协议闭环：
 
-- `WebSocket /api/agents/connect`：接受 agent 主连接；`binary_plain` 按 `export.auth_mode` 校验 `none` / query token / bearer token，`secure_psk` 要求 `auth_mode=none` 并通过 Noise 握手认证。
+- `WebSocket /agent/v1/connect`：接受 agent 主连接；`binary_plain` 按 `export.auth_mode` 校验 `none` / query token / bearer token，`secure_psk` 要求 `auth_mode=none` 并通过 Noise 握手认证。
 - `WirePacket`：读取固定头，校验 magic、version、kind、sequence、payload_len；开发期至少实现 `PlainData`，正式加密模式实现 `Hello`、`Handshake` 和 `SecureData`。
 - `secure_psk`：保存 `key_id -> secret`；收到 Hello 后按 `key_id` 查 secret，用同样 HKDF-SHA256 派生 PSK，并作为 Noise responder 返回 handshake message。
 - `ClientFrame` 解析：payload JSON 先按 `protocol_version` 和 `type` 分发；不认识的 `type` 记录日志并忽略，不要断开主连接。
@@ -1183,7 +1227,7 @@ server 想确认 patch 是否生效，可以按字段类型观察：
 | `outbound.realtime_report` | 支持部分字段 | delivery 字段级 | server 只能更新 `enabled` 和 `send_on_start`；发送节奏由 latest report 触发 |
 | `outbound.basic_info` | 支持 | delivery 字段级 | 可以只更新 `enabled`、`refresh_interval` 或 `send_on_start` 其中一个字段；当前主要由 Komari adapter 使用 |
 | `agent_id` / `public_ip.required_for_first_report` / `public_ip.retry_interval` / `export.unsafe_cert` | 不支持 server 部分更新 | startup-only 或安全敏感配置 | 只能通过 CLI 或默认值在启动时设置，不在 patch 模型中 |
-| `log_file` / `log_retention_files` / `log_max_size_mb` | 不支持 server 部分更新 | startup-only 日志配置 | 只能通过 CLI 或默认值在启动时设置，不在 patch 模型中 |
+| `log_file` / `log_retention_files` / `log_max_size_mb` / `log_payload` / `log_payload_max_bytes` | 不支持 server 部分更新 | startup-only 日志配置 | 只能通过 CLI 或默认值在启动时设置，不在 patch 模型中；payload 日志不会被 server 动态开启 |
 | `diagnostics` / `remote_shell.enabled` / `remote_task.enabled` | 不支持 server 部分更新 | CLI-only 静态能力 | 只能启动时设置，server patch 不能打开或修改 |
 | `remote_shell.max_sessions` / `remote_shell.idle_timeout` / `remote_shell.session_timeout` / `remote_shell.program` / `remote_task.*` | 支持 | 配置字段级 | CLI 可作为启动初始值，server patch 可动态调整运行限制；remote task 启用开关仍是 CLI-only |
 | `remote_probe.*` | 支持 | 配置字段级 | 默认关闭；CLI 可作为启动初始值，server patch 可动态开启、关闭和调整频率保护 |
@@ -1222,6 +1266,8 @@ main()
      -> reporter command channel
      -> export_supervisor(outbound_rx)
         -> build_protocol_adapter()
+        -> ExportLogOptions(config.log_payload, config.log_payload_max_bytes)
+        -> ExportRouter(adapter, log_options)
         -> adapter.transport_plan()
         -> TransportPlan::apply_outbound_config(config.outbound)
         -> TransportHub
