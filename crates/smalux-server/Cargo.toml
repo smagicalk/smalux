@@ -28,12 +28,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150" }
 # 结构化日志入口，server 日志和中间件 trace 使用。
 tracing = { version = "0.1.44", features = ["log", "std"] }
-# SeaORM 数据库 ORM，当前只启用 SQLite + Tokio/Rustls。
-sea-orm = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+# SeaORM 数据库 ORM，支持 SQLite / PostgreSQL / MySQL + Tokio/Rustls。
+sea-orm = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SeaORM 数据库迁移能力，关闭默认 CLI，只保留运行迁移所需能力。
-sea-orm-migration = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+sea-orm-migration = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SQL 构建器，用于动态查询、迁移辅助和复杂 SQL 拼装。
-sea-query = { version = "1.0.1", default-features = false, features = ["derive", "backend-sqlite", "serde", "with-json", "with-chrono", "with-time", "with-uuid", "sea-orm"] }
+sea-query = { version = "1.0.1", default-features = false, features = ["derive", "backend-sqlite", "backend-postgres", "backend-mysql", "serde", "with-json", "with-chrono", "with-time", "with-uuid", "sea-orm"] }
 # 应用启动和顶层错误封装，适合 main/bootstrap 这类边界层。
 anyhow = { version = "1.0.102", features = ["default"] }
 # 领域错误和模块错误定义，适合 storage、ingest、http 等内部错误类型。

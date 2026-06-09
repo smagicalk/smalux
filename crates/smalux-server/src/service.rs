@@ -2,4 +2,6 @@
 
 pub mod agent;
 pub mod command;
+pub mod connection;
 pub mod dashboard;
+pub mod event;

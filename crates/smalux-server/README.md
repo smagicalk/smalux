@@ -16,39 +16,46 @@
 
 ```text
 src/
-  main.rs      # 最小可编译入口，当前只包含 fn main() {}
-  cli/         # server 启动参数、环境变量和命令行默认值解析
-    args/      # clap 参数结构和启动输入解析规则
-  config/      # server 运行配置模型、默认值和校验
-    model/     # 配置模型、默认值和校验
-  auth/        # agent 认证、secure_psk 识别、管理后台 session 和授权边界
-    agent/     # agent token、key_id、secure_psk 认证
-    session/   # 管理后台 session 和用户登录态
-  http/        # axum router、REST API、agent 接入、前端实时通道、静态前端资源和中间件
-    router/    # REST、agent 接入、前端实时通道、静态资源和中间件的路由组合
-    rest/      # 前端 REST API handler 和 route 组织
-    agent/     # agent WebSocket upgrade、连接生命周期和控制帧发送
-    realtime/  # 前端 dashboard live update、事件订阅和管理端实时反馈
-    frontend/  # 静态前端资源、SPA fallback 和前端入口页面服务
-    middleware/# axum/tower middleware，例如 trace、CORS、限流、request id
-  ingest/      # agent 上报接入、协议分发和校验
-    frame/     # ClientFrame/ServerFrame 分发和序列号语义
-    report/    # AgentReport snapshot/delta/heartbeat 校验与应用
-  storage/     # 持久化接口、内存状态和数据库适配
-    entity/    # SeaORM entity
-    migration/ # SeaORM migration
-    repository/# latest state、pending command、remote result 仓储
-  service/     # server 后台服务编排、连接状态和控制命令调度
-    agent/     # agent 连接注册、在线状态和 latest 状态协调
-    dashboard/ # dashboard 聚合状态、摘要指标和前端展示数据
-    command/   # server 下发命令、ack/error、超时和幂等处理
+  main.rs          # 最小入口，声明模块并交给 bootstrap 启动
+  bootstrap.rs     # 启动编排：日志、CLI、配置、数据库、HTTP server
+  state.rs         # axum handler 和后台服务共享的 AppState
+  cli/             # server 启动参数、环境变量和命令行默认值解析
+    args/          # clap 参数结构
+  config/          # server 运行配置模型、默认值和校验
+    defaults/      # 默认值常量
+    model/         # 配置模型
+    validation/    # 配置校验
+  auth/            # agent 认证、secure_psk 识别、管理后台 session 和授权边界
+    agent/         # agent token、key_id、secure_psk 认证
+    session/       # 管理后台 session 和用户登录态
+  http/            # axum router、REST API、agent 接入、前端实时通道、静态前端资源和中间件
+    router/        # REST、agent 接入、前端实时通道、静态资源和中间件的路由组合
+    rest/          # 前端 REST API handler 和 route 组织
+    agent/         # agent WebSocket upgrade、连接生命周期和控制帧发送
+    realtime/      # 前端 dashboard live update、事件订阅和管理端实时反馈
+    frontend/      # 静态前端资源、SPA fallback 和前端入口页面服务
+    middleware/    # axum/tower middleware，例如 trace、CORS、限流、request id
+  ingest/          # agent 上报接入、协议分发和校验
+    frame/         # ClientFrame/ServerFrame 分发和序列号语义
+    report/        # AgentReport snapshot/delta/heartbeat 校验与应用
+  storage/         # 持久化接口、内存状态和数据库适配
+    entity/        # SeaORM entity
+    memory/        # 内存存储，用于首版开发和测试
+    migration/     # SeaORM migration
+    repository/    # latest state、pending command、remote result 仓储
+  service/         # server 后台服务编排、连接状态和控制命令调度
+    agent/         # agent 连接注册、在线状态和 latest 状态协调
+    connection/    # 在线连接 registry、连接替换、下行队列和断开清理
+    dashboard/     # dashboard 聚合状态、摘要指标和前端展示数据
+    command/       # server 下发命令、ack/error、超时和幂等处理
+    event/         # dashboard 实时事件和内部状态变化事件
 ```
 
 ## 当前 crate 依赖配置
 
 `smalux-server` 现在先只配置后续 server 会用到的相关 crate，模块内部暂时保持骨架。版本按当前已确认的 crates.io / `cargo info` 最新可用版本固定，避免未来自动跳版本带来不可控变化。
 
-这次配置的目标是“server 基础设施尽量一次配全”：HTTP/WebSocket、Tower 中间件、限流、会话、SQLite ORM、迁移、协议复用、错误处理、时间、ID、校验和密钥包装都先放进 crate；认证方案、OpenAPI、gRPC、密码哈希、外部 API 客户端这些会绑定业务设计，暂时不硬塞进来。
+这次配置的目标是“server 基础设施尽量一次配全”：HTTP/WebSocket、Tower 中间件、限流、会话、数据库 ORM、迁移、协议复用、错误处理、时间、ID、校验和密钥包装都先放进 crate；认证方案、OpenAPI、gRPC、密码哈希、外部 API 客户端这些会绑定业务设计，暂时不硬塞进来。
 
 - `tokio 1.52.3`: 异步运行时。
 - `tokio-util 0.7.18`: stream、codec、IO 适配、超时工具。
@@ -61,9 +68,9 @@ src/
 - `clap 4.6.1`: 后续启动参数解析，启用 `derive`、`env`、`unicode`、`wrap_help`。
 - `serde 1.0.228` / `serde_json 1.0.150`: 后续 JSON API 和协议辅助。
 - `tracing 0.1.44`: server 运行日志。
-- `sea-orm 2.0.0-rc.40`: server 数据库 ORM，当前按 SQLite + Tokio/Rustls 配置；这是当前 crates.io 可搜索到的最新可用版本，但属于 RC，不是稳定线。
-- `sea-orm-migration 2.0.0-rc.40`: SeaORM 迁移能力，关闭默认 CLI feature，只保留 Tokio/Rustls + SQLite 迁移运行能力。
-- `sea-query 1.0.1`: 后续手写动态 SQL、迁移辅助或复杂查询构建时使用，当前只开 SQLite 后端。
+- `sea-orm 2.0.0-rc.40`: server 数据库 ORM，当前按 SQLite / PostgreSQL / MySQL + Tokio/Rustls 配置；这是当前 crates.io 可搜索到的最新可用版本，但属于 RC，不是稳定线。
+- `sea-orm-migration 2.0.0-rc.40`: SeaORM 迁移能力，关闭默认 CLI feature，只保留 Tokio/Rustls + SQLite / PostgreSQL / MySQL 迁移运行能力。
+- `sea-query 1.0.1`: 后续手写动态 SQL、迁移辅助或复杂查询构建时使用，当前开启 SQLite / PostgreSQL / MySQL query backend。
 - `anyhow 1.0.102` / `thiserror 2.0.18`: 启动错误和后续领域错误建模。
 - `async-trait 0.1.89`: 后续存储 trait、服务 trait 需要 async 方法时使用。
 - `futures-util 0.3.32`: WebSocket split/sink/stream 等异步组合工具。
@@ -76,14 +83,63 @@ src/
 - `smalux-core`: 复用日志初始化和通用工具。
 - `smalux-protocol`: 后续 server 解包 `ClientFrame`、wire packet 和 `secure_psk` 时复用协议实现。
 
-数据库依赖现在只按 SQLite 驱动收敛，没有启用 `sqlx-all`，也没有启用 SQLx 的 MySQL/Postgres 驱动。SeaORM 自身会给 `sea-query` 开多个 SQL 方言的 query builder backend，这是 SeaORM 内部建模能力，不等于启用了多个数据库驱动。当前依赖树已经确认 `sqlx-mysql`、`sqlx-postgres`、`tonic` 都没有被 `smalux-server` 拉入。
+数据库依赖当前支持 SQLite、PostgreSQL 和 MySQL，对应 `database_url` 可使用 `sqlite://`、`postgres://`、`postgresql://` 或 `mysql://`。没有启用 `sqlx-all`，也没有引入 gRPC/Tonic。
 
 暂时没有把 gRPC、系统采集类依赖、OpenAPI、密码哈希、外部 HTTP client 作为 server 直接依赖。原因是这些依赖会强绑定后续功能边界：gRPC 要看是否真的做独立传输协议，OpenAPI 要看 API 文档生成方式，密码哈希要等管理后台认证模型确定，外部 HTTP client 要等 server 是否主动调用第三方服务。后续需要时再加，比提前把业务方向锁死更稳。
 
 `tower-sessions-sqlx-store` 和 `tower-sessions-seaorm-store` 也暂时没有加入：前者当前最新版本依赖的 `tower-sessions-core` 版本和 `tower-sessions 0.15.0` 不一致，后者版本较早且默认偏 Postgres。首版可以先用 `tower-sessions` 的内存 store 跑通管理后台登录态；如果要持久化 session，建议等 session 表结构确定后自己用 SeaORM 写 store 或等待生态版本对齐。
 
+## CLI 参数设计
+
+server CLI 只负责 server 进程启动时必须确定的静态运行环境，不负责 agent 凭据、agent 能力或管理端业务权限。agent token/key 在“添加 agent”流程中动态生成并写入数据库；remote task、remote shell、remote probe 是 agent 能力和管理端授权问题，不放到 server 启动参数里。
+
+当前参数：
+
+| 参数 | 短参数 | 环境变量 | 默认值 | 作用 |
+| --- | --- | --- | --- | --- |
+| `--bind <ADDR>` | `-b` | `SMALUX_SERVER_BIND` | `127.0.0.1:3000` | HTTP 监听地址，必须是 `SocketAddr` 格式 |
+| `--database-url <URL>` | `-d` | `SMALUX_SERVER_DATABASE_URL` | `sqlite://smalux-server.db` | 数据库连接地址，支持 `sqlite://`、`postgres://`、`postgresql://`、`mysql://` |
+| `--serve-frontend [true|false]` | 无 | `SMALUX_SERVER_SERVE_FRONTEND` | `false` | 是否由 server 托管前端静态资源；只传 `--serve-frontend` 等价于 `true` |
+| `--frontend-dir <PATH>` | 无 | `SMALUX_SERVER_FRONTEND_DIR` | `apps/smalux-web/dist` | 未编译内置前端资源时，server 托管的前端构建目录 |
+| `--frontend-spa-fallback <true|false>` | 无 | `SMALUX_SERVER_FRONTEND_SPA_FALLBACK` | `true` | 是否为 React/Vite SPA 启用 `index.html` fallback |
+| `--log-file <PATH>` | 无 | `SMALUX_SERVER_LOG_FILE` | `logs/smalux-server.log` | server 滚动日志文件路径 |
+| `--log-retention-files <N>` | `-L` | `SMALUX_SERVER_LOG_RETENTION_FILES` | `14` | 保留最近 N 个滚动日志文件，必须大于 0 |
+| `--log-max-size-mb <MB>` | 无 | `SMALUX_SERVER_LOG_MAX_SIZE_MB` | `64` | 单个滚动日志文件最大大小，单位 MB，必须大于 0 |
+
+日志级别只使用 Rust 生态通用的 `RUST_LOG`，不再额外增加 server 专用日志级别参数：
+
+```powershell
+$env:RUST_LOG="smalux_server=debug,smalux_protocol=debug"
+cargo run -p smalux-server -- --bind 127.0.0.1:3000
+```
+
+常用启动示例：
+
+```powershell
+# 只启动 API 和 agent 接入，不托管前端。
+cargo run -p smalux-server -- --bind 127.0.0.1:3000
+
+# 使用 SQLite，并托管 Vite/React 构建后的前端目录。
+cargo run -p smalux-server -- -b 0.0.0.0:3000 -d sqlite://smalux-server.db --serve-frontend --frontend-dir apps/smalux-web/dist
+
+# 使用 PostgreSQL。
+cargo run -p smalux-server -- -d postgres://user:password@127.0.0.1:5432/smalux
+
+# 使用 MySQL。
+cargo run -p smalux-server -- -d mysql://user:password@127.0.0.1:3306/smalux
+```
+
+暂时不要加入到 server CLI 的内容：
+
+- `agent_token`、`agent_token_file`、`secure_key_file`：由添加 agent 流程动态生成并存库。
+- `allow_remote_task`、`allow_remote_shell`、`allow_remote_probe`：这是 agent 启动能力和管理端权限，不是 server 启动配置。
+- `max_agent_connections`、`max_request_body_bytes`、队列容量：等连接 registry、HTTP middleware 或 command queue 真正实现时再按行为加配置，避免 CLI 先承诺不存在的功能。
+- `public_base_url`：server 当前不需要运行时拼外部访问地址；前端或部署层需要时再单独设计。
+
 ## 后续接入点
 
+- `bootstrap.rs`: 串联启动流程，避免 `main.rs` 堆积启动细节。
+- `state.rs`: 定义共享 `AppState`，集中持有配置、存储、连接 registry 和事件通道。
 - `cli/`: 定义 server 启动参数、环境变量和命令行默认值解析。
 - `config/`: 定义 server 运行配置模型、默认值和校验。
 - `auth/`: 处理 agent 认证、secure key 查找、管理后台 session 和权限边界。
@@ -98,7 +154,7 @@ src/
 - `auth/` 只处理身份和权限：token/key 查找、secure_psk 认证、session、控制权限判定。
 - `ingest/` 只处理协议语义：decode `ClientFrame`、校验、snapshot/delta/heartbeat 分发、控制响应关联。
 - `storage/` 只处理持久化：latest state、pending command、remote task/probe result，不直接依赖 axum。
-- `cli/` 只处理启动输入，例如监听地址、数据库路径、wire mode、token/secret 加载方式的命令行或环境变量来源。
+- `cli/` 只处理 server 启动输入，例如监听地址、数据库连接地址和前端托管选项；agent token/key 由添加 agent 流程动态生成并存库，不从 CLI 传入。
 - `config/` 只放运行配置模型、默认值和校验，不直接依赖 clap。
 - `service/` 只做服务级编排，例如连接注册、命令投递、latest 读取、dashboard 聚合、后台清理和状态协调。
 
@@ -132,8 +188,9 @@ server 同时服务 agent、前端 REST 和前端实时连接时，最容易混�
 server 还没正式实现时，优先把“能连接、能解包、能保存最新 snapshot”跑通。建议按下面顺序写：
 
 1. `cli/`
-   - 定义监听地址、数据库路径、允许的 wire mode、开发期 token 或 `key_id -> secret` 加载方式的启动输入。
+   - 定义监听地址、数据库连接地址、前端托管和日志滚动相关的启动输入。
    - 只负责把命令行和环境变量解析成启动输入，不直接做数据库连接或 HTTP 启动。
+   - 不放 agent token、secure key、wire mode 或 remote 能力开关；这些属于 agent 登记记录、连接认证和管理端业务配置。
 2. `config/`
    - 定义运行配置模型、默认值和校验，把 CLI 启动输入转换成稳定配置。
    - 不在这里放 agent 上报 JSON 结构，JSON 结构来自 `smalux-protocol` 和 `smalux-core`。
@@ -166,19 +223,17 @@ server 还没正式实现时，优先把“能连接、能解包、能保存最�
 
 Rust server 不直接运行 React 源码。React/Vite 前端应先构建成静态资源，再由 server 按配置选择是否服务这些资源。这样可以同时支持开发期前后端独立运行和生产期整体部署。
 
-建议后续在配置模型中使用枚举，而不是让用户手写随意字符串：
+前端是否内嵌由编译 feature 决定，运行时不需要 `embedded` 模式参数。运行时只需要决定是否启用 server 托管前端，以及没有内嵌资源时从哪个目录读取。
 
 ```text
-FrontendMode::Disabled
+frontend.enabled = false
   -> 不服务前端，只提供 `/api/v1/*`、`/agent/v1/connect` 和 `/live/v1/*`。
 
-FrontendMode::Dir
-  -> 使用 tower-http ServeDir 从 React/Vite dist 目录读取静态资源。
-  -> 适合第一版生产部署，前端更新时只替换 dist，不需要重新编译 Rust。
+frontend.enabled = true + 编译了 frontend-embed
+  -> 直接使用内置前端资源，`frontend.dir` 不参与选择。
 
-FrontendMode::Embedded
-  -> 通过可选 feature 把 dist 嵌入 server 二进制。
-  -> 适合单文件发布，但前端每次变化都需要重新编译 Rust，二进制体积也会变大。
+frontend.enabled = true + 没有编译 frontend-embed
+  -> 使用 tower-http ServeDir 从 `frontend.dir` 读取 React/Vite dist。
 ```
 
 推荐默认：
@@ -191,10 +246,11 @@ FrontendMode::Embedded
 
 生产期:
   pnpm build
-  smalux-server --frontend-mode dir --frontend-dir apps/smalux-web/dist
+  smalux-server --serve-frontend --frontend-dir apps/smalux-web/dist
 
 单文件发布:
   cargo build --release -p smalux-server --features frontend-embed
+  smalux-server --serve-frontend
 ```
 
 `http/frontend.rs` 只负责前端静态资源和 SPA fallback，不处理 REST handler，也不处理 agent 上报。`http/router.rs` 负责把 frontend route 放在 fallback 位置，避免静态资源路由抢走 `/api/v1/*`、`/agent/v1/connect` 或 `/live/v1/*`。
