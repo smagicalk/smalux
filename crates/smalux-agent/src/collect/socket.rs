@@ -33,7 +33,7 @@ pub(crate) fn sample_socket_info(
 ) -> SocketInfo {
     match sample_socket_info_result(level, limit) {
         Ok(info) => info,
-        Err(error) => SocketInfo::stale_or_failed(previous, error.to_string()),
+        Err(error) => SocketInfo::stale_or_failed(previous, level, error.to_string()),
     }
 }
 
@@ -48,10 +48,13 @@ pub(crate) fn sample_socket_info(
 /// 不支持 socket table 的平台返回 unsupported，避免调用方额外分支。
 pub(crate) fn sample_socket_info(
     _previous: Option<&SocketInfo>,
-    _level: MetricLevel,
+    level: MetricLevel,
     _limit: usize,
 ) -> SocketInfo {
-    SocketInfo::unsupported("socket counting is unsupported on this platform".to_string())
+    SocketInfo::unsupported(
+        level,
+        "socket counting is unsupported on this platform".to_string(),
+    )
 }
 
 /// 根据采集级别选择 socket 采样路径。
@@ -362,9 +365,14 @@ mod tests {
     /// 验证失败时没有旧值会返回 failed。
     #[test]
     fn socket_info_stale_or_failed_without_previous_returns_failed() {
-        let info = SocketInfo::stale_or_failed(None, "temporary failure".to_string());
+        let info = SocketInfo::stale_or_failed(
+            None,
+            MetricLevel::Details,
+            "temporary failure".to_string(),
+        );
 
         assert_eq!(info.status, MetricStatus::Failed);
+        assert_eq!(info.level, MetricLevel::Details);
         assert_eq!(info.tcp, 0);
         assert_eq!(info.udp, 0);
         assert_eq!(info.error.as_deref(), Some("temporary failure"));
@@ -380,9 +388,14 @@ mod tests {
             SocketAccuracy::SocketTable,
         );
 
-        let info = SocketInfo::stale_or_failed(Some(&previous), "temporary failure".to_string());
+        let info = SocketInfo::stale_or_failed(
+            Some(&previous),
+            MetricLevel::Light,
+            "temporary failure".to_string(),
+        );
 
         assert_eq!(info.status, MetricStatus::Stale);
+        assert_eq!(info.level, MetricLevel::Light);
         assert_eq!(info.tcp, 10);
         assert_eq!(info.udp, 3);
         assert_eq!(info.error.as_deref(), Some("temporary failure"));

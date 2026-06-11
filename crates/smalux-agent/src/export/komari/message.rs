@@ -8,10 +8,11 @@ use crate::export::{
     InboundProtocolHandler, TransportInboundMessage, inbound_message_into_string, komari::terminal,
 };
 use crate::service::{
-    InboundCommand, InboundCommandEnvelope, InboundCommandSender, RemoteProbeRunRequest,
-    RemoteShellOpenRequest, RemoteTaskRunRequest, display_probe_task_id,
+    InboundCommand, InboundCommandEnvelope, InboundCommandSender, RemoteProbeApply,
+    RemoteProbeExecutionRequest, RemoteShellOpenRequest, RemoteTaskRunRequest, display_probe_id,
 };
 use serde::Deserialize;
+use smalux_protocol::{RemoteProbeId, RemoteProbeResultSource};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -80,7 +81,7 @@ impl InboundProtocolHandler for KomariInboundHandler {
 
             if let Ok(event) = parse_exec_request(&msg) {
                 let task_id = event.task_id.clone();
-                let command = event.command.clone();
+                let command_len = event.command.len();
                 commands
                     .send(InboundCommandEnvelope::without_response(
                         InboundCommand::RemoteTaskRun {
@@ -91,7 +92,7 @@ impl InboundProtocolHandler for KomariInboundHandler {
                     .map_err(|_| anyhow::anyhow!("inbound command channel is closed"))?;
                 tracing::info!(
                     task_id = %task_id,
-                    command = %command,
+                    command_len,
                     "komari exec command queued"
                 );
                 return Ok(());
@@ -103,14 +104,16 @@ impl InboundProtocolHandler for KomariInboundHandler {
                 let target = event.ping_target.clone();
                 commands
                     .send(InboundCommandEnvelope::without_response(
-                        InboundCommand::RemoteProbeRun {
-                            request: event.into_remote_probe_request(),
+                        InboundCommand::RemoteProbeApply {
+                            request: RemoteProbeApply::Once {
+                                runs: vec![event.into_remote_probe_request()],
+                            },
                         },
                     ))
                     .await
                     .map_err(|_| anyhow::anyhow!("inbound command channel is closed"))?;
                 tracing::info!(
-                    task_id = %display_probe_task_id(&task_id),
+                    probe_id = %display_probe_id(&task_id),
                     probe_type = probe_type.as_str(),
                     target = %target,
                     "komari ping command queued"
@@ -141,7 +144,7 @@ struct KomariPingRequest {
     /// 消息类型，必须是 ping。
     message: String,
     /// Komari server 生成的 ping 任务 ID。
-    ping_task_id: serde_json::Value,
+    ping_task_id: RemoteProbeId,
     /// 探测类型。
     ping_type: crate::service::RemoteProbeType,
     /// 探测目标。
@@ -150,11 +153,16 @@ struct KomariPingRequest {
 
 impl KomariPingRequest {
     /// 转换为内部远程探测请求，继续复用 remote probe 的动态开关和频率保护。
-    fn into_remote_probe_request(self) -> RemoteProbeRunRequest {
-        RemoteProbeRunRequest {
-            task_id: self.ping_task_id,
+    fn into_remote_probe_request(self) -> RemoteProbeExecutionRequest {
+        let point_id = self.ping_task_id.clone();
+        RemoteProbeExecutionRequest {
+            source: RemoteProbeResultSource::Once,
+            point_id: Some(point_id),
+            request_id: Some(self.ping_task_id),
+            job_id: None,
             probe_type: self.ping_type,
             target: self.ping_target,
+            timeout: None,
         }
     }
 }
@@ -193,13 +201,7 @@ fn parse_ping_request(message: &str) -> anyhow::Result<KomariPingRequest> {
     if request.message != "ping" {
         anyhow::bail!("not a komari ping message");
     }
-    if request.ping_task_id.is_null()
-        || request
-            .ping_task_id
-            .as_str()
-            .map(str::trim)
-            .is_some_and(str::is_empty)
-    {
+    if matches!(&request.ping_task_id, RemoteProbeId::String(value) if value.trim().is_empty()) {
         anyhow::bail!("komari ping_task_id cannot be empty");
     }
     if request.ping_target.trim().is_empty() {
@@ -230,6 +232,7 @@ mod tests {
     use crate::service::shell::{RemoteShellManager, RemoteShellOptions};
     use crate::service::{InboundCommand, inbound_command_channel};
     use futures_util::{SinkExt, StreamExt};
+    use smalux_protocol::{RemoteShellOpenRequest, ServerFrame, encode_server_frame};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -365,6 +368,7 @@ mod tests {
                 },
                 stream_codec,
             )
+            .await
             .unwrap();
 
         let output_text = timeout(Duration::from_secs(12), terminal_task)
@@ -430,11 +434,17 @@ mod tests {
             .unwrap();
 
         let command = command_rx.try_recv().unwrap().command;
-        let InboundCommand::RemoteProbeRun { request } = command else {
-            panic!("expected remote probe run command");
+        let InboundCommand::RemoteProbeApply { request } = command else {
+            panic!("expected remote probe apply command");
         };
+        let RemoteProbeApply::Once { runs } = request else {
+            panic!("expected remote probe once command");
+        };
+        let request = runs.into_iter().next().unwrap();
 
-        assert_eq!(request.task_id, serde_json::Value::from(123));
+        assert_eq!(request.source, RemoteProbeResultSource::Once);
+        assert_eq!(request.request_id, Some(RemoteProbeId::from(123)));
+        assert_eq!(request.job_id, None);
         assert_eq!(request.probe_type, crate::service::RemoteProbeType::Tcp);
         assert_eq!(request.target, "example.com:443");
     }
@@ -458,5 +468,31 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("ping_target"));
+    }
+
+    /// 验证 Komari handler 不会把 Smalux ServerFrame 误当成第三方控制消息。
+    #[tokio::test]
+    async fn inbound_handler_ignores_smalux_server_frame() {
+        let manager = ConfigManager::new(AgentConfig::default()).unwrap();
+        let (commands, mut command_rx) = inbound_command_channel();
+        let handler = inbound_handler(manager, commands);
+        let message = encode_server_frame(&ServerFrame::remote_shell_open(
+            42,
+            100,
+            RemoteShellOpenRequest {
+                session_id: "shell-1".to_string(),
+                stream_url: "wss://example.com/shell/shell-1".to_string(),
+                cols: Some(120),
+                rows: Some(30),
+            },
+        ))
+        .unwrap();
+
+        handler
+            .on_message(TransportInboundMessage::Text(message))
+            .await
+            .unwrap();
+
+        assert!(command_rx.try_recv().is_err());
     }
 }

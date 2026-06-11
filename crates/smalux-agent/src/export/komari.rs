@@ -210,10 +210,11 @@ impl ProtocolAdapter for KomariProtocolAdapter {
         let body = serde_json::to_string(&PingResult::from_remote_probe_result(&result.result))?;
         tracing::info!(
             sequence = result.sequence,
-            task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+            probe_id = %result.result.display_id(),
             probe_type = result.result.probe_type.as_str(),
             target = %result.result.target,
-            value = result.result.value,
+            status = ?result.result.status,
+            latency_ms = result.result.latency_ms,
             body_bytes = body.len(),
             "komari ping result encoded"
         );
@@ -248,7 +249,10 @@ mod tests {
     use crate::export::ExportDeliveryTrigger;
     use crate::service::outbound::{RemoteProbeResultEnvelope, RemoteTaskResultEnvelope};
     use smalux_core::model::info::AgentReport;
-    use smalux_protocol::{RemoteProbeResult, RemoteProbeType, RemoteTaskResult, RemoteTaskStatus};
+    use smalux_protocol::{
+        RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
+        RemoteProbeType, RemoteTaskResult, RemoteTaskStatus,
+    };
 
     /// 构造 Komari 测试配置。
     fn komari_config(base_url: &str) -> ExportConfig {
@@ -465,10 +469,15 @@ mod tests {
             sequence: 11,
             created_at: 100,
             result: RemoteProbeResult {
-                task_id: serde_json::Value::from(123),
+                run_id: "probe-run-1".to_string(),
+                source: RemoteProbeResultSource::Once,
+                point_id: Some(RemoteProbeId::from("point-123")),
+                request_id: Some(RemoteProbeId::from(123)),
+                job_id: None,
                 probe_type: RemoteProbeType::Tcp,
                 target: "example.com:443".to_string(),
-                value: 13,
+                status: RemoteProbeResultStatus::Success,
+                latency_ms: Some(13),
                 started_at: 99,
                 finished_at: 100,
                 duration_ms: 13,

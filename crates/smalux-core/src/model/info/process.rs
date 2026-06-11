@@ -112,12 +112,12 @@ impl ProcessInfo {
         }
     }
 
-    /// 构造当前平台不支持状态。
-    pub fn unsupported(error: String) -> Self {
+    /// 构造当前平台不支持状态，并保留调用方请求的采集级别。
+    pub fn unsupported(level: MetricLevel, error: String) -> Self {
         Self {
             count: 0,
             status: MetricStatus::Unsupported,
-            level: MetricLevel::Count,
+            level,
             light: None,
             details: None,
             error: Some(error),

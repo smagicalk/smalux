@@ -4,13 +4,13 @@
 
 ## 当前职责
 
-- 当前只保留 crate 依赖配置和实现文档。
-- `src/` 当前只有目录骨架和最小 `main.rs`，server 业务代码由你后续重新编写。
+- 当前保留 server crate 依赖配置、目录骨架、CLI 参数结构和实现文档。
+- `src/` 当前只有最小启动入口和模块骨架，`main.rs` 已交给 `bootstrap::run()`，业务代码由你后续继续编写。
 - 后续接收 `smalux-agent` 上报的 `ClientFrame`，完成校验、标准化、持久化和查询。
 
 ## 目录结构
 
-当前 `src/` 只保留最小可编译入口和按 agent 风格预建的目录骨架。`crates/smalux-server` 已在 workspace `members` 中，后续可以直接在这些目录里继续写 server 业务代码。
+当前 `src/` 保留最小可编译入口、CLI 参数解析入口和按 agent 风格预建的目录骨架。`crates/smalux-server` 已在 workspace `members` 中，后续可以直接在这些目录里继续写 server 业务代码。
 
 当前预留结构：
 
@@ -20,35 +20,35 @@ src/
   bootstrap.rs     # 启动编排：日志、CLI、配置、数据库、HTTP server
   state.rs         # axum handler 和后台服务共享的 AppState
   cli/             # server 启动参数、环境变量和命令行默认值解析
-    args/          # clap 参数结构
+    args.rs        # clap 参数结构
   config/          # server 运行配置模型、默认值和校验
-    defaults/      # 默认值常量
-    model/         # 配置模型
-    validation/    # 配置校验
+    defaults.rs    # 默认值常量
+    model.rs       # 配置模型
+    validation.rs  # 配置校验
   auth/            # agent 认证、secure_psk 识别、管理后台 session 和授权边界
-    agent/         # agent token、key_id、secure_psk 认证
-    session/       # 管理后台 session 和用户登录态
+    agent.rs       # agent token、key_id、secure_psk 认证
+    session.rs     # 管理后台 session 和用户登录态
   http/            # axum router、REST API、agent 接入、前端实时通道、静态前端资源和中间件
-    router/        # REST、agent 接入、前端实时通道、静态资源和中间件的路由组合
-    rest/          # 前端 REST API handler 和 route 组织
-    agent/         # agent WebSocket upgrade、连接生命周期和控制帧发送
-    realtime/      # 前端 dashboard live update、事件订阅和管理端实时反馈
-    frontend/      # 静态前端资源、SPA fallback 和前端入口页面服务
-    middleware/    # axum/tower middleware，例如 trace、CORS、限流、request id
+    router.rs      # REST、agent 接入、前端实时通道、静态资源和中间件的路由组合
+    rest.rs        # 前端 REST API handler 和 route 组织
+    agent.rs       # agent WebSocket upgrade、连接生命周期和控制帧发送
+    realtime.rs    # 前端 dashboard live update、事件订阅和管理端实时反馈
+    frontend.rs    # 静态前端资源、SPA fallback 和前端入口页面服务
+    middleware.rs  # axum/tower middleware，例如 trace、CORS、限流、request id
   ingest/          # agent 上报接入、协议分发和校验
-    frame/         # ClientFrame/ServerFrame 分发和序列号语义
-    report/        # AgentReport snapshot/delta/heartbeat 校验与应用
+    frame.rs       # ClientFrame/ServerFrame 分发和序列号语义
+    report.rs      # AgentReport snapshot/delta/heartbeat 校验与应用
   storage/         # 持久化接口、内存状态和数据库适配
-    entity/        # SeaORM entity
-    memory/        # 内存存储，用于首版开发和测试
-    migration/     # SeaORM migration
-    repository/    # latest state、pending command、remote result 仓储
+    entity.rs      # SeaORM entity
+    memory.rs      # 内存存储，用于首版开发和测试
+    migration.rs   # SeaORM migration
+    repository.rs  # latest state、pending command、remote result 仓储
   service/         # server 后台服务编排、连接状态和控制命令调度
-    agent/         # agent 连接注册、在线状态和 latest 状态协调
-    connection/    # 在线连接 registry、连接替换、下行队列和断开清理
-    dashboard/     # dashboard 聚合状态、摘要指标和前端展示数据
-    command/       # server 下发命令、ack/error、超时和幂等处理
-    event/         # dashboard 实时事件和内部状态变化事件
+    agent.rs       # agent 连接注册、在线状态和 latest 状态协调
+    connection.rs  # 在线连接 registry、连接替换、下行队列和断开清理
+    dashboard.rs   # dashboard 聚合状态、摘要指标和前端展示数据
+    command.rs     # server 下发命令、ack/error、超时和幂等处理
+    event.rs       # dashboard 实时事件和内部状态变化事件
 ```
 
 ## 当前 crate 依赖配置
@@ -74,16 +74,18 @@ src/
 - `anyhow 1.0.102` / `thiserror 2.0.18`: 启动错误和后续领域错误建模。
 - `async-trait 0.1.89`: 后续存储 trait、服务 trait 需要 async 方法时使用。
 - `futures-util 0.3.32`: WebSocket split/sink/stream 等异步组合工具。
+- `form_urlencoded 1.2.2`: SQLite 连接地址 query 参数编码。
 - `bytes 1.11.1`: WebSocket、HTTP body、二进制协议 buffer。
 - `http 1.4.1` / `headers 0.4.1`: HTTP 类型和 typed header。
 - `validator 0.20.0`: API 请求 DTO、管理后台表单和配置 patch 的结构化校验。
 - `uuid 1.23.2`: connection id、command id、task id 等服务端生成 ID。
 - `time 0.3.47`: server 收包时间、过期时间、日志/数据库时间字段。
+- `url 2.5.8`: PostgreSQL/MySQL 连接 URL 构造和用户名、密码、query 编码。
 - `secrecy 0.10.3`: token、secret、PSK 等敏感值包装，降低误打印风险。
 - `smalux-core`: 复用日志初始化和通用工具。
 - `smalux-protocol`: 后续 server 解包 `ClientFrame`、wire packet 和 `secure_psk` 时复用协议实现。
 
-数据库依赖当前支持 SQLite、PostgreSQL 和 MySQL，对应 `database_url` 可使用 `sqlite://`、`postgres://`、`postgresql://` 或 `mysql://`。没有启用 `sqlx-all`，也没有引入 gRPC/Tonic。
+数据库依赖当前支持 SQLite、PostgreSQL 和 MySQL。CLI 不要求用户手写完整连接 URL，而是接收 driver、host、port、name、user、password 和额外 query 参数等关键属性；配置层会补齐默认值、校验跨字段约束，并生成 SeaORM/SQLx 需要的连接 URL。没有启用 `sqlx-all`，也没有引入 gRPC/Tonic。
 
 暂时没有把 gRPC、系统采集类依赖、OpenAPI、密码哈希、外部 HTTP client 作为 server 直接依赖。原因是这些依赖会强绑定后续功能边界：gRPC 要看是否真的做独立传输协议，OpenAPI 要看 API 文档生成方式，密码哈希要等管理后台认证模型确定，外部 HTTP client 要等 server 是否主动调用第三方服务。后续需要时再加，比提前把业务方向锁死更稳。
 
@@ -97,8 +99,15 @@ server CLI 只负责 server 进程启动时必须确定的静态运行环境，�
 
 | 参数 | 短参数 | 环境变量 | 默认值 | 作用 |
 | --- | --- | --- | --- | --- |
-| `--bind <ADDR>` | `-b` | `SMALUX_SERVER_BIND` | `127.0.0.1:3000` | HTTP 监听地址，必须是 `SocketAddr` 格式 |
-| `--database-url <URL>` | `-d` | `SMALUX_SERVER_DATABASE_URL` | `sqlite://smalux-server.db` | 数据库连接地址，支持 `sqlite://`、`postgres://`、`postgresql://`、`mysql://` |
+| `--bind-addr <ADDR>` | `-b` | `SMALUX_SERVER_BIND_ADDR` | `127.0.0.1` | HTTP 监听 IP 地址 |
+| `--bind-port <PORT>` | `-p` | `SMALUX_SERVER_BIND_PORT` | `3000` | HTTP 监听端口 |
+| `--database-driver <DRIVER>` | `-d` | `SMALUX_SERVER_DATABASE_DRIVER` | `sqlite` | 数据库类型，支持 `sqlite`、`postgres`、`mysql` |
+| `--database-name <NAME>` | 无 | `SMALUX_SERVER_DATABASE_NAME` | 按 driver 决定 | 数据库目标；SQLite 默认 `smalux-server.db`，PostgreSQL/MySQL 默认 `smalux` |
+| `--database-host <HOST>` | 无 | `SMALUX_SERVER_DATABASE_HOST` | PostgreSQL/MySQL 默认 `127.0.0.1` | PostgreSQL/MySQL 主机；SQLite 不允许传入 |
+| `--database-port <PORT>` | 无 | `SMALUX_SERVER_DATABASE_PORT` | PostgreSQL 默认 `5432`，MySQL 默认 `3306` | PostgreSQL/MySQL 端口；SQLite 不允许传入 |
+| `--database-user <USER>` | 无 | `SMALUX_SERVER_DATABASE_USER` | 无 | PostgreSQL/MySQL 用户名 |
+| `--database-password <PASSWORD>` | 无 | `SMALUX_SERVER_DATABASE_PASSWORD` | 无 | PostgreSQL/MySQL 密码，Debug 输出会脱敏 |
+| `--database-param <KEY=VALUE>` | 无 | 不支持 | 无 | 额外数据库连接 query 参数，可重复传入，例如 `mode=rwc`、`sslmode=require`、`charset=utf8mb4`、`options=--search_path=public` |
 | `--serve-frontend [true|false]` | 无 | `SMALUX_SERVER_SERVE_FRONTEND` | `false` | 是否由 server 托管前端静态资源；只传 `--serve-frontend` 等价于 `true` |
 | `--frontend-dir <PATH>` | 无 | `SMALUX_SERVER_FRONTEND_DIR` | `apps/smalux-web/dist` | 未编译内置前端资源时，server 托管的前端构建目录 |
 | `--frontend-spa-fallback <true|false>` | 无 | `SMALUX_SERVER_FRONTEND_SPA_FALLBACK` | `true` | 是否为 React/Vite SPA 启用 `index.html` fallback |
@@ -110,24 +119,56 @@ server CLI 只负责 server 进程启动时必须确定的静态运行环境，�
 
 ```powershell
 $env:RUST_LOG="smalux_server=debug,smalux_protocol=debug"
-cargo run -p smalux-server -- --bind 127.0.0.1:3000
+cargo run -p smalux-server -- --bind-addr 127.0.0.1 --bind-port 3000
 ```
 
 常用启动示例：
 
 ```powershell
 # 只启动 API 和 agent 接入，不托管前端。
-cargo run -p smalux-server -- --bind 127.0.0.1:3000
+cargo run -p smalux-server -- --bind-addr 127.0.0.1 --bind-port 3000
 
 # 使用 SQLite，并托管 Vite/React 构建后的前端目录。
-cargo run -p smalux-server -- -b 0.0.0.0:3000 -d sqlite://smalux-server.db --serve-frontend --frontend-dir apps/smalux-web/dist
+cargo run -p smalux-server -- -b 0.0.0.0 -p 3000 -d sqlite --database-name smalux-server.db --database-param mode=rwc --serve-frontend --frontend-dir apps/smalux-web/dist
 
 # 使用 PostgreSQL。
-cargo run -p smalux-server -- -d postgres://user:password@127.0.0.1:5432/smalux
+cargo run -p smalux-server -- -d postgres --database-user user --database-password password --database-param sslmode=disable --database-param options=--search_path=public
 
 # 使用 MySQL。
-cargo run -p smalux-server -- -d mysql://user:password@127.0.0.1:3306/smalux
+cargo run -p smalux-server -- -d mysql --database-user user --database-password password --database-param charset=utf8mb4
 ```
+
+## 配置转换流程
+
+server 当前启动时会把 CLI/env 原始输入转换成稳定 `ServerConfig`：
+
+```text
+ServerArgs::parse()
+  -> ServerArgs::into_config()
+  -> validate_server_config()
+  -> DatabaseConfig::connection_url()
+  -> DatabaseConfig::redacted_connection_url()
+  -> 后续接日志、数据库连接和 HTTP server
+```
+
+配置层规则：
+
+- `cli/args.rs` 只处理 clap 参数、环境变量和 CLI 专用类型，例如 `DatabaseDriverArg`。
+- `config/model.rs` 保存稳定运行配置，不依赖 clap，后续配置文件或数据库下发配置也可以复用。
+- HTTP 配置在模型中拆成 `bind_addr` 和 `bind_port`，真正绑定时通过 `HttpConfig::socket_addr()` 合成 `SocketAddr`。
+- `config/validation.rs` 处理跨字段校验，例如 SQLite 不允许传 host/port/user/password，PostgreSQL/MySQL 必须有 user。
+- `database-param` 在 CLI 可重复传入，但配置层会转换成稳定 map；重复 key 直接报错，避免覆盖行为不清晰。
+- 数据库明文密码只参与真实连接 URL 构造；日志和 debug 摘要只使用 `redacted_connection_url()`，不会打印原始密码。
+
+数据库连接 URL 生成规则：
+
+| driver | 输入示例 | 生成结果 |
+| --- | --- | --- |
+| SQLite | `-d sqlite` | `sqlite://smalux-server.db` |
+| SQLite memory | `-d sqlite --database-name :memory:` | `sqlite::memory:` |
+| SQLite + query | `-d sqlite --database-param mode=rwc` | `sqlite://smalux-server.db?mode=rwc` |
+| PostgreSQL | `-d postgres --database-user user --database-password password` | `postgres://user:***@127.0.0.1:5432/smalux`，日志脱敏；真实连接 URL 使用明文密码 |
+| MySQL | `-d mysql --database-user user --database-param charset=utf8mb4` | `mysql://user@127.0.0.1:3306/smalux?charset=utf8mb4` |
 
 暂时不要加入到 server CLI 的内容：
 
@@ -323,6 +364,75 @@ Noise pattern     = Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
 Noise payload      = empty bytes during both handshake messages
 ```
 
+### Agent 当前发送语义
+
+server 第一版要按 agent 当前运行时语义处理数据，不要把所有消息理解成“固定间隔、严格递增、一次到达”的普通日志流。
+
+- agent 采集是事件驱动：`collector_loop` 按 core/disk/network/processes/sockets 各自的 interval 调度；同一时间点到期的 group 会合并成一条 `TelemetryUpdate::Batch`。例如 disk=2s、network=3s 时，2s 发 disk，3s 发 network，4s 发 disk，6s 发 disk+network。
+- `reporter_loop` 收到 telemetry update 后立即尝试生成 `snapshot`、`delta` 或 `heartbeat`；`report.interval` 只是兜底 tick，用于长时间没有采集变化时检查 snapshot/heartbeat 策略，不是唯一上报频率。
+- `snapshot` 是完整最新状态；`delta` 只包含变化的顶层采集组；无变化且未到 heartbeat 间隔时，agent 会跳过发送。
+- agent 的 report 是 latest-only 语义：export supervisor 只保留最新 report，慢连接或重连时可能跳过中间 report，因此 `ClientFrame.sequence` 允许跳号。
+- 出站事件分普通队列和高优先级队列。`ack`、`error`、`remote_task_result`、`remote_probe_result` 会优先于普通 report 投递，所以 server 可能先收到 `sequence=11` 的控制响应，再收到 `sequence=10` 的 report。
+- `ClientFrame.sequence` 是 agent 进程内全局出站序号，不是每种消息各自递增，也不是网络到达顺序保证。server 可以记录它用于排查跳号和乱序，但不能只因为小于等于最大已见序号就丢弃 frame。
+- `delta.base_sequence` 才是合并 delta 的强约束。server 只用它判断当前 latest state 是否能应用该 delta；不匹配时请求 snapshot。
+- `ack` / `error` 只表示 agent 已接收并调度带 `ServerFrame.sequence` 的控制命令，不代表 snapshot 已发送、远程 task 已完成或 remote probe 已完成。
+- `remote_task_result` 在发送成功前会被 agent pending，重连后可能重投；server 必须按 `task_id` 幂等。
+- `remote_probe_result` 在发送成功前会被 agent pending，重连后可能重投；server 必须按 `run_id` 幂等，并优先用 `point_id` 关联业务探测点，用 `request_id` 或 `job_id` 关联本次请求或持续任务。
+- `remote_shell_open` 的 ack 比普通控制命令更严格：agent 会等独立 shell stream WebSocket 连接成功、PTY 启动、`opened` 事件发送成功后才回 ack。失败时会回 `remote_shell_open_failed`。
+- `basic_info` 不是 Smalux 自有 `ClientFrame` 的核心类型；当前主要用于 Komari 兼容，由 reporter 低频生成后交给 Komari adapter 发送 HTTP `uploadBasicInfo`。
+- Komari 兼容模式是 agent 侧 adapter：出站把内部 report/task/probe 映射为 Komari report/basic_info/task_result/ping_result；入站把 Komari terminal/exec/ping 转换为内部 remote shell/task/probe。server 自有协议实现不要依赖 Komari 字段。
+
+### Server 收包处理顺序
+
+server 收到一条 agent 业务 frame 后，建议固定按下面顺序处理。这个顺序能同时处理 latest-only report、乱序控制响应和重连重投的一次性结果。
+
+```text
+1. transport 层
+   -> WebSocket 已升级
+   -> wire packet 已解包
+   -> secure_psk 已完成 Noise 解密
+   -> 得到 JSON bytes
+
+2. frame 层
+   -> decode_client_frame(json_bytes)
+   -> 校验 protocol_version / agent_id / sequence / sent_at / type
+   -> 记录 connection_id、agent_id、frame.sequence、frame.type
+
+3. agent 连接态
+   -> 更新 last_seen_at
+   -> 更新 max_observed_client_sequence = max(old, frame.sequence)
+   -> 如果 frame.sequence <= old max，只记录 possible_out_of_order=true，不直接丢弃
+
+4. payload 分发
+   -> snapshot: 覆盖 latest report，更新 delta_base_sequence = frame.sequence
+   -> delta: 只在 delta.base_sequence == delta_base_sequence 时合并
+   -> heartbeat: 只更新时间，不改 latest report 和 delta_base_sequence
+   -> ack/error: 按 payload.sequence 关联 pending command
+   -> remote_task_result: 按 result.task_id 幂等写入
+   -> remote_probe_result: 按 result.run_id 幂等写入
+
+5. 响应动作
+   -> delta base 不匹配: 下发 snapshot_request
+   -> pending command ack/error: 更新命令状态，不再修改业务结果
+   -> task/probe result: 更新业务结果，可通知前端 live channel
+```
+
+不要把 `frame.sequence <= max_observed_client_sequence` 作为通用丢弃条件。agent 高优先级队列可能让控制响应先到，普通 report 后到；latest-only report 也可能跳过中间序号。server 的幂等判断应落到更具体的业务键上：snapshot/delta 看 `delta_base_sequence`，ack/error 看 `ServerFrame.sequence`，task 看 `task_id`，probe 看 `run_id`。
+
+### 乱序和重复处理矩阵
+
+| frame 类型 | 可乱序到达 | 幂等键或基准 | 低于最大已见 sequence 时如何处理 |
+| --- | --- | --- | --- |
+| `snapshot` | 可以 | `agent_id` + `frame.sequence` | 不默认丢弃；如果比当前 `delta_base_sequence` 旧很多，可以记录 stale snapshot 并按策略决定是否覆盖 |
+| `delta` | 可以 | `delta.base_sequence` | 只要 `delta.base_sequence` 等于当前基准就处理；不匹配就请求 snapshot |
+| `heartbeat` | 可以 | `agent_id` + `frame.sequence` | 只更新在线时间；旧 heartbeat 不应覆盖较新的 `last_seen_at` |
+| `ack` | 可以 | `ack.sequence`，也就是 server 下发的 `ServerFrame.sequence` | 查 pending command；已处理过则当重复 ack 记录 |
+| `error` | 可以 | `error.sequence`，也就是 server 下发的 `ServerFrame.sequence` | 查 pending command；已处理过则当重复 error 记录 |
+| `remote_task_result` | 可以，会重投 | `result.task_id` | 幂等 upsert；同一 `task_id` 的最终状态不要重复创建 |
+| `remote_probe_result` | 可以，会重投 | `result.run_id` | 幂等 upsert；用 `point_id` 做业务探测点归属，用 `request_id/job_id` 做执行关联 |
+
+首版建议不要为了“严格顺序”牺牲 agent 的高优先级响应能力。server 只要做到上面这些幂等规则，就能同时兼容实时 report、控制响应和重连重投。
+
 HKDF 测试向量，server 第一版必须覆盖：
 
 ```text
@@ -454,7 +564,7 @@ server 不应该把所有 payload 都当成完整指标：
 - `heartbeat`：只说明 agent 业务上仍在线，不修改 CPU、磁盘、网络等指标。
 - `ack` / `error`：只关联 server 之前下发的 `ServerFrame.sequence`，不代表远程任务或探测已经完成。
 - `remote_task_result`：通过 `result.task_id` 关联非交互任务。
-- `remote_probe_result`：通过 `result.task_id` 关联网络探测；`value=-1` 表示失败、禁用、限频或暂不支持。
+- `remote_probe_result`：通过 `result.run_id` 幂等保存单次探测运行；`result.point_id` 是 server 下发的业务探测点 ID，用它关联 UI 里的固定探测点；`source=once` 时用 `result.request_id` 关联一次性请求，`source=job` 时用 `result.job_id` 关联持续探测任务。`status=rejected` 表示 agent 未发包，例如未启用或限频。
 
 ### Delta 合并伪代码
 
@@ -495,7 +605,7 @@ on_delta(frame):
 
 - `protocol_version` 必须等于当前支持版本 `1`。
 - `agent_id` 必须非空，并且 snapshot 中 `report.identity.agent_id` 应与 frame 顶层 `agent_id` 一致。
-- `sequence` 必须大于 `0`，同一 agent 后续可用于判断跳号、乱序或 delta 基准。
+- `sequence` 必须大于 `0`；同一 agent 后续可用于记录跳号、乱序和排查发送路径，但不能作为唯一丢弃依据。
 - `sent_at` 必须大于 `0`。
 - `type=snapshot` 时必须包含 `report`。
 - `report.meta.schema_version` 必须等于当前支持版本 `5`。
@@ -546,7 +656,7 @@ server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当�
 - `collect_sockets_once`
 - `remote_shell_open`
 - `remote_task_run`
-- `remote_probe_run`
+- `remote_probe_apply`
 
 第一版 server 建议先实现：
 
@@ -560,7 +670,7 @@ server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当�
 - `collect_sockets_once`：请求 agent 立即采样一次 socket 信息，结果进入下一次 snapshot/delta。
 - `remote_shell_open`：打开远程交互式 shell，前提是 agent 启动时显式开启。
 - `remote_task_run`：执行一次非交互命令，前提是 agent 启动时显式开启。
-- `remote_probe_run`：执行一次 TCP/HTTP 探测；默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
+- `remote_probe_apply`：执行一次 TCP/HTTP 探测，或同步持续探测任务；默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
 
 server 如果要远程打开 `processes.level=details` 或 `sockets.level=details`，agent 必须启动时带对应 CLI-only 授权：`--allow-process-level details` 或 `--allow-socket-level details`。一次性 details 采集同样受这个限制。
 
@@ -569,7 +679,51 @@ server 如果要远程打开 `processes.level=details` 或 `sockets.level=detail
 - 发送 `ServerFrame` 前先分配 server 侧递增 `sequence`，保存一条 pending command。
 - 收到 `ack.sequence` 后，只能把该 command 标记为“已调度”；不能把远程 task/probe 标记为完成。
 - 收到 `error.sequence` 后，把该 command 标记为失败，并记录 `error.code` 和 `error.message`。
-- 重连后不要盲目重发所有有副作用命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重。
+- 重连后不要盲目重发所有有副作用命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重；`remote_probe_apply(operation=once)` 靠 `request_id` 关联一次性请求，`replace/patch` 靠 `generation` 防止旧任务表覆盖新任务表。
+
+### 控制命令生命周期
+
+server 下发控制命令时，建议把“命令是否被 agent 接收”和“业务动作是否完成”拆成两条状态线。
+
+```text
+create command
+  -> allocate ServerFrame.sequence
+  -> persist PendingCommand(status=created)
+  -> send ServerFrame over current agent connection
+  -> PendingCommand(status=sent)
+
+agent returns ClientFrame(type=ack)
+  -> mark PendingCommand(status=acked)
+  -> only means agent accepted/scheduled the command
+
+agent returns ClientFrame(type=error)
+  -> mark PendingCommand(status=failed)
+  -> save error.code/error.message
+
+business result arrives later
+  -> snapshot_request: later snapshot/delta arrives through report path
+  -> collect_processes_once: later report contains processes group update
+  -> collect_sockets_once: later report contains sockets group update
+  -> remote_task_run: later remote_task_result arrives with task_id
+  -> remote_probe_apply once: later remote_probe_result arrives with point_id/request_id/run_id
+  -> remote_probe_apply replace/patch: later job results arrive with point_id/job_id/run_id
+  -> remote_shell_open: ack already means stream ready; session output goes through shell stream
+```
+
+各命令的 server 状态建议：
+
+| 命令 | ack 表示 | 最终业务结果来自 | 幂等键 | 是否建议重连后自动重发 |
+| --- | --- | --- | --- | --- |
+| `snapshot_request` | agent 已接受强制 snapshot 请求 | 后续 `snapshot` frame | `ServerFrame.sequence` | 可以限频重发 |
+| `config_patch` | agent 已应用或接受配置变更 | 无独立业务结果；以后看 report 行为 | desired config version | 可以按 desired config 重发 |
+| `collect_processes_once` | agent 已把一次性采集命令投递给 collector | 后续 report 的 `processes` 分组 | `ServerFrame.sequence` | 不建议自动重发，避免高成本扫描 |
+| `collect_sockets_once` | agent 已把一次性采集命令投递给 collector | 后续 report 的 `sockets` 分组 | `ServerFrame.sequence` | 不建议自动重发，避免高成本扫描 |
+| `remote_task_run` | agent 已接收或启动任务 | `remote_task_result.result.task_id` | `task_id` | 默认不自动重发，除非确认未执行 |
+| `remote_probe_apply once` | agent 已接收一次性探测请求 | `remote_probe_result.point_id/request_id/run_id` | `point_id` / `request_id` / `run_id` | 可按业务需求重发，但要限频 |
+| `remote_probe_apply replace/patch` | agent 已应用持续任务表变更 | 后续 `source=job` 的结果 | `generation` / `point_id` / `job_id` / `run_id` | 推荐重连后用新 `generation` replace 同步 |
+| `remote_shell_open` | 独立 shell stream 已连接、PTY 已启动、opened 已发送 | shell stream 的 output/exit/error | `session_id` | 不自动重发，由用户重新打开 |
+
+pending command 超时只说明没有收到 `ack/error`。对于 `remote_task_run`、`remote_shell_open` 这类有副作用命令，server 不能仅凭 pending 超时就假定 agent 没执行；需要结合业务结果、连接断开时间和人工操作决定。
 
 ### 控制消息示例
 
@@ -613,11 +767,18 @@ server 如果要远程打开 `processes.level=details` 或 `sockets.level=detail
   "protocol_version": 1,
   "sequence": 202,
   "sent_at": 1710001001,
-  "type": "remote_probe_run",
+  "type": "remote_probe_apply",
   "request": {
-    "task_id": "probe-1",
-    "probe_type": "tcp",
-    "target": "example.com:443"
+    "operation": "once",
+    "runs": [
+      {
+        "request_id": "probe-1",
+        "point_id": "point-main-api",
+        "probe_type": "tcp",
+        "target": "example.com:443",
+        "timeout": "5s"
+      }
+    ]
   }
 }
 ```
@@ -663,10 +824,16 @@ PendingRemoteTask
   result
 
 PendingRemoteProbe
-  task_id
+  run_id
   agent_id
-  sent_at
+  source          # once | job
+  point_id        # server 业务探测点 ID
+  request_id
+  job_id
+  probe_type
+  target
   status          # sent | success | failed | rejected
+  latency_ms
   result
 ```
 
@@ -677,12 +844,12 @@ PendingRemoteProbe
 server 需要把三类数据分开处理：
 
 - 最新状态：`snapshot` / `delta` / `heartbeat`。只保存最新状态，旧 report 不排队，防止高频 agent 把 server 内存打满。
-- 一次性结果：`ack` / `error` / `remote_task_result` / `remote_probe_result`。用 `sequence` 或 `task_id` 关联 pending 记录，可重复接收同一结果并做幂等覆盖。
-- 控制命令：server 主动发送给 agent。`config_patch` 可以在重连后按 desired config 重新下发；`remote_task_run` 这类有副作用的命令不要自动重发，除非 server 能根据 `task_id` 确认 agent 没有执行过。
+- 一次性结果：`ack` / `error` / `remote_task_result` / `remote_probe_result`。`ack/error` 用 `sequence` 关联 pending command，remote task 用 `task_id` 幂等，remote probe 用 `run_id` 幂等并优先用 `point_id` 做业务探测点关联。
+- 控制命令：server 主动发送给 agent。`config_patch` 可以在重连后按 desired config 重新下发；`remote_task_run` 这类有副作用的命令不要自动重发，除非 server 能根据 `task_id` 确认 agent 没有执行过。持续探测任务建议保存 desired jobs，重连后用 `remote_probe_apply(operation=replace)` 带新 `generation` 同步。
 
 建议规则：
 
-- 同一 agent 的 `ClientFrame.sequence` 小于等于已处理序号时，记录为重复或乱序，默认忽略。
+- 同一 agent 的 `ClientFrame.sequence` 小于等于已见最大序号时，只记录为可能乱序或重复，不能默认忽略；是否处理要看 payload 类型、幂等键和 `delta.base_sequence`。
 - 收到 `delta.base_sequence != delta_base_sequence` 时，不处理该 delta，立即发送 `snapshot_request`。
 - 收到新的 `snapshot` 后，用它重建 latest state，并把 `delta_base_sequence` 设置为该 frame 的 `sequence`。
 - 收到 `heartbeat` 时只更新 `last_heartbeat_at` 和 `last_seen_at`，不要覆盖指标。
@@ -700,7 +867,7 @@ server 需要把三类数据分开处理：
 - `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
 - `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
 - server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-level details` 或 `--allow-socket-level details`。
-- 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_run` 和未来的 remote task。
+- 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_apply(operation=once)` 和未来的 remote task。
 
 ### 测试清单
 
@@ -728,6 +895,7 @@ server 第一版建议至少覆盖这些测试：
 | control | `snapshot_request` ack | pending command 标记为 acked |
 | control | `snapshot_request` error | pending command 标记失败并保存错误 |
 | task | 重复 `remote_task_result.task_id` | 幂等覆盖，不创建重复记录 |
+| probe | 重复 `remote_probe_result.run_id` | 幂等覆盖，不创建重复记录 |
 | reconnect | agent 断开重连后发 snapshot | connection state 更新，latest state 正常覆盖 |
 
 ### 存储策略
@@ -808,11 +976,19 @@ remote_task_results
   updated_at INTEGER NOT NULL
 
 remote_probe_results
-  task_id TEXT PRIMARY KEY
+  run_id TEXT PRIMARY KEY
   agent_id TEXT NOT NULL
+  source TEXT NOT NULL
+  point_id TEXT NULL
+  request_id TEXT NULL
+  job_id TEXT NULL
   probe_type TEXT NOT NULL
   target TEXT NOT NULL
-  value INTEGER NOT NULL
+  status TEXT NOT NULL
+  latency_ms INTEGER NULL
+  duration_ms INTEGER NOT NULL
+  started_at INTEGER NOT NULL
+  finished_at INTEGER NOT NULL
   error TEXT NULL
   updated_at INTEGER NOT NULL
 ```
@@ -823,7 +999,8 @@ remote_probe_results
 - `delta`：先读取当前 `delta_base_sequence`；匹配才合并 JSON 并写回，不匹配不写库，只发送 `snapshot_request`。
 - `heartbeat`：只更新 `last_seen_at`，不改 `report_json` 和 `delta_base_sequence`。
 - `ack/error`：只更新 `pending_commands`，不要修改 latest report。
-- `remote_task_result` / `remote_probe_result`：按 `task_id` upsert，重复结果覆盖同一行，保证幂等。
+- `remote_task_result`：按 `task_id` upsert，重复结果覆盖同一行，保证幂等。
+- `remote_probe_result`：按 `run_id` upsert，重复结果覆盖同一行；额外保存 `source`、`point_id`、`request_id`、`job_id`，方便查询业务探测点、一次性请求和持续任务历史。
 
 ### 查询接口
 
@@ -852,10 +1029,10 @@ GET /api/v1/agents/{agent_id}
 | `/agent/v1/connect` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
 | `/api/v1/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
 | `/api/v1/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
-| `/api/v1/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_run` | 可后做 |
+| `/api/v1/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_apply` | 可后做 |
 | `/api/v1/commands/{command_id}` | `GET` | 查询 pending command 的 ack/error 状态 | 可后做 |
 | `/api/v1/agents/{agent_id}/tasks/{task_id}` | `GET` | 查询 remote task 结果 | 可后做 |
-| `/api/v1/agents/{agent_id}/probes/{task_id}` | `GET` | 查询 remote probe 结果 | 可后做 |
+| `/api/v1/agents/{agent_id}/probes/{run_id}` | `GET` | 查询 remote probe 单次运行结果 | 可后做 |
 | `/live/v1/dashboard` | `GET` upgrade 或 SSE | 前端 dashboard 实时推送、事件订阅和命令反馈 | 可后做 |
 
 端点职责建议：

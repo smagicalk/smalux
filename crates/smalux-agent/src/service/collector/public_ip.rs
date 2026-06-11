@@ -1,17 +1,19 @@
-//! Service 公网 IP 低频刷新调度。
+//! Service 采集模块的公网 IP 低频刷新调度。
+//!
+//! 该模块归属采集层，但不并入 `collector_loop` 主调度，避免公网请求慢或超时时
+//! 阻塞 core/disk/network/processes/sockets 这类本机指标采样。
 
 use crate::collect::LocalCollector;
 use crate::config::AgentConfig;
+use crate::service::message::TelemetryUpdateSender;
 use crate::telemetry::TelemetryUpdate;
 use smalux_core::model::info::{IdentityInfo, PublicIpInfo, PublicIpStatus};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
 
-use super::message::TelemetryUpdateSender;
-
-/// 低频刷新公网 IP。
-pub(crate) async fn refresh_identity_once(
+/// 低频刷新身份信息里的公网 IP 状态。
+async fn refresh_public_ip_identity_once(
     collector: &mut LocalCollector,
     config: &AgentConfig,
 ) -> IdentityInfo {
@@ -36,7 +38,7 @@ pub(crate) async fn public_ip_refresh_loop(
     loop {
         tokio::select! {
             _ = refresh_tick.tick(), if config.public_ip.enabled => {
-                let identity = refresh_identity_once(&mut collector, &config).await;
+                let identity = refresh_public_ip_identity_once(&mut collector, &config).await;
                 if !publish_identity_refresh(&telemetry_tx, identity).await {
                     break;
                 }
@@ -56,7 +58,7 @@ pub(crate) async fn public_ip_refresh_loop(
                 config = next;
                 tracing::info!("Public IP refresh config updated");
                 if refresh_immediately {
-                    let identity = refresh_identity_once(&mut collector, &config).await;
+                    let identity = refresh_public_ip_identity_once(&mut collector, &config).await;
                     if !publish_identity_refresh(&telemetry_tx, identity).await {
                         break;
                     }

@@ -245,11 +245,20 @@ pub mod redact {
 
         if let Some(quote) = quote {
             cursor += quote.len_utf8();
+            let mut escaped = false;
             while cursor < text.len() {
                 let Some(ch) = text[cursor..].chars().next() else {
                     break;
                 };
                 cursor += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
                 if ch == quote {
                     break;
                 }
@@ -385,6 +394,17 @@ pub mod redact {
             assert!(redacted.redacted);
             assert!(redacted.value.contains("mytoken=visible"));
             assert!(redacted.value.contains("token=<redacted>"));
+        }
+
+        /// 验证带转义引号的值会整体脱敏，而不是在转义处提前截断。
+        #[test]
+        fn redact_sensitive_text_handles_escaped_quotes() {
+            let redacted = redact_sensitive_text(r#"token=\"abc\\\"def\" other=value"#);
+
+            assert!(redacted.redacted);
+            assert_eq!(redacted.value, r#"token=<redacted> other=value"#);
+            assert!(!redacted.value.contains("abc"));
+            assert!(!redacted.value.contains("def"));
         }
     }
 }

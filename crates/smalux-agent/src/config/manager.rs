@@ -325,7 +325,7 @@ mod tests {
 
     /// 验证 server patch 可以动态调整远程探测运行限制。
     #[test]
-    fn apply_patch_updates_remote_probe_runtime_limits() {
+    fn apply_patch_updates_remote_probe_execution_limits() {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
 
         let updated = manager

@@ -4258,6 +4258,7 @@ dependencies = [
  "axum-extra",
  "bytes 1.11.1",
  "clap",
+ "form_urlencoded",
  "futures-util",
  "headers",
  "http",
@@ -4278,6 +4279,7 @@ dependencies = [
  "tower-sessions",
  "tower_governor",
  "tracing",
+ "url",
  "uuid",
  "validator",
 ]

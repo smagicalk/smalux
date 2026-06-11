@@ -152,13 +152,14 @@ impl SocketInfo {
         }
     }
 
-    /// 根据旧值构造 stale；没有旧值时降级为 failed。
-    pub fn stale_or_failed(previous: Option<&Self>, error: String) -> Self {
+    /// 根据旧值构造 stale；没有旧值时降级为 failed，并保留当前请求级别。
+    pub fn stale_or_failed(previous: Option<&Self>, level: MetricLevel, error: String) -> Self {
         let Some(previous) = previous
             .filter(|value| matches!(value.status, MetricStatus::Ready | MetricStatus::Stale))
         else {
             return Self {
                 status: MetricStatus::Failed,
+                level,
                 error: Some(error),
                 ..Self::default()
             };
@@ -170,17 +171,24 @@ impl SocketInfo {
             status: MetricStatus::Stale,
             source: previous.source.clone(),
             accuracy: previous.accuracy.clone(),
-            level: previous.level,
-            light: previous.light.clone(),
-            details: previous.details.clone(),
+            level,
+            light: previous
+                .light
+                .clone()
+                .filter(|_| level == MetricLevel::Light),
+            details: previous
+                .details
+                .clone()
+                .filter(|_| level == MetricLevel::Details),
             error: Some(error),
         }
     }
 
-    /// 构造当前平台不支持状态。
-    pub fn unsupported(error: String) -> Self {
+    /// 构造当前平台不支持状态，并保留调用方请求的采集级别。
+    pub fn unsupported(level: MetricLevel, error: String) -> Self {
         Self {
             status: MetricStatus::Unsupported,
+            level,
             error: Some(error),
             ..Self::default()
         }

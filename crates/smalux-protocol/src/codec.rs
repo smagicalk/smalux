@@ -161,10 +161,10 @@ mod tests {
     use super::*;
     use crate::frame::{
         Ack, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest, OutboundReport,
-        ProtocolError, RemoteProbeResult, RemoteProbeType, RemoteShellDataEncoding,
-        RemoteShellOpenRequest, RemoteShellStreamCommand, RemoteShellStreamEvent,
-        RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus, ServerFrame, ServerPayload,
-        SnapshotRequest,
+        ProtocolError, RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource,
+        RemoteProbeResultStatus, RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest,
+        RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult,
+        RemoteTaskStatus, ServerFrame, ServerPayload, SnapshotRequest,
     };
     use smalux_core::model::info::MetricLevel;
     use std::time::Duration;
@@ -440,10 +440,15 @@ mod tests {
     #[test]
     fn remote_probe_result_encodes_as_client_frame() {
         let result = RemoteProbeResult {
-            task_id: serde_json::Value::from(7),
+            run_id: "probe-run-1".to_string(),
+            source: RemoteProbeResultSource::Once,
+            point_id: Some(RemoteProbeId::from("point-7")),
+            request_id: Some(RemoteProbeId::from(7)),
+            job_id: None,
             probe_type: RemoteProbeType::Tcp,
             target: "example.com:443".to_string(),
-            value: 12,
+            status: RemoteProbeResultStatus::Success,
+            latency_ms: Some(12),
             started_at: 100,
             finished_at: 101,
             duration_ms: 12,
@@ -458,9 +463,14 @@ mod tests {
         assert_eq!(decoded.sequence, 8);
         match decoded.payload {
             ClientPayload::RemoteProbeResult { result } => {
-                assert_eq!(result.task_id, serde_json::Value::from(7));
+                assert_eq!(result.run_id, "probe-run-1");
+                assert_eq!(result.source, RemoteProbeResultSource::Once);
+                assert_eq!(result.point_id, Some(RemoteProbeId::from("point-7")));
+                assert_eq!(result.request_id, Some(RemoteProbeId::from(7)));
+                assert_eq!(result.job_id, None);
                 assert_eq!(result.probe_type, RemoteProbeType::Tcp);
-                assert_eq!(result.value, 12);
+                assert_eq!(result.status, RemoteProbeResultStatus::Success);
+                assert_eq!(result.latency_ms, Some(12));
             }
             _ => panic!("expected remote probe result payload"),
         }

@@ -82,12 +82,15 @@
 
 ## 当前状态
 
+说明：当前这份计划只描述 `smalux-server` 自身的实现路径。最近一轮实际代码推进主要发生在 `smalux-agent` / `smalux-protocol` / `smalux-core`，包括更严格的协议边界、控制响应可靠性、远程 shell ready 语义、出站优先级和分层恢复；这些变化不会改变本计划的 server 里程碑顺序，但会提高后续 server 对接时的约束清晰度。
+
 已经完成：
 
 - server crate 依赖已配置。
 - `query/` 模块已删除，前端读模型职责下沉到 `service/agent.rs` 和 `service/dashboard.rs`。
 - 自有协议 agent 主连接路径统一为 `/agent/v1/connect`。
 - 已预建 `bootstrap.rs`、`state.rs`、`cli/`、`config/`、`auth/`、`http/`、`ingest/`、`service/`、`storage/` 骨架。
+- 已接入 `cli/args.rs` 和最小 `bootstrap::run()`，`cargo run -p smalux-server -- --help` 可以输出启动参数。
 - 前端托管规则已确定：是否内嵌由 `frontend-embed` 编译 feature 决定，运行时只配置 `frontend.enabled`、`frontend.dir`、`frontend.spa_fallback`。
 
 当前不做：
@@ -99,11 +102,12 @@
 
 下一步优先级：
 
-1. 实现 `cli/args.rs`、`cli/startup.rs`、`config/model.rs`、`config/validation.rs`。
-2. 把 `main.rs` 改成只调用 `bootstrap::run().await`。
-3. 实现 `MemoryRepository` 和最小 `GET /api/v1/health`。
-4. 实现 `/agent/v1/connect` 最小 WebSocket upgrade。
-5. 接入 binary_plain snapshot/heartbeat 到 latest state。
+1. 继续完善 `ServerArgs::into_config()`，把 CLI/env 输入转成稳定 `ServerConfig`。
+2. 补全 `config/model.rs` 和 `config/validation.rs` 的剩余启动校验。
+3. 在 `bootstrap.rs` 串联配置校验、日志初始化和 HTTP server。
+4. 实现 `MemoryRepository` 和最小 `GET /api/v1/health`。
+5. 实现 `/agent/v1/connect` 最小 WebSocket upgrade。
+6. 接入 binary_plain snapshot/heartbeat 到 latest state。
 
 ## 总体边界
 
@@ -151,7 +155,6 @@ src/
   cli.rs
   cli/
     args.rs
-    startup.rs      # 后续实现 CLI -> StartupOptions 时再创建
   config.rs
   config/
     defaults.rs
@@ -282,7 +285,6 @@ cargo check -p smalux-server
 
 - `src/cli.rs`
 - `src/cli/args.rs`
-- `src/cli/startup.rs`
 - `src/config.rs`
 - `src/config/defaults.rs`
 - `src/config/model.rs`
@@ -293,10 +295,22 @@ cargo check -p smalux-server
 
 ```text
 server.bind_addr
-  -> 默认 127.0.0.1:3000。
+  -> 默认 127.0.0.1。
 
-database.url
-  -> 默认 sqlite://smalux-server.db；支持 sqlite://、postgres://、postgresql:// 和 mysql://。
+server.bind_port
+  -> 默认 3000。
+
+database.driver
+  -> 默认 sqlite；支持 sqlite、postgres 和 mysql。
+
+database.name
+  -> 数据库目标；SQLite 默认 smalux-server.db，PostgreSQL/MySQL 默认 smalux。
+
+database.host / database.port / database.user / database.password
+  -> PostgreSQL/MySQL 使用；CLI 中可选，配置校验阶段按 driver 判断哪些必填。
+
+database.params
+  -> 可重复 KEY=VALUE 映射，用于生成连接 URL query 参数，例如 mode=rwc、sslmode=require、charset=utf8mb4、options=--search_path=public。
 
 auth.agent_credentials
   -> 不属于启动配置；添加 agent 时由 server 动态生成 token/key 并保存到数据库。
@@ -320,11 +334,18 @@ log.max_size_mb
   -> 默认 64。
 ```
 
-最终 server CLI 只保留下面 8 个参数：
+最终 server CLI 保留 server 启动静态参数和数据库关键属性：
 
 ```text
---bind, -b
---database-url, -d
+--bind-addr, -b
+--bind-port, -p
+--database-driver, -d
+--database-name
+--database-host
+--database-port
+--database-user
+--database-password
+--database-param
 --serve-frontend
 --frontend-dir
 --frontend-spa-fallback
@@ -356,13 +377,12 @@ dashboard realtime queue capacity
 
 1. 在 `cli/args.rs` 定义 `ServerArgs`。
 2. 使用 `clap` derive，给常用参数加长参数和短参数。
-3. 在 `cli/startup.rs` 定义 `StartupOptions`，只做 CLI 到启动输入的转换。
-4. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`FrontendConfig`、`LogConfig`、`AuthConfig`。
+3. 在 `ServerArgs::into_config()` 中只做 CLI 到稳定配置的转换。
+4. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`FrontendConfig`、`LogConfig`。
 5. 在 `config/defaults.rs` 集中默认值。
-6. 给配置实现 `Default`。
-7. 实现 `ServerConfig::from_startup_options(options)`。
-8. 在 `config/validation.rs` 实现配置校验，例如端口格式、数据库 URL 非空且 scheme 支持、`frontend.enabled=true` 且没有内置前端时 `frontend.dir` 非空、日志滚动参数大于 0。
-9. `main.rs` 只调用 bootstrap，暂不直接解析 CLI。
+6. 在配置转换时根据 driver 补齐默认数据库目标、host 和端口。
+7. 在 `config/validation.rs` 实现配置校验，例如 SQLite 不允许网络字段、PostgreSQL/MySQL 必须有 user、`frontend.enabled=true` 且没有内置前端时 `frontend.dir` 非空、日志滚动参数大于 0。
+8. `main.rs` 只调用 bootstrap，暂不直接解析 CLI。
 
 测试：
 
@@ -460,10 +480,16 @@ RemoteTaskResult
   finished_at
 
 RemoteProbeResult
-  task_id
+  run_id
   agent_id
+  source
+  request_id
+  job_id
   probe_type
+  target
   status
+  latency_ms
+  duration_ms
   result_json
   started_at
   finished_at
@@ -558,10 +584,16 @@ remote_task_results
 
 remote_probe_results
   id
-  task_id
+  run_id
   agent_id
+  source
+  request_id
+  job_id
   probe_type
+  target
   status
+  latency_ms
+  duration_ms
   result_json
   started_at
   finished_at
@@ -767,7 +799,7 @@ unknown
 snapshot_request
 config_patch
 remote_task_run
-remote_probe_run
+remote_probe_apply
 remote_shell_open
 remote_shell_input
 remote_shell_resize
@@ -1183,7 +1215,7 @@ rg -n -F 'secret' crates/smalux-server/README.md crates/smalux-server/plan.md
 
 ```text
 Milestone 1: 可启动
-  1. CLI + StartupOptions
+  1. CLI + ServerConfig
   2. ServerConfig + defaults + validation
   3. bootstrap::run()
   4. GET /api/v1/health
@@ -1221,14 +1253,13 @@ Milestone 6: UI 和扩展
 
 ## 当前下一步建议
 
-当前 server 还是骨架。下一步只做 Milestone 1：
+当前 server 还是骨架，但 `cli/args.rs` 和最小 `bootstrap::run()` 已接入。下一步继续完成 Milestone 1：
 
-1. 实现 `cli/args.rs`、`cli/startup.rs`。
-2. 实现 `config/model.rs`、`config/defaults.rs`、`config/validation.rs`。
-3. 把 `main.rs` 改为 async，并调用 `bootstrap::run().await`。
-4. 在 `bootstrap.rs` 串联 CLI、配置校验和日志初始化。
-5. 在 `state.rs` 定义最小 `AppState`。
-6. 在 `http/router.rs` 和 `http/rest.rs` 增加最小 `GET /api/v1/health`。
+1. 完善 `ServerArgs::into_config()`，把 `ServerArgs` 转换为稳定配置。
+2. 补全 `config/model.rs` 和 `config/validation.rs` 的剩余启动校验。
+3. 在 `bootstrap.rs` 串联启动输入、配置校验和日志初始化。
+4. 在 `state.rs` 定义最小 `AppState`。
+5. 在 `http/router.rs` 和 `http/rest.rs` 增加最小 `GET /api/v1/health`。
 
 完成 Milestone 1 后再进入 `MemoryRepository` 和 `/agent/v1/connect`，不要在第一步同时实现数据库、secure_psk 或前端托管。
 
@@ -1341,7 +1372,6 @@ src/bootstrap.rs
 src/state.rs
 src/cli.rs
 src/cli/args.rs
-src/cli/startup.rs
 src/config.rs
 src/config/defaults.rs
 src/config/model.rs
@@ -1353,23 +1383,29 @@ src/http/rest.rs
 
 具体步骤：
 
-1. 在 `config/defaults.rs` 定义默认监听地址、数据库 URL 和前端目录。
+1. 在 `config/defaults.rs` 定义默认监听地址、数据库 driver、数据库目标和前端目录。
 2. 在 `cli/args.rs` 定义 `ServerArgs`，使用 `clap::Parser`。
 3. CLI 首批参数只实现启动必需项：
-   - `--bind`, `-b`
-   - `--database-url`, `-d`
+   - `--bind-addr`, `-b`
+   - `--bind-port`, `-p`
+   - `--database-driver`, `-d`
+   - `--database-name`
+   - `--database-host`
+   - `--database-port`
+   - `--database-user`
+   - `--database-password`
+   - `--database-param`
    - `--serve-frontend`
    - `--frontend-dir`
    - `--frontend-spa-fallback`
    - `--log-file`
    - `--log-retention-files`, `-L`
    - `--log-max-size-mb`
-4. 在 `cli/startup.rs` 定义 `StartupOptions`，负责从 `ServerArgs` 转成启动输入。
-5. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`AuthConfig`、`FrontendConfig`、`LogConfig`。
+4. 在 `ServerArgs::into_config()` 中负责从 `ServerArgs` 转成稳定配置。
+5. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`FrontendConfig`、`LogConfig`。
 6. 在 `config/validation.rs` 实现 `validate_server_config()`。
 7. 在 `bootstrap.rs` 实现 `run()`：
    - 解析 CLI。
-   - 转成 `StartupOptions`。
    - 生成 `ServerConfig`。
    - 校验配置。
    - 初始化日志。
@@ -1384,7 +1420,7 @@ src/http/rest.rs
 验收标准：
 
 - `cargo run -p smalux-server -- --help` 能显示参数。
-- `cargo run -p smalux-server -- -b 127.0.0.1:3000` 能启动。
+- `cargo run -p smalux-server -- -b 127.0.0.1 -p 3000` 能启动。
 - `GET /api/v1/health` 返回 JSON。
 - 启动日志不打印 token、secret、Authorization header。
 - `frontend.enabled=false` 时不注册前端 fallback。
@@ -1402,7 +1438,7 @@ cargo run -p smalux-server -- --help
 推荐测试：
 
 - 默认 CLI 能生成有效配置。
-- `--bind` 能覆盖默认监听地址。
+- `--bind-addr` 能覆盖默认监听地址，`--bind-port` 能覆盖默认监听端口。
 - `--serve-frontend` 能打开前端托管标记。
 - token 和 secret 字段 Debug 输出脱敏。
 - health handler 返回 `status=ok`。
@@ -1680,7 +1716,7 @@ cargo test -p smalux-server
 
 | 任务包 | 前置条件 | 主要产出 | 可验证能力 | 是否可并行 |
 | --- | --- | --- | --- | --- |
-| 1. 启动参数模型 | 当前骨架可编译 | `ServerArgs`、`StartupOptions` | `--help` 正常输出 | 不建议并行 |
+| 1. 启动参数模型 | 当前骨架可编译 | `ServerArgs`、`ServerConfig` | `--help` 正常输出 | 不建议并行 |
 | 2. 配置模型和默认值 | 任务包 1 | `ServerConfig` 和默认值 | 默认配置可生成 | 不建议并行 |
 | 3. 配置校验 | 任务包 2 | `validate_server_config()` | 错误配置 fail-fast | 不建议并行 |
 | 4. bootstrap 和最小启动 | 任务包 1-3 | `bootstrap::run()` | server 可启动 | 不建议并行 |
@@ -1733,17 +1769,11 @@ Milestone 1 结束时，建议已经具备下面这些明确函数或类型。�
 cli::args::ServerArgs
   -> clap 参数结构，只负责从命令行读取原始输入。
 
-cli::startup::StartupOptions
-  -> 启动输入结构，只承接 CLI/env 解析后的值。
-
-cli::startup::StartupOptions::from_args(args)
-  -> 把 ServerArgs 转换为 StartupOptions。
+cli::args::ServerArgs::into_config()
+  -> 把 CLI/env 输入转换为稳定 ServerConfig。
 
 config::model::ServerConfig
   -> 运行时最终配置。
-
-config::model::ServerConfig::from_startup_options(options)
-  -> 合并默认值和启动输入。
 
 config::validation::validate_server_config(config)
   -> 启动前校验配置，返回结构化错误。
@@ -1778,8 +1808,8 @@ Milestone 1 不应该出现：
 单元测试：
 
 1. `ServerConfig::default()` 可通过校验。
-2. `--bind` 能覆盖默认监听地址。
-3. `--database-url` 能覆盖默认数据库地址。
+2. `--bind-addr` 能覆盖默认监听地址，`--bind-port` 能覆盖默认监听端口。
+3. `--database-driver` 能覆盖默认数据库类型。
 4. `--serve-frontend` 能打开前端托管标记。
 5. `frontend.enabled=true` 且 `frontend.dir` 为空时校验失败。
 6. token、secret 类字段不出现在 CLI Debug 输出中。
@@ -1795,7 +1825,7 @@ router 测试：
 
 ```powershell
 cargo run -p smalux-server -- --help
-cargo run -p smalux-server -- -b 127.0.0.1:3000
+cargo run -p smalux-server -- -b 127.0.0.1 -p 3000
 ```
 
 ### Milestone 1 实际实施清单
@@ -1809,7 +1839,6 @@ Milestone 1 建议拆成 7 个小步骤完成，每一步都能单独编译。
 ```text
 src/cli.rs
 src/cli/args.rs
-src/cli/startup.rs
 src/main.rs
 ```
 
@@ -1817,8 +1846,8 @@ src/main.rs
 
 1. `cli.rs` 只声明子模块。
 2. `args.rs` 定义 `ServerArgs`。
-3. `startup.rs` 定义 `StartupOptions`。
-4. `main.rs` 暂时不需要使用这些类型，但模块必须能编译。
+3. `args.rs` 定义 `ServerArgs::into_config()`。
+4. `main.rs` 暂时不需要启动 HTTP server，但模块必须能编译。
 
 检查：
 
@@ -1868,14 +1897,14 @@ cargo test -p smalux-server default_server_config_is_valid
 改动文件：
 
 ```text
-src/cli/startup.rs
+src/cli/args.rs
 src/config/model.rs
 ```
 
 实现内容：
 
-1. `StartupOptions::from_args()` 保留 CLI 原始输入。
-2. `ServerConfig::from_startup_options()` 合并默认值和启动输入。
+1. `ServerArgs::into_config()` 合并默认值和 CLI 输入。
+2. `DatabaseConfig::connection_url()` 负责生成最终数据库连接 URL。
 3. CLI 未传字段使用默认值。
 4. CLI 传了字段只覆盖对应配置。
 
@@ -1883,7 +1912,8 @@ src/config/model.rs
 
 ```powershell
 cargo test -p smalux-server cli_bind_overrides_default_bind
-cargo test -p smalux-server cli_database_url_overrides_default_database_url
+cargo test -p smalux-server cli_database_driver_overrides_default_driver
+cargo test -p smalux-server cli_database_password_debug_is_redacted
 ```
 
 完成后不应该有：
@@ -1906,7 +1936,7 @@ src/state.rs
 
 1. `main.rs` 改为 async。
 2. `main.rs` 只调用 `bootstrap::run().await`。
-3. `bootstrap::run()` 完成 CLI -> StartupOptions -> ServerConfig -> validate。
+3. `bootstrap::run()` 完成 CLI -> ServerConfig -> validate。
 4. `state.rs` 定义 `AppState`。
 5. 暂时可以先不启动 server，或者启动空 router。
 
@@ -1952,7 +1982,7 @@ cargo test -p smalux-server health_returns_ok
 手动检查：
 
 ```powershell
-cargo run -p smalux-server -- -b 127.0.0.1:3000
+cargo run -p smalux-server -- -b 127.0.0.1 -p 3000
 ```
 
 然后访问：
@@ -2362,9 +2392,10 @@ compat::komari::router()
 main()
   -> bootstrap::run()
   -> cli::args::ServerArgs::parse()
-  -> cli::startup::StartupOptions::from_args()
-  -> config::model::ServerConfig::from_startup_options()
+  -> cli::args::ServerArgs::into_config()
   -> config::validation::validate_server_config()
+  -> config::model::DatabaseConfig::connection_url() 预检
+  -> config::model::DatabaseConfig::redacted_connection_url() 用于日志
   -> smalux_core::log 初始化日志
   -> storage 初始化，首版 MemoryRepository，后续 SqliteRepository
   -> service 初始化，注入 repository、connection registry、event publisher
@@ -2548,17 +2579,23 @@ browser
 ```text
 src/cli.rs
 src/cli/args.rs
-src/cli/startup.rs
 ```
 
 步骤：
 
-1. 在 `cli.rs` 声明 `pub mod args;` 和 `pub mod startup;`。
+1. 在 `cli.rs` 声明 `pub mod args;`。
 2. 在 `cli/args.rs` 定义 `ServerArgs`。
 3. 给 `ServerArgs` 实现 `clap::Parser`。
 4. 添加基础参数：
-   - `--bind`, `-b`
-   - `--database-url`, `-d`
+   - `--bind-addr`, `-b`
+   - `--bind-port`, `-p`
+   - `--database-driver`, `-d`
+   - `--database-name`
+   - `--database-host`
+   - `--database-port`
+   - `--database-user`
+   - `--database-password`
+   - `--database-param`
    - `--serve-frontend`
    - `--frontend-dir`
    - `--frontend-spa-fallback`
@@ -2571,31 +2608,29 @@ src/cli/startup.rs
 6. `--frontend-spa-fallback` 默认 `true`，需要关闭时传 `--frontend-spa-fallback false`。
 7. 不添加 agent token/key 参数，这些凭据由添加 agent 流程动态生成并保存到数据库。
 8. 不添加 remote task/shell/probe 开关；这是 agent 能力和管理权限，不是 server 启动参数。
-9. 在 `cli/startup.rs` 定义 `StartupOptions`。
-10. 实现 `StartupOptions::from_args(args)`。
-11. 不在 `StartupOptions` 中做复杂校验，只做路径、字符串、开关的原样承接。
+9. 实现 `ServerArgs::into_config()`，把 CLI/env 输入转换成稳定 `ServerConfig`。
+10. 不在 CLI 层做业务逻辑，只处理启动输入、默认值合并和基础类型转换。
 
 完成标准：
 
 - `cargo run -p smalux-server -- --help` 能看到全部参数。
 - `ServerArgs` 中没有业务状态字段。
-- `StartupOptions` 不依赖 axum、storage、service。
+- CLI 转换逻辑不依赖 axum、storage、service。
 
 文件级执行顺序：
 
 1. 先改 `src/cli.rs`：
    - 只声明 `pub mod args;`
-   - 只声明 `pub mod startup;`
    - 不写业务函数。
 2. 再改 `src/cli/args.rs`：
    - 写 `ServerArgs`。
    - 按分类组织字段：HTTP、database、frontend、log。
    - 字段名使用清晰全称，不使用 `pri`、`cfg` 这种缩写。
-3. 再改 `src/cli/startup.rs`：
-   - 写 `StartupOptions`。
-   - 写 `impl From<ServerArgs> for StartupOptions` 或 `from_args()`。
-   - 保持原始输入，不做复杂校验。
-4. 最后临时调整 `bootstrap.rs` 或测试入口：
+3. 再给 `ServerArgs` 实现 `into_config()`：
+   - 转换成 `ServerConfig`。
+   - 根据 database driver 补齐默认数据库目标、host 和端口。
+   - 重复 `database-param` 直接报错。
+4. 最后调整 `bootstrap.rs` 或测试入口：
    - 只验证 `ServerArgs::parse()` 能编译。
    - 不提前启动 HTTP server。
 
@@ -2603,7 +2638,14 @@ src/cli/startup.rs
 
 ```text
 bind_addr
-database_url
+bind_port
+database_driver
+database_name
+database_host
+database_port
+database_user
+database_password
+database_params
 serve_frontend
 frontend_dir
 frontend_spa_fallback
@@ -2634,29 +2676,32 @@ src/config.rs
 src/config/defaults.rs
 src/config/model.rs
 src/config/validation.rs
-src/cli/startup.rs
+src/cli/args.rs
 ```
 
 步骤：
 
 1. 在 `config.rs` 声明 `defaults`、`model`、`validation`。
 2. 在 `config/defaults.rs` 定义默认常量。
-3. 默认监听地址使用 `127.0.0.1:3000`。
-4. 默认数据库地址使用 `sqlite://smalux-server.db`。
-5. 默认 `frontend.enabled=false`。
-6. 默认 `frontend.dir=apps/smalux-web/dist`。
-7. 默认 `frontend.spa_fallback=true`。
-8. agent token/key 不设置默认值，添加 agent 时由 server 动态生成并存库。
-9. remote task/shell/probe 不在 server CLI 中配置，后续由 agent 能力和管理权限决定。
-10. 在 `config/model.rs` 定义：
+3. 默认监听地址使用 `127.0.0.1`，默认监听端口使用 `3000`。
+4. 默认数据库 driver 使用 `sqlite`。
+5. SQLite 默认数据库目标使用 `smalux-server.db`。
+6. PostgreSQL/MySQL 默认数据库目标使用 `smalux`。
+7. PostgreSQL/MySQL 默认 host 使用 `127.0.0.1`。
+8. PostgreSQL 默认端口 `5432`，MySQL 默认端口 `3306`。
+9. 默认 `frontend.enabled=false`。
+10. 默认 `frontend.dir=apps/smalux-web/dist`。
+11. 默认 `frontend.spa_fallback=true`。
+12. agent token/key 不设置默认值，添加 agent 时由 server 动态生成并存库。
+13. remote task/shell/probe 不在 server CLI 中配置，后续由 agent 能力和管理权限决定。
+14. 在 `config/model.rs` 定义：
     - `ServerConfig`
     - `HttpConfig`
     - `DatabaseConfig`
-    - `AuthConfig`
     - `FrontendConfig`
-11. 给模型实现 `Default`。
-12. 实现 `ServerConfig::from_startup_options(options)`。
-13. token、secret 类字段的 `Debug` 输出必须脱敏。
+    - `LogConfig`
+15. 在 `DatabaseConfig` 上实现 `connection_url()` 和 `redacted_connection_url()`。
+16. token、secret 类字段的 `Debug` 输出必须脱敏。
 
 完成标准：
 
@@ -2677,7 +2722,7 @@ src/cli/startup.rs
 3. 再改 `src/config/validation.rs`：
    - 先只写函数签名和基础校验。
    - 不在这里加载文件内容。
-4. 最后回到 `src/cli/startup.rs`：
+4. 最后回到 `src/cli/args.rs`：
    - 确认 CLI 字段能映射到配置字段。
    - 缺失项使用默认值。
 
@@ -2689,13 +2734,18 @@ ServerConfig
   database: DatabaseConfig
   frontend: FrontendConfig
   log: LogConfig
-  auth: AuthConfig
 
 HttpConfig
   bind_addr
 
 DatabaseConfig
-  url
+  driver
+  name
+  host
+  port
+  user
+  password
+  params
 
 FrontendConfig
   enabled
@@ -2706,10 +2756,6 @@ LogConfig
   file
   retention_files
   max_size_mb
-
-AuthConfig
-  # 不包含启动时写死的 agent token/key。
-  # agent 凭据由添加 agent 流程生成，并通过 storage/auth 查询。
 
 ```
 
@@ -2732,13 +2778,15 @@ src/config/model.rs
 
 步骤：
 
-1. 校验 bind 地址可解析为 `SocketAddr`。
-2. 校验 database URL 非空，并且 scheme 是 `sqlite`、`postgres`、`postgresql` 或 `mysql`。
-3. 校验 `frontend.enabled=true` 且未编译 `frontend-embed` 时，`frontend.dir` 非空。
-4. 校验 `log.retention_files > 0`。
-5. 校验 `log.max_size_mb > 0`。
-6. agent token/key 不属于启动配置，不在这里校验。
-7. 返回结构化错误，错误信息不要包含 token 或 secret。
+1. CLI 转换阶段校验 bind 地址可解析为 `IpAddr`，bind 端口可解析为 `u16`。
+2. 校验 database name 非空。
+3. 校验 SQLite 不允许传 host、port、user、password。
+4. 校验 PostgreSQL/MySQL 必须有 host 和 user，port 缺失时由配置层补默认值。
+5. 校验 `frontend.enabled=true` 且未编译 `frontend-embed` 时，`frontend.dir` 非空。
+6. 校验 `log.retention_files > 0`。
+7. 校验 `log.max_size_mb > 0`。
+8. agent token/key 不属于启动配置，不在这里校验。
+9. 返回结构化错误，错误信息不要包含 token 或 secret。
 
 完成标准：
 
@@ -2789,24 +2837,23 @@ src/http/rest.rs
 1. `main.rs` 改成 `#[tokio::main] async fn main() -> anyhow::Result<()>`。
 2. `main.rs` 只调用 `bootstrap::run().await`。
 3. `bootstrap::run()` 解析 `ServerArgs`。
-4. 转成 `StartupOptions`。
-5. 生成 `ServerConfig`。
-6. 调用配置校验。
-7. 初始化日志。
-8. 构建 `AppState`。
-9. 构建 axum router。
-10. 绑定监听地址。
-11. 打印启动摘要：
+4. 通过 `ServerArgs::into_config()` 生成 `ServerConfig`。
+5. 调用配置校验。
+6. 初始化日志。
+7. 构建 `AppState`。
+8. 构建 axum router。
+9. 绑定监听地址。
+10. 打印启动摘要：
     - bind address
     - database backend
     - frontend enabled
     - secure mode enabled
     - database backend
-12. 启动 axum server。
+11. 启动 axum server。
 
 完成标准：
 
-- `cargo run -p smalux-server -- -b 127.0.0.1:3000` 能启动。
+- `cargo run -p smalux-server -- -b 127.0.0.1 -p 3000` 能启动。
 - 启动日志清晰，且不包含敏感值。
 - `main.rs` 不直接出现配置解析、路由构建、数据库初始化细节。
 
@@ -3794,7 +3841,8 @@ cargo fmt --all --check
 cargo check -p smalux-server
 cargo test -p smalux-server
 rg -n -F '/api/agents/connect' crates/smalux-agent crates/smalux-server/src crates/smalux-server/README.md
-rg -n -F 'config/cli' crates/smalux-server/src crates/smalux-server/README.md
+rg -n -F -- '--frontend-enabled' crates/smalux-server/src crates/smalux-server/README.md
+rg -n -F 'SMALUX_SERVER_FRONTEND_ENABLED' crates/smalux-server/src crates/smalux-server/README.md
 rg -n -F 'FrontendMode' crates/smalux-server/src crates/smalux-server/README.md
 rg -n -F 'frontend.mode' crates/smalux-server/src crates/smalux-server/README.md
 ```

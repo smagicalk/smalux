@@ -1,5 +1,8 @@
 //! Service 本机指标采集调度。
 
+/// 公网 IP/身份低频刷新采集；单独 loop 避免外部网络请求阻塞本机指标采样。
+pub(crate) mod public_ip;
+
 use crate::collect::LocalCollector;
 use crate::config::AgentConfig;
 use crate::telemetry::TelemetryUpdate;

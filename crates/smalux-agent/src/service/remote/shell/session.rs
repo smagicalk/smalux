@@ -70,8 +70,8 @@ impl RemoteShellSession {
         })
     }
 
-    /// 运行 shell 会话。
-    pub(super) async fn run(self) -> anyhow::Result<()> {
+    /// 执行最小就绪检查：stream 建连、PTY 启动并发送 opened 事件。
+    pub(super) async fn establish_ready(self) -> anyhow::Result<RemoteShellSessionReady> {
         let session_id = self.request.session_id.clone();
         let (input_tx, input_rx) = mpsc::channel(SHELL_INPUT_CHANNEL_CAPACITY);
         let mut client = WebSocketClient::new_with_config(self.stream_config.clone());
@@ -84,54 +84,80 @@ impl RemoteShellSession {
         client.connect().await?;
         let stream = Arc::new(Mutex::new(client));
         let sender = ShellStreamSender::new(stream.clone(), self.stream_codec.clone());
+        let (cols, rows) = open_request_initial_size(&self.request);
+        let shell = spawn_pty_shell(&self.shell_config, cols, rows)?;
 
-        let result = self.run_connected(sender.clone(), input_rx).await;
+        if let Err(error) = sender
+            .send_event(RemoteShellStreamEvent::Opened {
+                session_id: session_id.clone(),
+            })
+            .await
+        {
+            let _ = stream.lock().await.close().await;
+            shell.shutdown().await;
+            return Err(error);
+        }
+
+        Ok(RemoteShellSessionReady {
+            session_id,
+            shell_config: self.shell_config,
+            sender,
+            input_rx,
+            shell,
+            stream,
+            _permit: self._permit,
+        })
+    }
+}
+
+/// 已完成 stream/PTY ready 阶段的 shell 会话。
+pub(super) struct RemoteShellSessionReady {
+    /// 会话 ID。
+    session_id: String,
+    /// 会话启动时捕获的动态运行限制。
+    shell_config: RemoteShellConfig,
+    /// shell stream 发送端。
+    sender: ShellStreamSender,
+    /// shell stream 输入接收端。
+    input_rx: mpsc::Receiver<RemoteShellInput>,
+    /// 已启动的 PTY shell。
+    shell: PtyShell,
+    /// 已连接的 stream。
+    stream: SharedShellStream,
+    /// 会话名额 guard。
+    _permit: RemoteShellSessionPermit,
+}
+
+impl RemoteShellSessionReady {
+    /// 在 ready 之后运行 shell 主循环。
+    pub(super) async fn run(mut self) -> anyhow::Result<()> {
+        let result = run_shell_loop(
+            &self.session_id,
+            &self.shell_config,
+            &self.sender,
+            &mut self.shell,
+            self.input_rx,
+        )
+        .await;
         if let Err(err) = &result {
-            let _ = sender
+            let _ = self
+                .sender
                 .send_event(RemoteShellStreamEvent::Error {
-                    session_id: session_id.clone(),
+                    session_id: self.session_id.clone(),
                     message: err.to_string(),
                 })
                 .await;
         }
 
-        stream.lock().await.close().await?;
-        result
-    }
-
-    /// 在 stream 已连接后启动本地 PTY shell 并桥接 IO。
-    async fn run_connected(
-        self,
-        sender: ShellStreamSender,
-        input_rx: mpsc::Receiver<RemoteShellInput>,
-    ) -> anyhow::Result<()> {
-        let session_id = self.request.session_id.clone();
-        let (cols, rows) = open_request_initial_size(&self.request);
-        let mut shell = spawn_pty_shell(&self.shell_config, cols, rows)?;
-
-        sender
-            .send_event(RemoteShellStreamEvent::Opened {
-                session_id: session_id.clone(),
-            })
-            .await?;
-
-        let result = run_shell_loop(
-            &session_id,
-            &self.shell_config,
-            &sender,
-            &mut shell,
-            input_rx,
-        )
-        .await;
-        shell.shutdown().await;
+        self.shell.shutdown().await;
         let exit_code = result?;
-
-        sender
+        self.sender
             .send_event(RemoteShellStreamEvent::Exit {
-                session_id,
+                session_id: self.session_id,
                 code: exit_code,
             })
-            .await
+            .await?;
+        self.stream.lock().await.close().await
     }
 }
 

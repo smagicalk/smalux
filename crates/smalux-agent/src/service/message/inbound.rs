@@ -12,7 +12,7 @@ use crate::service::collector::{CollectorCommand, CollectorCommandSender};
 use crate::service::options::DiagnosticOptions;
 use crate::service::reporter::{ReporterCommand, ReporterCommandSender};
 use crate::service::{
-    probe::{RemoteProbeManager, RemoteProbeRunRequest},
+    probe::{RemoteProbeApply, RemoteProbeManager},
     shell::{RemoteShellManager, RemoteShellOpenRequest, RemoteShellStreamCodecRef},
     task::{RemoteTaskManager, RemoteTaskRunRequest},
 };
@@ -75,10 +75,10 @@ pub(crate) enum InboundCommand {
         /// 远程任务请求。
         request: RemoteTaskRunRequest,
     },
-    /// 执行远程网络探测。
-    RemoteProbeRun {
+    /// 应用远程网络探测请求。
+    RemoteProbeApply {
         /// 远程探测请求。
-        request: RemoteProbeRunRequest,
+        request: RemoteProbeApply,
     },
     /// 请求尽快发送完整 snapshot。
     SnapshotRequest {
@@ -96,7 +96,7 @@ impl InboundCommand {
             Self::CollectSocketsOnce { .. } => "collect_sockets_once",
             Self::RemoteShellOpen { .. } => "remote_shell_open",
             Self::RemoteTaskRun { .. } => "remote_task_run",
-            Self::RemoteProbeRun { .. } => "remote_probe_run",
+            Self::RemoteProbeApply { .. } => "remote_probe_apply",
             Self::SnapshotRequest { .. } => "snapshot_request",
         }
     }
@@ -201,20 +201,21 @@ impl ControlDispatcher {
     }
 
     /// 执行单条入站命令。
-    pub(crate) fn dispatch(&self, envelope: InboundCommandEnvelope) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(&self, envelope: InboundCommandEnvelope) -> anyhow::Result<()> {
         let command_name = envelope.command.name();
         let meta = envelope.meta;
-        let result = self.dispatch_command(envelope.command);
+        let result = self.dispatch_command(envelope.command).await;
         // 只有带 server sequence 的 Smalux ServerFrame 才回 ack/error。
         // 第三方兼容消息没有可关联的 sequence，失败只在本地日志或对应兼容结果中体现。
         if let Some(meta) = meta {
-            self.queue_control_response(meta, command_name, result.as_ref().err());
+            self.queue_control_response(meta, command_name, result.as_ref().err())
+                .await;
         }
         result
     }
 
     /// 执行不带响应处理的单条命令。
-    fn dispatch_command(&self, command: InboundCommand) -> anyhow::Result<()> {
+    async fn dispatch_command(&self, command: InboundCommand) -> anyhow::Result<()> {
         match command {
             InboundCommand::ConfigPatch { patch } => self.apply_config_patch(*patch),
             InboundCommand::CollectProcessesOnce { level, limit } => {
@@ -227,9 +228,12 @@ impl ControlDispatcher {
                 request,
                 stream_export_config,
                 stream_codec,
-            } => self.open_remote_shell(request, stream_export_config, stream_codec),
-            InboundCommand::RemoteTaskRun { request } => self.remote_task.start(request),
-            InboundCommand::RemoteProbeRun { request } => self.remote_probe.start(request),
+            } => {
+                self.open_remote_shell(request, stream_export_config, stream_codec)
+                    .await
+            }
+            InboundCommand::RemoteTaskRun { request } => self.remote_task.start(request).await,
+            InboundCommand::RemoteProbeApply { request } => self.remote_probe.apply(request).await,
             InboundCommand::SnapshotRequest { reason } => self.request_snapshot(reason),
         }
     }
@@ -287,7 +291,7 @@ impl ControlDispatcher {
     }
 
     /// 打开远程 shell。
-    fn open_remote_shell(
+    async fn open_remote_shell(
         &self,
         request: RemoteShellOpenRequest,
         stream_export_config: Option<ExportConfig>,
@@ -297,12 +301,14 @@ impl ControlDispatcher {
         let session_id = request.session_id.clone();
         let export_config = stream_export_config.unwrap_or_else(|| current_config.export.clone());
 
-        self.remote_shell.open(
-            request,
-            &export_config,
-            &current_config.remote_shell,
-            stream_codec,
-        )?;
+        self.remote_shell
+            .open(
+                request,
+                &export_config,
+                &current_config.remote_shell,
+                stream_codec,
+            )
+            .await?;
         tracing::info!(session_id = %session_id, "remote shell open accepted");
         Ok(())
     }
@@ -327,7 +333,7 @@ impl ControlDispatcher {
     }
 
     /// 根据命令执行结果投递 ack 或 error。
-    fn queue_control_response(
+    async fn queue_control_response(
         &self,
         meta: ServerCommandMeta,
         command_name: &'static str,
@@ -356,9 +362,9 @@ impl ControlDispatcher {
             )),
         };
 
-        if let Err(error) = self.outbound_tx.try_send(event) {
+        if let Err(error) = self.outbound_tx.send(event).await {
             tracing::warn!(
-                error = %control_response_queue_error(error),
+                error = %control_response_queue_error(&error),
                 server_sequence = meta.sequence,
                 "control response dropped"
             );
@@ -433,11 +439,21 @@ impl ControlDispatcher {
 }
 
 /// 格式化控制响应入队失败原因。
-fn control_response_queue_error(error: TrySendError<OutboundEvent>) -> String {
-    match error {
-        TrySendError::Full(_) => "outbound event queue is full".to_string(),
-        TrySendError::Closed(_) => "outbound event queue is closed".to_string(),
-    }
+fn control_response_queue_error(error: &super::outbound::OutboundSendError) -> String {
+    let event_type = match error.event() {
+        OutboundEvent::Report(_) => "report",
+        OutboundEvent::BasicInfo(_) => "basic info",
+        OutboundEvent::ControlAck(_) => "control ack",
+        OutboundEvent::ControlError(_) => "control error",
+        OutboundEvent::RemoteTaskResult(_) => "remote task result",
+        OutboundEvent::RemoteProbeResult(_) => "remote probe result",
+    };
+    let reason = match error.kind() {
+        super::outbound::OutboundSendErrorKind::Closed => "closed",
+        super::outbound::OutboundSendErrorKind::Timeout => "timeout",
+    };
+
+    format!("{event_type} send failed ({reason}): {}", error)
 }
 
 /// 入站命令循环。
@@ -459,7 +475,7 @@ pub(crate) async fn inbound_command_loop(
                     break;
                 };
 
-                if let Err(err) = dispatcher.dispatch(command) {
+                if let Err(err) = dispatcher.dispatch(command).await {
                     tracing::error!(error = ?err, "inbound command dispatch failed");
                 }
             }

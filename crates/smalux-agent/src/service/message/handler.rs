@@ -71,7 +71,7 @@ impl SmaluxControlHandler {
                 tracing::warn!(
                     sequence = error.sequence,
                     code = %error.code,
-                    message = %error.message,
+                    message_len = error.message.len(),
                     "server protocol error received"
                 );
                 return Ok(None);
@@ -96,8 +96,8 @@ impl SmaluxControlHandler {
                 let request: RemoteTaskRunRequest = request.into();
                 InboundCommand::RemoteTaskRun { request }
             }
-            ServerPayload::RemoteProbeRun { request } => InboundCommand::RemoteProbeRun {
-                request: request.into(),
+            ServerPayload::RemoteProbeApply { request } => InboundCommand::RemoteProbeApply {
+                request: request.try_into()?,
             },
             ServerPayload::RemoteShellOpen { request } => InboundCommand::RemoteShellOpen {
                 request,
@@ -219,16 +219,21 @@ mod tests {
         assert!(decoded.is_none());
     }
 
-    /// 验证 raw remote_probe_run 会被丢弃，不再作为自有协议入口。
+    /// 验证 raw remote_probe_apply 会被丢弃，不再作为自有协议入口。
     #[test]
-    fn decode_message_drops_raw_remote_probe_run() {
+    fn decode_message_drops_raw_remote_probe_apply() {
         let decoded = handler("agent-1")
             .decode_message(
                 r#"{
-                "type": "remote_probe_run",
-                "task_id": "probe-raw",
-                "probe_type": "tcp",
-                "target": "127.0.0.1:80"
+                "type": "remote_probe_apply",
+                "operation": "once",
+                "runs": [
+                    {
+                        "request_id": "probe-raw",
+                        "probe_type": "tcp",
+                        "target": "127.0.0.1:80"
+                    }
+                ]
             }"#,
             )
             .unwrap();
@@ -255,6 +260,16 @@ mod tests {
         .unwrap();
 
         let decoded = handler("agent-1").decode_message(&message).unwrap();
+
+        assert!(decoded.is_none());
+    }
+
+    /// 验证自有协议 handler 不会把 Komari 消息误当成 Smalux ServerFrame。
+    #[test]
+    fn decode_message_drops_komari_exec_message() {
+        let decoded = handler("agent-1")
+            .decode_message(r#"{ "message": "exec", "task_id": "task-1", "command": "echo ok" }"#)
+            .unwrap();
 
         assert!(decoded.is_none());
     }

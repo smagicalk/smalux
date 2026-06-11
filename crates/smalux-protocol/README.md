@@ -66,7 +66,7 @@
   - 为空时表示当前连接上的 agent；不为空且和当前 agent 不匹配时，agent 会直接丢弃该命令。
   - 该字段只做路由保护，不做认证。
 - `type`
-  - 当前稳定值包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run` 和 `remote_shell_open`。
+  - 当前稳定值包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply` 和 `remote_shell_open`。
 
 ## Frame JSON 示例
 
@@ -215,7 +215,7 @@ server 按下面顺序实现，最容易先跑通闭环：
 
 5. 下发控制命令
    -> 自有协议命令统一构造 ServerFrame，可选 target_agent_id 做路由保护
-   -> snapshot_request / config_patch / collect_* / remote_task_run / remote_probe_run / remote_shell_open 都可收到 ack/error
+   -> snapshot_request / config_patch / collect_* / remote_task_run / remote_probe_apply / remote_shell_open 都可收到 ack/error
    -> 按当前 wire_mode 封成 PlainData 或 SecureData
 ```
 
@@ -255,7 +255,7 @@ transport adapter
 
 ## 兼容边界
 
-- `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_run`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
+- `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
 - `ack/error` 只对带 `sequence` 的 `ServerFrame` 有意义。
 - `target_agent_id` 不匹配时 agent 会丢弃命令，不回 `ack/error`。
 - 第三方兼容消息不进入本 crate 的稳定协议面，应在对应 adapter/handler 中转换成 agent 内部命令。
@@ -296,7 +296,7 @@ JSON 解析建议：
 | `busy` | 并发已满，例如 remote shell session 已达到上限 | 稍后重试或让用户关闭旧会话 |
 | `internal_error` | agent 内部不可预期错误 | 记录上下文，避免无限重试 |
 
-错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。当前 agent 对 `ServerFrame` 调度失败时会按 `{server_frame_type}_failed` 生成错误码，例如 `snapshot_request_failed`、`remote_probe_run_failed` 和 `remote_shell_open_failed`。
+错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。当前 agent 对 `ServerFrame` 调度失败时会按 `{server_frame_type}_failed` 生成错误码，例如 `snapshot_request_failed`、`remote_probe_apply_failed` 和 `remote_shell_open_failed`。
 
 server 自己的 ingest 错误可以使用另一套内部错误码，不必通过 `ClientFrame(type=error)` 回给 agent。agent 当前没有等待 server 对上报 frame 做协议级 ack，因此 server 收到非法 `snapshot` / `delta` 时优先记录、丢弃或发送 `snapshot_request`。
 
@@ -308,14 +308,17 @@ server 自己的 ingest 错误可以使用另一套内部错误码，不必通�
 | --- | --- | --- |
 | `ClientFrame.sequence` | agent | agent 全局出站序号，snapshot、delta、heartbeat、ack/error、remote task/probe result 共用 |
 | `ServerFrame.sequence` | server | server 下发稳定控制命令的序号，agent 的 `ack.sequence` / `error.sequence` 会引用它 |
-| `task_id` | server 或第三方兼容层 | remote task / remote probe 的业务结果关联 ID |
+| `task_id` | server 或第三方兼容层 | remote task 的业务结果关联 ID；Komari ping_result 兼容输出也使用该字段 |
+| `run_id` | agent | remote probe 每次实际运行或拒绝运行的唯一结果 ID，可作为探测结果表主键或幂等键 |
+| `point_id` | server | remote probe 的业务探测点 ID；一次性探测和持续任务都可以携带，结果会原样带回 |
+| `request_id` / `job_id` | server | remote probe 的执行关联 ID；一次性探测使用 `request_id`，持续任务使用 `job_id` |
 
 server 处理建议：
 
 - `ClientFrame.sequence` 可以用于记录 last seen 和发现明显乱序，但不要把缺号直接当成协议错误。agent 导出 job 可能只发送最新 report，中间 report 被最新状态覆盖时会出现序号跳跃。
 - `delta.base_sequence` 才是合并增量的强约束；它不匹配时必须请求 snapshot，而不是靠 `ClientFrame.sequence` 猜测。
 - `ack/error` 的业务关联字段是内部 payload 里的 `ack.sequence` / `error.sequence`，不是外层 `ClientFrame.sequence`。
-- `remote_task_result` 和 `remote_probe_result` 以 `task_id` 幂等。重复收到同一个 `task_id` 时覆盖同一条结果，不创建重复任务。
+- `remote_task_result` 以 `task_id` 幂等。`remote_probe_result` 以 `run_id` 幂等；`point_id` 用于关联 server 业务探测点；`source=once` 额外用 `request_id` 关联一次性请求，`source=job` 额外用 `job_id` 关联持续探测任务。
 - 重连后 agent 的 `ClientFrame.sequence` 会从当前进程内的出站序号继续增长；如果 agent 进程重启，序号可能重新从 `1` 开始。server 不能只靠 sequence 判断 agent 是否是同一个进程，应该结合连接时间、agent version、latest snapshot 和后续认证信息。
 
 server 发送建议：

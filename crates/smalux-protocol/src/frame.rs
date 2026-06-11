@@ -22,9 +22,10 @@ pub use self::client::{ClientFrame, ClientPayload};
 pub use self::control::{Ack, ProtocolError};
 pub use self::outbound::{OutboundReport, OutboundReportKind};
 pub use self::remote::{
-    RemoteProbeRequest, RemoteProbeResult, RemoteProbeType, RemoteShellDataEncoding,
-    RemoteShellOpenRequest, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskRequest,
-    RemoteTaskResult, RemoteTaskStatus,
+    RemoteProbeApplyRequest, RemoteProbeId, RemoteProbeJob, RemoteProbeOnceRequest,
+    RemoteProbeOperation, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
+    RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
+    RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus,
 };
 pub use self::report::{DeltaReport, Heartbeat, MetricCollectionRequest, SnapshotRequest};
 pub use self::server::{ServerFrame, ServerPayload};
@@ -35,7 +36,6 @@ mod tests {
     //! frame 构造测试。
 
     use super::*;
-    use serde_json::Value;
     use smalux_core::model::info::AgentReport;
 
     /// 验证 snapshot 上报会从 report 中复制 agent_id。
@@ -68,14 +68,23 @@ mod tests {
 
     /// 验证 server remote probe request frame 会带协议版本。
     #[test]
-    fn server_remote_probe_run_uses_protocol_version() {
-        let frame = ServerFrame::remote_probe_run(
+    fn server_remote_probe_apply_uses_protocol_version() {
+        let frame = ServerFrame::remote_probe_apply(
             4,
             100,
-            RemoteProbeRequest {
-                task_id: Value::from(7),
-                probe_type: RemoteProbeType::Tcp,
-                target: "example.com:443".to_string(),
+            RemoteProbeApplyRequest {
+                operation: RemoteProbeOperation::Once,
+                generation: None,
+                runs: vec![RemoteProbeOnceRequest {
+                    request_id: RemoteProbeId::from(7),
+                    point_id: Some(RemoteProbeId::from("point-7")),
+                    probe_type: RemoteProbeType::Tcp,
+                    target: "example.com:443".to_string(),
+                    timeout: None,
+                }],
+                jobs: Vec::new(),
+                upsert_jobs: Vec::new(),
+                remove_job_ids: Vec::new(),
             },
         );
 

@@ -7,7 +7,11 @@ mod shell;
 /// 远程非交互任务协议模型。
 mod task;
 
-pub use self::probe::{RemoteProbeRequest, RemoteProbeResult, RemoteProbeType};
+pub use self::probe::{
+    RemoteProbeApplyRequest, RemoteProbeId, RemoteProbeJob, RemoteProbeOnceRequest,
+    RemoteProbeOperation, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
+    RemoteProbeType,
+};
 pub use self::shell::{
     RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
     RemoteShellStreamEvent,

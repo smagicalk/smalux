@@ -109,19 +109,21 @@ impl RemoteTaskManager {
     }
 
     /// 启动一个远程非交互任务。
-    pub(crate) fn start(&self, request: RemoteTaskRunRequest) -> anyhow::Result<()> {
+    pub(crate) async fn start(&self, request: RemoteTaskRunRequest) -> anyhow::Result<()> {
         request.validate()?;
         let config = self.config_manager.current();
         let agent_id = config.agent_id.clone();
 
         if !self.options.enabled {
-            self.queue_rejected_result(agent_id, request, "remote task is disabled")?;
+            self.queue_rejected_result(agent_id, request, "remote task is disabled")
+                .await?;
             return Ok(());
         }
 
         let remote_task = config.remote_task;
         if !self.try_acquire_slot(remote_task.max_concurrent) {
-            self.queue_rejected_result(agent_id, request, "remote task concurrency limit reached")?;
+            self.queue_rejected_result(agent_id, request, "remote task concurrency limit reached")
+                .await?;
             return Ok(());
         }
 
@@ -132,7 +134,8 @@ impl RemoteTaskManager {
         let manager = self.clone();
         tracing::info!(
             task_id = %request.task_id,
-            program = %request.program,
+            program_len = request.program.len(),
+            args_count = request.args.len(),
             timeout_ms = timeout.as_millis(),
             max_stdout_bytes = remote_task.max_stdout_bytes,
             max_stderr_bytes = remote_task.max_stderr_bytes,
@@ -174,7 +177,7 @@ impl RemoteTaskManager {
     }
 
     /// 生成拒绝结果并投递到出站队列。
-    fn queue_rejected_result(
+    async fn queue_rejected_result(
         &self,
         agent_id: String,
         request: RemoteTaskRunRequest,
@@ -197,15 +200,9 @@ impl RemoteTaskManager {
         };
         let event = self.result_event(agent_id, result);
         self.outbound_tx
-            .try_send(event)
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("outbound event queue is full")
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("outbound event queue is closed")
-                }
-            })?;
+            .send(event)
+            .await
+            .map_err(|error| anyhow::anyhow!("outbound event send failed: {error}"))?;
         tracing::warn!(reason, "remote task rejected");
         Ok(())
     }
@@ -214,8 +211,12 @@ impl RemoteTaskManager {
     async fn send_result(&self, agent_id: String, result: RemoteTaskResult) {
         let task_id = result.task_id.clone();
         let event = self.result_event(agent_id, result);
-        if self.outbound_tx.send(event).await.is_err() {
-            tracing::warn!(task_id = %task_id, "outbound event queue closed; remote task result dropped");
+        if let Err(error) = self.outbound_tx.send(event).await {
+            tracing::warn!(
+                task_id = %task_id,
+                error = %error,
+                "remote task result dropped"
+            );
         }
     }
 
@@ -449,7 +450,7 @@ mod tests {
         enabled: bool,
     ) -> (
         RemoteTaskManager,
-        tokio::sync::mpsc::Receiver<OutboundEvent>,
+        crate::service::message::outbound::OutboundReceiver,
     ) {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
@@ -475,6 +476,7 @@ mod tests {
                 args: test_args("ok"),
                 timeout: None,
             })
+            .await
             .unwrap();
 
         let event = outbound_rx.recv().await.unwrap();
@@ -498,6 +500,7 @@ mod tests {
                 args: test_args("smalux-task-ok"),
                 timeout: Some(Duration::from_secs(5)),
             })
+            .await
             .unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())

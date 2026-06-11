@@ -12,7 +12,10 @@ pub(crate) fn sample_processes(
     limit: usize,
 ) -> ProcessInfo {
     if !sysinfo::IS_SUPPORTED_SYSTEM {
-        return ProcessInfo::unsupported("sysinfo does not support this platform".to_string());
+        return ProcessInfo::unsupported(
+            level,
+            "sysinfo does not support this platform".to_string(),
+        );
     }
 
     refresh_processes_for_level(system, level);
@@ -155,6 +158,11 @@ mod tests {
             assert!(info.count > 0);
             let light = info.light.unwrap();
             assert!(light.items.len() <= 5);
+        } else {
+            assert_eq!(
+                info.status,
+                smalux_core::model::info::MetricStatus::Unsupported
+            );
         }
         assert_eq!(info.level, MetricLevel::Light);
     }
@@ -170,6 +178,11 @@ mod tests {
             assert!(info.count > 0);
             let details = info.details.unwrap();
             assert!(details.items.len() <= 5);
+        } else {
+            assert_eq!(
+                info.status,
+                smalux_core::model::info::MetricStatus::Unsupported
+            );
         }
         assert_eq!(info.level, MetricLevel::Details);
     }

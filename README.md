@@ -4,191 +4,133 @@
 
 # Smalux
 
-**Smalux** is a lightweight monitoring probe designed to illuminate system behavior with clarity and minimal intrusion.  
-It focuses on continuous observation, providing reliable signals about system health and runtime state, while remaining quiet, stable, and easy to integrate into existing environments.
+**Smalux** is a Rust workspace for a lightweight monitoring system built around a host-side agent, a shared protocol layer, and an in-progress central server.
 
-**Smalux** 是一个轻量级的探针监控系统，旨在以最小侵入的方式清晰地呈现系统运行状态。  
-它专注于持续观测，在保持稳定、安静和易于集成的前提下，提供可靠的系统健康与运行时信号。
+当前项目更准确的状态是：
 
----
+- `smalux-agent`、`smalux-core`、`smalux-protocol` 已经具备较完整实现。
+- `smalux-server` 仍处于骨架和实现计划阶段，CLI/config 边界已搭好，但主体服务还在继续开发。
 
-## Design Philosophy | 设计理念
+## Workspace
 
-Smalux is built around simplicity, stability, and long-term observability.  
-Rather than pursuing aggressive data collection or exhaustive metrics, it prioritizes meaningful signals that help operators understand system behavior over time.
+- `crates/smalux-agent`
+  - 运行在目标主机上的采集与上报进程。
+  - 已实现本机采集、动态配置、导出、控制消息处理、remote task、remote probe、remote shell、Komari 兼容。
+- `crates/smalux-core`
+  - 共享模型、日志初始化、脱敏工具和公共辅助函数。
+- `crates/smalux-protocol`
+  - 共享 `ClientFrame` / `ServerFrame`、JSON codec、Smalux binary wire、`secure_psk` 安全通道。
+- `crates/smalux-server`
+  - 中心服务端，目标是接收 agent 上报、提供 REST/实时接口并下发控制命令。
+  - 当前以目录结构、CLI/config 和详细实现计划为主。
 
-The project favors clarity over complexity and predictability over cleverness, aiming to remain useful and maintainable as systems evolve.
+## Current Status
 
-Smalux 的设计核心是简洁、稳定以及长期可观测性。  
-相比激进的数据采集或指标堆砌，它更关注真正有价值、能够帮助理解系统行为的信号。
+### Agent
 
-在设计取舍上，Smalux 更偏向清晰而非复杂、可预测而非炫技，以确保在系统不断演进的过程中依然可维护、可依赖。
+`smalux-agent` 当前已经实现：
 
----
+- CPU、内存、磁盘、网络、进程、socket、公网 IP 采集。
+- reporter/latest telemetry 聚合。
+- `snapshot`、可选 `delta`、业务级 `heartbeat`。
+- `smalux_json` 自有协议和 Komari 兼容导出。
+- `binary_plain` 与 `secure_psk` WebSocket wire。
+- `config_patch`、`snapshot_request`、一次性诊断、remote task、remote probe、remote shell。
 
-## Architecture Overview | 架构概览
+关键入口：
 
-Smalux follows a modular architecture with clear boundaries between data collection, aggregation, storage, and visualization.
+- [crates/smalux-agent/src/main.rs](crates/smalux-agent/src/main.rs)
+- [crates/smalux-agent/src/service.rs](crates/smalux-agent/src/service.rs)
+- [crates/smalux-agent/README.md](crates/smalux-agent/README.md)
 
-Each component is designed to operate independently, allowing the system to scale and evolve without introducing tight coupling or unnecessary coordination.
+### Protocol
 
-Smalux 采用模块化架构，明确划分数据采集、聚合、存储与展示等职责边界。  
-各组件均可独立运行，使系统能够在不引入强耦合或额外复杂度的情况下进行扩展与演进。
+`smalux-protocol` 当前承载：
 
----
+- `ClientFrame` / `ServerFrame`
+- JSON codec
+- Smalux binary wire packet
+- `secure_psk` token 解析、PSK 派生、Noise 握手和 payload 加解密
 
-## Project Structure | 项目结构
+关键入口：
 
-Smalux is organized as a Rust workspace.  
-Executable components and shared libraries are separated into independent crates, allowing multiple binaries to be built in a single compilation while keeping responsibilities clearly isolated.
+- [crates/smalux-protocol/src/lib.rs](crates/smalux-protocol/src/lib.rs)
+- [crates/smalux-protocol/README.md](crates/smalux-protocol/README.md)
 
-Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库拆分为独立的 crate，  
-在一次构建中生成多个运行程序，同时保持职责清晰、边界明确。
+### Server
 
-- **smalux-agent**  
-  The monitoring probe deployed close to observed systems.  
-  Responsible for data collection, preprocessing, buffering, and reporting.
+`smalux-server` 当前主要完成了：
 
-- **smalux-server**  
-  The central collector and management service.  
-  Handles data ingestion, aggregation, querying, and configuration management.
+- crate 依赖和目录骨架
+- 启动参数模型
+- 稳定配置模型和校验逻辑
+- 详细实现计划与边界设计
 
-- **smalux-core**  
-  Shared core library containing common types, configuration models, error definitions, and utilities.
+它还没有完成真正的：
 
-- **smalux-protocol**
-  Contains the shared agent/server wire protocol, including versioned frames and JSON message contracts.
-  gRPC/protobuf support can be added later as a separate crate when needed.
+- HTTP server 启动
+- `/agent/v1/connect` 接入
+- storage/repository 闭环
+- REST 查询与命令下发
 
-- **assets**  
-  Static assets such as project icons, diagrams, and documentation resources.
+关键入口：
 
----
+- [crates/smalux-server/src/bootstrap.rs](crates/smalux-server/src/bootstrap.rs)
+- [crates/smalux-server/README.md](crates/smalux-server/README.md)
+- [crates/smalux-server/plan.md](crates/smalux-server/plan.md)
 
-## Core Components | 核心组件
+## Non-server Fixes In This Session
 
-Smalux consists of a small set of focused components, each responsible for a well-defined role within the monitoring pipeline:
+本轮已修复非 server 模块的几个明确问题：
 
-- **Probe / Agent**  
-  Runs close to the observed system and performs data collection, preprocessing, buffering, and reporting.
+- `smalux-core`
+  - 修复文本脱敏在转义引号场景下可能泄漏敏感值尾部的问题。
+- `smalux-protocol`
+  - `RemoteProbeId` 从任意 JSON 收紧为“字符串或整数”，当前用于 `remote_probe_apply.request_id` 和 Komari ping task id。
+  - `decode_secure_hello()` 现在会显式校验 Noise pattern，不再把错误拖到更晚的握手阶段。
+- `smalux-agent`
+  - 控制层 `ack/error` 不再用 `try_send`，避免队列满时静默丢失。
+  - disabled/rate-limited 的 remote task/probe 即时拒绝结果改为可靠异步发送。
+  - export 重连后的 pending 恢复失败现在会继续向上返回错误，避免 pending 事件卡住不再重试。
+  - 进程和 socket 的 unsupported/stale 状态现在会保留调用方请求的采样级别，避免把 `light/details` 误报成默认 `count` 语义。
+  - Komari exec 入站日志不再打印原始命令字符串，只记录 `task_id` 和长度，降低敏感参数落盘风险。
+  - `remote_shell_open` 现在在 stream 建连、PTY 启动并成功发出 `opened` 事件后才视为 ready，避免过早成功确认。
+  - 出站事件改为高低优先级双通道：control ack/error 与 remote task/probe result 优先于普通 report/basic info。
+  - export 重连恢复现在按 latest state、控制响应、远程结果三层执行，减少整批恢复时的耦合。
+  - 补充了协议适配边界测试，固定 Smalux 与 Komari handler 不能串线解析对方消息。
+  - 收紧了 Smalux server error 入站日志，不再直接打印对端原始 `message`，只记录 `code` 和长度。
+  - 收紧了 remote task/probe 运行日志，不再直接打印本地程序名或探测目标原文，改为长度/计数等结构化摘要。
 
-- **Collector / Server**  
-  Receives, validates, aggregates, and exposes monitoring data through query and management APIs.
+## Validation
 
-- **Storage Layer**  
-  Persists metrics, events, and configuration data using purpose-built storage backends.
+本轮已验证：
 
-- **Web Interface**  
-  Provides visualization, system overview, and operational access.
-
-- **gRPC Module (Optional)**  
-  Provides a high-performance, strongly-typed communication layer for data ingestion and internal service interaction.  
-  This module is optional and can be enabled when higher throughput, stricter schemas, or cross-language integration is required.
-
-Smalux 由一组职责明确的核心组件构成：
-
-- **探针 / Agent**  
-  运行在被监控系统附近，负责数据采集、预处理、缓冲以及数据上报。
-
-- **收集器 / 服务端**  
-  接收、校验、聚合监控数据，并通过查询与管理接口对外提供服务。
-
-- **存储层**  
-  使用合适的存储后端对指标、事件和配置数据进行持久化。
-
-- **Web 界面**  
-  用于系统状态可视化与运维操作。
-
-- **gRPC 模块（可选）**  
-  提供高性能、强类型的通信能力，用于数据上报或内部服务交互。  
-  当系统需要更高吞吐、更严格数据结构约束或跨语言集成时，可启用该模块。
-
----
-
-## Data Collection | 数据采集
-
-Smalux emphasizes continuous and unobtrusive observation.  
-Data collection is guided by the principle that signals should be actionable, interpretable, and stable over time.
-
-What to collect, how frequently to collect it, and how to transport it are treated as explicit design decisions rather than defaults.
-
-Smalux 强调持续且低干扰的观测方式。  
-数据采集遵循“可操作、可理解、长期稳定”的原则。
-
-采集内容、采集频率以及数据传输方式都被视为明确的设计选择，而非默认行为。
-
----
-
-## Observability & Signals | 可观测性与信号
-
-Smalux focuses on exposing signals that help answer practical operational questions, such as system health, availability, and behavioral changes.
-
-The goal is to improve understanding and confidence in system operation, not merely to increase the volume of metrics.
-
-Smalux 专注于输出能够回答实际运维问题的观测信号，例如系统健康状况、可用性以及行为变化。
-
-其目标是提升对系统运行状态的理解与信心，而不是单纯增加指标数量。
-
----
-
-## Technology Stack | 技术选型
-
-Smalux is built with a focus on reliability, performance, and long-term maintainability.  
-The technology stack is intentionally kept minimal and composable, favoring mature ecosystems and clear operational characteristics.
-
-Smalux 在技术选型上注重可靠性、性能以及长期可维护性。  
-整体架构保持克制与可组合性，优先选择成熟生态与行为可预测的技术方案。
-
----
-
-### Backend & Probe | 后端与探针
-
-The backend and probe components of Smalux are implemented in **Rust**, chosen for its performance, memory safety, and suitability for long-running system-level services.
-
-Rust is used consistently across probe agents and server-side components to ensure predictable behavior and low operational overhead.
-
----
-
-### Frontend | 前端
-
-The Smalux web interface is built with **React** and **TypeScript**, focusing on clarity, responsiveness, and ease of iteration.
-
----
-
-### Data & Communication | 数据与通信
-
-HTTP-based interfaces are used as the primary integration surface, prioritizing debuggability and operational transparency.
-
-An optional gRPC-based communication module can be enabled for higher throughput, stricter schema guarantees, or efficient internal service communication.
-
----
-
-## Deployment Model | 部署模型
-
-Smalux components are designed to be deployed independently and operate reliably in long-running environments.
-
-The deployment model favors simplicity and predictability, allowing Smalux to fit naturally into existing infrastructure setups.
-
----
-
-## Extensibility | 可扩展性
-
-The chosen architecture and technology stack allow Smalux to evolve gradually without forcing early complexity.
-
-New capabilities can be introduced incrementally while preserving the core principles of simplicity and stability.
-
----
-
-## Roadmap | 发展规划
-
-Smalux is developed iteratively, with an emphasis on correctness, operational experience, and real-world feedback.
-
-Future work includes improvements to observability quality, operational ergonomics, and optional high-performance communication paths such as gRPC.
-
----
-
-## License | 许可证
-
-This project is licensed under the terms specified in the LICENSE file.
-
-
+```powershell
+cargo test -p smalux-core
+cargo test -p smalux-protocol
+cargo test -p smalux-agent
+cargo fmt --all --check
+```
+
+## Recommended Reading Order
+
+如果要继续熟悉项目，建议按这个顺序：
+
+1. `crates/smalux-agent/README.md`
+2. `crates/smalux-protocol/README.md`
+3. `crates/smalux-agent/src/main.rs`
+4. `crates/smalux-agent/src/service.rs`
+5. `crates/smalux-agent/src/service/reporter.rs`
+6. `crates/smalux-agent/src/service/export.rs`
+7. `crates/smalux-server/README.md`
+8. `crates/smalux-server/plan.md`
+
+## Next Steps
+
+下一步建议继续推进 `smalux-server`：
+
+1. 实现真正的 bootstrap 和最小 HTTP 启动。
+2. 增加 `GET /api/v1/health`。
+3. 接入 `MemoryRepository`。
+4. 跑通 `/agent/v1/connect` + `snapshot/heartbeat`。
+5. 再补 REST 查询和命令下发。

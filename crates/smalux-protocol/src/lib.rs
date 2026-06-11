@@ -21,8 +21,10 @@ pub use codec::{
 };
 pub use frame::{
     Ack, ClientFrame, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest,
-    OutboundReport, OutboundReportKind, ProtocolError, RemoteProbeRequest, RemoteProbeResult,
-    RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
-    RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus,
-    SMALUX_PROTOCOL_VERSION, ServerFrame, ServerPayload, SnapshotRequest,
+    OutboundReport, OutboundReportKind, ProtocolError, RemoteProbeApplyRequest, RemoteProbeId,
+    RemoteProbeJob, RemoteProbeOnceRequest, RemoteProbeOperation, RemoteProbeResult,
+    RemoteProbeResultSource, RemoteProbeResultStatus, RemoteProbeType, RemoteShellDataEncoding,
+    RemoteShellOpenRequest, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskRequest,
+    RemoteTaskResult, RemoteTaskStatus, SMALUX_PROTOCOL_VERSION, ServerFrame, ServerPayload,
+    SnapshotRequest,
 };

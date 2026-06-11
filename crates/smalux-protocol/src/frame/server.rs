@@ -1,7 +1,7 @@
 //! server 发往 agent 的 frame。
 
 use super::{
-    Ack, MetricCollectionRequest, ProtocolError, RemoteProbeRequest, RemoteShellOpenRequest,
+    Ack, MetricCollectionRequest, ProtocolError, RemoteProbeApplyRequest, RemoteShellOpenRequest,
     RemoteTaskRequest, SMALUX_PROTOCOL_VERSION, SnapshotRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -84,9 +84,17 @@ impl ServerFrame {
         )
     }
 
-    /// 构造远程网络探测请求 frame。
-    pub fn remote_probe_run(sequence: u64, sent_at: u64, request: RemoteProbeRequest) -> Self {
-        Self::new(sequence, sent_at, ServerPayload::RemoteProbeRun { request })
+    /// 构造远程网络探测应用请求 frame。
+    pub fn remote_probe_apply(
+        sequence: u64,
+        sent_at: u64,
+        request: RemoteProbeApplyRequest,
+    ) -> Self {
+        Self::new(
+            sequence,
+            sent_at,
+            ServerPayload::RemoteProbeApply { request },
+        )
     }
 
     /// 构造远程 shell 打开请求 frame。
@@ -155,13 +163,13 @@ pub enum ServerPayload {
         /// 远程任务请求。
         request: RemoteTaskRequest,
     },
-    /// 请求 agent 执行一次远程网络探测。
+    /// 请求 agent 执行一次或一组远程网络探测变更。
     ///
-    /// 该命令有协议级 sequence，因此 agent 调度成功会先回 `ack`，真实探测完成后再回
-    /// `remote_probe_result`；如果探测被禁用或限频，也会返回一个失败结果。
-    RemoteProbeRun {
-        /// 探测请求。
-        request: RemoteProbeRequest,
+    /// 该命令有协议级 sequence，因此 agent 调度成功会先回 `ack`。`once` 会在真实探测
+    /// 完成后回 `remote_probe_result`；持续任务 `replace/patch` 只更新本地调度状态。
+    RemoteProbeApply {
+        /// 探测应用请求。
+        request: RemoteProbeApplyRequest,
     },
     /// 请求 agent 打开一个交互式远程 shell stream。
     ///

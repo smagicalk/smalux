@@ -141,11 +141,54 @@ pub(super) async fn send_resume_events(
     latest_report: Option<&ReportEnvelope>,
     pending: PendingResumeEvents<'_>,
 ) -> anyhow::Result<()> {
-    send_ready_deliveries(transport_hub, router, deliveries, latest_report).await?;
-    send_pending_remote_task_results(transport_hub, router, pending.remote_task_results).await?;
-    send_pending_remote_probe_results(transport_hub, router, pending.remote_probe_results).await?;
-    send_pending_control_acks(transport_hub, router, pending.control_acks).await?;
-    send_pending_control_errors(transport_hub, router, pending.control_errors).await
+    resume_latest_state(transport_hub, router, deliveries, latest_report).await?;
+    resume_control_responses(
+        transport_hub,
+        router,
+        pending.control_acks,
+        pending.control_errors,
+    )
+    .await?;
+    resume_remote_results(
+        transport_hub,
+        router,
+        pending.remote_task_results,
+        pending.remote_probe_results,
+    )
+    .await?;
+    Ok(())
+}
+
+/// 恢复 latest state 层，只负责 latest report 和周期 delivery。
+async fn resume_latest_state(
+    transport_hub: &mut TransportHub,
+    router: &mut ExportRouter,
+    deliveries: &mut [DeliveryState],
+    latest_report: Option<&ReportEnvelope>,
+) -> anyhow::Result<()> {
+    send_ready_deliveries(transport_hub, router, deliveries, latest_report).await
+}
+
+/// 恢复控制响应层，优先把 ack/error 送回 server。
+async fn resume_control_responses(
+    transport_hub: &mut TransportHub,
+    router: &mut ExportRouter,
+    pending_control_acks: &mut BTreeMap<u64, ControlAckEnvelope>,
+    pending_control_errors: &mut BTreeMap<u64, ControlErrorEnvelope>,
+) -> anyhow::Result<()> {
+    send_pending_control_acks(transport_hub, router, pending_control_acks).await?;
+    send_pending_control_errors(transport_hub, router, pending_control_errors).await
+}
+
+/// 恢复远程结果层，最后再补发 task/probe 的一次性结果。
+async fn resume_remote_results(
+    transport_hub: &mut TransportHub,
+    router: &mut ExportRouter,
+    pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
+    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+) -> anyhow::Result<()> {
+    send_pending_remote_task_results(transport_hub, router, pending_remote_task_results).await?;
+    send_pending_remote_probe_results(transport_hub, router, pending_remote_probe_results).await
 }
 
 /// 投递远程任务结果，并在等待发送确认期间保留一份副本。
@@ -192,7 +235,7 @@ pub(super) async fn queue_remote_probe_result(
     if request_count == 0 {
         pending_remote_probe_results.remove(&result.sequence);
         tracing::debug!(
-            task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+            probe_id = %result.result.display_id(),
             sequence = result.sequence,
             format_skipped = true,
             "remote probe result skipped by adapter"
@@ -201,7 +244,7 @@ pub(super) async fn queue_remote_probe_result(
     }
 
     tracing::debug!(
-        task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+        probe_id = %result.result.display_id(),
         sequence = result.sequence,
         request_count,
         "remote probe result queued"
@@ -324,7 +367,7 @@ pub(super) async fn send_pending_remote_probe_results(
         if request_count == 0 {
             pending_remote_probe_results.remove(&sequence);
             tracing::debug!(
-                task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+                probe_id = %result.result.display_id(),
                 sequence,
                 format_skipped = true,
                 "pending remote probe result skipped by adapter"
@@ -332,7 +375,7 @@ pub(super) async fn send_pending_remote_probe_results(
             continue;
         }
         tracing::debug!(
-            task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+            probe_id = %result.result.display_id(),
             sequence,
             request_count,
             "pending remote probe result requeued"

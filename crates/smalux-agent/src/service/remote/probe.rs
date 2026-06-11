@@ -1,7 +1,7 @@
-//! 远程网络探测执行器。
+//! 远程网络探测执行器和持续任务调度。
 //!
-//! 该模块只处理协议无关的探测请求、频率保护和结果投递；外部协议的
-//! 字段映射放在各自 adapter 中。
+//! 本模块统一处理一次性探测和持续任务同步。外部协议只负责把 server 消息转换成
+//! `RemoteProbeApply`；具体 TCP/HTTP 探测、频率保护、持续任务 worker 和结果投递都收口在这里。
 
 use crate::collect::unix_timestamp_secs;
 use crate::config::ConfigManager;
@@ -9,42 +9,98 @@ use crate::service::message::outbound::{
     OutboundEvent, OutboundSender, OutboundSequence, RemoteProbeResultEnvelope,
 };
 use serde::Deserialize;
-use serde_json::Value;
 use smalux_core::utils::validate::ensure_non_empty;
-use smalux_protocol::{RemoteProbeResult, RemoteProbeType};
-use std::collections::HashMap;
+use smalux_protocol::{
+    RemoteProbeApplyRequest, RemoteProbeId, RemoteProbeJob, RemoteProbeOnceRequest,
+    RemoteProbeOperation, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
+    RemoteProbeType,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 /// 远程探测目标缓存上限，避免恶意 server 用大量唯一目标撑大内存。
 const RATE_STATE_MAX_TARGETS: usize = 1024;
 
-/// server 下发的远程探测请求。
+/// 协议无关的远程探测执行请求。
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub(crate) struct RemoteProbeRunRequest {
-    /// server 侧生成的探测任务 ID；兼容协议可能使用数字或字符串。
-    pub(crate) task_id: Value,
+pub(crate) struct RemoteProbeExecutionRequest {
+    /// 结果来源。
+    pub(crate) source: RemoteProbeResultSource,
+    /// server 侧业务探测点 ID。
+    pub(crate) point_id: Option<RemoteProbeId>,
+    /// 一次性请求 ID。
+    pub(crate) request_id: Option<RemoteProbeId>,
+    /// 持续任务 ID。
+    pub(crate) job_id: Option<String>,
     /// 探测类型。
     pub(crate) probe_type: RemoteProbeType,
     /// 探测目标，TCP 使用 `host:port`，HTTP 使用 URL 或 host。
     pub(crate) target: String,
+    /// 本次请求的超时；缺省时使用当前 agent 配置。
+    #[serde(default)]
+    pub(crate) timeout: Option<Duration>,
 }
 
-impl RemoteProbeRunRequest {
+impl RemoteProbeExecutionRequest {
     /// 校验探测请求最小字段。
     fn validate(&self) -> anyhow::Result<()> {
-        if self.task_id.is_null()
-            || self
-                .task_id
-                .as_str()
-                .map(str::trim)
-                .is_some_and(str::is_empty)
-        {
-            anyhow::bail!("remote_probe.task_id cannot be empty");
+        validate_optional_probe_id("remote_probe.point_id", &self.point_id)?;
+        match self.source {
+            RemoteProbeResultSource::Once => {
+                if self.job_id.is_some() {
+                    anyhow::bail!("remote_probe.once cannot contain job_id");
+                }
+                match &self.request_id {
+                    Some(RemoteProbeId::String(value)) if value.trim().is_empty() => {
+                        anyhow::bail!("remote_probe.request_id cannot be empty");
+                    }
+                    Some(_) => {}
+                    None => anyhow::bail!("remote_probe.once requires request_id"),
+                }
+            }
+            RemoteProbeResultSource::Job => {
+                if self.request_id.is_some() {
+                    anyhow::bail!("remote_probe.job cannot contain request_id");
+                }
+                ensure_non_empty(
+                    "remote_probe.job_id",
+                    self.job_id.as_deref().unwrap_or_default(),
+                )?;
+            }
         }
         ensure_non_empty("remote_probe.target", &self.target)?;
         Ok(())
+    }
+
+    /// 返回日志和兼容协议使用的关联 ID。
+    fn display_id(&self) -> String {
+        self.point_id
+            .as_ref()
+            .map(RemoteProbeId::display)
+            .or_else(|| self.request_id.as_ref().map(RemoteProbeId::display))
+            .or_else(|| self.job_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// 返回本次执行请求对应的业务探测点 ID，日志中没有时输出空字符串。
+    fn point_display_id(&self) -> String {
+        self.point_id
+            .as_ref()
+            .map(RemoteProbeId::display)
+            .unwrap_or_default()
+    }
+
+    /// 返回本次执行请求对应的请求或任务 ID，便于日志区分执行和业务探测点。
+    fn execution_display_id(&self) -> String {
+        self.request_id
+            .as_ref()
+            .map(RemoteProbeId::display)
+            .or_else(|| self.job_id.clone())
+            .unwrap_or_default()
     }
 
     /// 用于同目标限频的稳定 key。
@@ -55,15 +111,220 @@ impl RemoteProbeRunRequest {
             self.target.trim().to_ascii_lowercase()
         )
     }
+
+    /// 把一次执行请求收口转换成最终上报结果。
+    ///
+    /// 结果字段集中在这里映射，后续协议新增字段时不需要分别修改执行成功、
+    /// 执行失败和本地拒绝三条路径。
+    fn into_result(self, parts: RemoteProbeResultParts) -> RemoteProbeResult {
+        RemoteProbeResult {
+            run_id: parts.run_id,
+            source: self.source,
+            point_id: self.point_id,
+            request_id: self.request_id,
+            job_id: self.job_id,
+            probe_type: self.probe_type,
+            target: self.target,
+            status: parts.status,
+            latency_ms: parts.latency_ms,
+            started_at: parts.started_at,
+            finished_at: parts.finished_at,
+            duration_ms: parts.duration_ms,
+            error: parts.error,
+        }
+    }
 }
 
-impl From<smalux_protocol::RemoteProbeRequest> for RemoteProbeRunRequest {
-    /// 从自有协议探测请求转换为 service 内部命令。
-    fn from(request: smalux_protocol::RemoteProbeRequest) -> Self {
-        Self {
-            task_id: request.task_id,
+/// 远程探测结果的执行侧字段。
+///
+/// 这些字段由执行器本地生成，和 server 下发的探测目标字段分开，避免构造结果时
+/// 出现过长参数列表。
+#[derive(Debug)]
+struct RemoteProbeResultParts {
+    /// agent 生成的单次运行唯一 ID。
+    run_id: String,
+    /// 结果状态。
+    status: RemoteProbeResultStatus,
+    /// 成功时的延迟毫秒数。
+    latency_ms: Option<u64>,
+    /// 开始时间，Unix 秒。
+    started_at: u64,
+    /// 完成时间，Unix 秒。
+    finished_at: u64,
+    /// 实际耗时，毫秒。
+    duration_ms: u64,
+    /// 失败或拒绝原因。
+    error: Option<String>,
+}
+
+impl TryFrom<RemoteProbeOnceRequest> for RemoteProbeExecutionRequest {
+    type Error = anyhow::Error;
+
+    fn try_from(request: RemoteProbeOnceRequest) -> Result<Self, Self::Error> {
+        let run = Self {
+            source: RemoteProbeResultSource::Once,
+            point_id: request.point_id,
+            request_id: Some(request.request_id),
+            job_id: None,
             probe_type: request.probe_type,
             target: request.target,
+            timeout: request.timeout,
+        };
+        run.validate()?;
+        Ok(run)
+    }
+}
+
+/// 持续远程探测任务定义。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RemoteProbeJobSpec {
+    /// server 侧生成的持续任务 ID。
+    pub(crate) job_id: String,
+    /// server 侧业务探测点 ID。
+    pub(crate) point_id: Option<RemoteProbeId>,
+    /// 是否启用该任务。
+    pub(crate) enabled: bool,
+    /// 探测类型。
+    pub(crate) probe_type: RemoteProbeType,
+    /// 探测目标。
+    pub(crate) target: String,
+    /// 持续探测间隔。
+    pub(crate) interval: Duration,
+    /// 任务级超时；缺省时使用 agent 默认值。
+    pub(crate) timeout: Option<Duration>,
+}
+
+impl RemoteProbeJobSpec {
+    /// 校验持续任务最小字段。
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure_non_empty("remote_probe.job_id", &self.job_id)?;
+        validate_optional_probe_id("remote_probe.point_id", &self.point_id)?;
+        ensure_non_empty("remote_probe.target", &self.target)?;
+        if self.interval.is_zero() {
+            anyhow::bail!("remote_probe.interval must be greater than zero");
+        }
+        Ok(())
+    }
+
+    /// 转成一次执行请求。
+    fn to_execution_request(&self) -> RemoteProbeExecutionRequest {
+        RemoteProbeExecutionRequest {
+            source: RemoteProbeResultSource::Job,
+            point_id: self.point_id.clone(),
+            request_id: None,
+            job_id: Some(self.job_id.clone()),
+            probe_type: self.probe_type,
+            target: self.target.clone(),
+            timeout: self.timeout,
+        }
+    }
+}
+
+impl TryFrom<RemoteProbeJob> for RemoteProbeJobSpec {
+    type Error = anyhow::Error;
+
+    fn try_from(job: RemoteProbeJob) -> Result<Self, Self::Error> {
+        let spec = Self {
+            job_id: job.job_id,
+            point_id: job.point_id,
+            enabled: job.enabled,
+            probe_type: job.probe_type,
+            target: job.target,
+            interval: job.interval,
+            timeout: job.timeout,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+/// 统一远程探测请求。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum RemoteProbeApply {
+    /// 立即执行一批一次性探测。
+    Once {
+        /// 一次性探测列表。
+        runs: Vec<RemoteProbeExecutionRequest>,
+    },
+    /// 用新任务列表整组替换当前持续任务。
+    Replace {
+        /// 任务代际。
+        generation: u64,
+        /// 新任务列表。
+        jobs: Vec<RemoteProbeJobSpec>,
+    },
+    /// 增量更新当前持续任务。
+    Patch {
+        /// 任务代际。
+        generation: u64,
+        /// 需要新增或更新的任务。
+        upsert_jobs: Vec<RemoteProbeJobSpec>,
+        /// 需要删除的任务 ID。
+        remove_job_ids: Vec<String>,
+    },
+}
+
+impl TryFrom<RemoteProbeApplyRequest> for RemoteProbeApply {
+    type Error = anyhow::Error;
+
+    fn try_from(request: RemoteProbeApplyRequest) -> Result<Self, Self::Error> {
+        match request.operation {
+            RemoteProbeOperation::Once => {
+                if request.runs.is_empty() {
+                    anyhow::bail!("remote_probe_apply.once requires at least one run");
+                }
+                if !request.jobs.is_empty()
+                    || !request.upsert_jobs.is_empty()
+                    || !request.remove_job_ids.is_empty()
+                {
+                    anyhow::bail!("remote_probe_apply.once only accepts runs");
+                }
+                let mut request_ids = HashSet::new();
+                let mut runs = Vec::with_capacity(request.runs.len());
+                for run in request.runs {
+                    let run: RemoteProbeExecutionRequest = run.try_into()?;
+                    let display = run
+                        .request_id
+                        .as_ref()
+                        .map(RemoteProbeId::display)
+                        .unwrap_or_default();
+                    if !request_ids.insert(display.clone()) {
+                        anyhow::bail!("duplicate remote_probe request_id: {display}");
+                    }
+                    runs.push(run);
+                }
+                Ok(Self::Once { runs })
+            }
+            RemoteProbeOperation::Replace => {
+                let generation = request.generation.ok_or_else(|| {
+                    anyhow::anyhow!("remote_probe_apply.replace requires generation")
+                })?;
+                if !request.runs.is_empty()
+                    || !request.upsert_jobs.is_empty()
+                    || !request.remove_job_ids.is_empty()
+                {
+                    anyhow::bail!("remote_probe_apply.replace only accepts jobs");
+                }
+                let jobs = parse_jobs(request.jobs)?;
+                Ok(Self::Replace { generation, jobs })
+            }
+            RemoteProbeOperation::Patch => {
+                let generation = request.generation.ok_or_else(|| {
+                    anyhow::anyhow!("remote_probe_apply.patch requires generation")
+                })?;
+                if !request.runs.is_empty() || !request.jobs.is_empty() {
+                    anyhow::bail!(
+                        "remote_probe_apply.patch only accepts upsert_jobs/remove_job_ids"
+                    );
+                }
+                let upsert_jobs = parse_jobs(request.upsert_jobs)?;
+                let remove_job_ids = normalize_job_ids(request.remove_job_ids)?;
+                Ok(Self::Patch {
+                    generation,
+                    upsert_jobs,
+                    remove_job_ids,
+                })
+            }
         }
     }
 }
@@ -79,6 +340,8 @@ pub(crate) struct RemoteProbeManager {
     sequence: OutboundSequence,
     /// 本地频率保护状态。
     rate_state: Arc<Mutex<ProbeRateState>>,
+    /// 持续任务运行状态。
+    scheduler_state: Arc<Mutex<ProbeSchedulerState>>,
     /// HTTP 探测复用连接池。
     http_client: reqwest::Client,
 }
@@ -95,66 +358,279 @@ impl RemoteProbeManager {
             outbound_tx,
             sequence,
             rate_state: Arc::new(Mutex::new(ProbeRateState::default())),
+            scheduler_state: Arc::new(Mutex::new(ProbeSchedulerState::default())),
             http_client: reqwest::Client::new(),
         }
     }
 
-    /// 启动一次远程探测；禁用或限频时立即回传 `value=-1`，不排队等待。
-    pub(crate) fn start(&self, request: RemoteProbeRunRequest) -> anyhow::Result<()> {
+    /// 应用一次性探测或持续任务更新。
+    pub(crate) async fn apply(&self, request: RemoteProbeApply) -> anyhow::Result<()> {
+        match request {
+            RemoteProbeApply::Once { runs } => {
+                for run in runs {
+                    self.start_once(run).await?;
+                }
+                Ok(())
+            }
+            RemoteProbeApply::Replace { generation, jobs } => self.apply_replace(generation, jobs),
+            RemoteProbeApply::Patch {
+                generation,
+                upsert_jobs,
+                remove_job_ids,
+            } => self.apply_patch(generation, upsert_jobs, remove_job_ids),
+        }
+    }
+
+    /// 启动一次性探测；禁用或限频时立即回传 `status=rejected`。
+    async fn start_once(&self, request: RemoteProbeExecutionRequest) -> anyhow::Result<()> {
         request.validate()?;
         let config = self.config_manager.current();
         let agent_id = config.agent_id.clone();
         let probe_config = config.remote_probe;
 
-        // remote probe 默认关闭；关闭或限频时仍回传结果，方便 server 看到“请求被拒绝”
-        // 而不是一直等待超时。这里不排队，是因为网络探测结果有明显时效性。
         if !probe_config.enabled {
-            self.queue_immediate_result(agent_id, request, "remote probe is disabled")?;
+            self.queue_immediate_result(agent_id, request, "remote probe is disabled")
+                .await?;
             return Ok(());
         }
 
         if let Some(reason) = self.try_mark_started(&request, &probe_config) {
-            self.queue_immediate_result(agent_id, request, &reason)?;
+            self.queue_immediate_result(agent_id, request, &reason)
+                .await?;
             return Ok(());
         }
 
+        let timeout = request
+            .timeout
+            .map(|requested| requested.min(probe_config.timeout))
+            .unwrap_or(probe_config.timeout);
+        self.spawn_probe_task(agent_id, request, timeout);
+        Ok(())
+    }
+
+    /// 应用整组持续任务替换。
+    fn apply_replace(&self, generation: u64, jobs: Vec<RemoteProbeJobSpec>) -> anyhow::Result<()> {
+        let mut state = self
+            .scheduler_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if state.generation.is_some_and(|current| generation < current) {
+            tracing::warn!(
+                generation,
+                current_generation = state.generation.unwrap_or(0),
+                "stale remote probe replace ignored"
+            );
+            return Ok(());
+        }
+
+        let mut old_jobs = std::mem::take(&mut state.jobs);
+        let mut rebuilt = HashMap::with_capacity(jobs.len());
+        for spec in jobs {
+            let key = spec.job_id.clone();
+            let control = match old_jobs.remove(&key) {
+                Some(existing) if existing.spec == spec => existing.control,
+                Some(existing) => {
+                    stop_job_worker(existing.control);
+                    None
+                }
+                None => None,
+            };
+            rebuilt.insert(key, ScheduledProbeJob { spec, control });
+        }
+
+        for existing in old_jobs.into_values() {
+            stop_job_worker(existing.control);
+        }
+
+        state.jobs = rebuilt;
+        state.generation = Some(generation);
+        drop(state);
+        self.reconcile_job_workers();
+        tracing::info!(generation, "remote probe jobs replaced");
+        Ok(())
+    }
+
+    /// 应用持续任务增量 patch。
+    fn apply_patch(
+        &self,
+        generation: u64,
+        upsert_jobs: Vec<RemoteProbeJobSpec>,
+        remove_job_ids: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .scheduler_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if state.generation.is_some_and(|current| generation < current) {
+            tracing::warn!(
+                generation,
+                current_generation = state.generation.unwrap_or(0),
+                "stale remote probe patch ignored"
+            );
+            return Ok(());
+        }
+
+        for job_id in remove_job_ids {
+            if let Some(existing) = state.jobs.remove(&job_id) {
+                stop_job_worker(existing.control);
+            }
+        }
+
+        for spec in upsert_jobs {
+            match state.jobs.remove(&spec.job_id) {
+                Some(existing) if existing.spec == spec => {
+                    state.jobs.insert(spec.job_id.clone(), existing);
+                }
+                Some(existing) => {
+                    stop_job_worker(existing.control);
+                    state.jobs.insert(
+                        spec.job_id.clone(),
+                        ScheduledProbeJob {
+                            spec,
+                            control: None,
+                        },
+                    );
+                }
+                None => {
+                    state.jobs.insert(
+                        spec.job_id.clone(),
+                        ScheduledProbeJob {
+                            spec,
+                            control: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        state.generation = Some(generation);
+        drop(state);
+        self.reconcile_job_workers();
+        tracing::info!(generation, "remote probe jobs patched");
+        Ok(())
+    }
+
+    /// 对齐 worker 运行状态和当前任务表。
+    fn reconcile_job_workers(&self) {
+        let mut state = self
+            .scheduler_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for job in state.jobs.values_mut() {
+            if job.spec.enabled {
+                if job.control.is_none() {
+                    job.control = Some(self.spawn_job_worker(job.spec.clone()));
+                }
+            } else if job.control.is_some() {
+                let control = job.control.take();
+                stop_job_worker(control);
+            }
+        }
+    }
+
+    /// 为单个持续任务启动 worker。
+    fn spawn_job_worker(&self, spec: RemoteProbeJobSpec) -> JobWorkerControl {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let manager = self.clone();
-        let timeout = probe_config.timeout;
+        let job_id = spec.job_id.clone();
+        let interval = spec.interval;
+        let handle = tokio::spawn(async move {
+            tracing::info!(
+                job_id = %job_id,
+                point_id = %spec.point_id.as_ref().map(RemoteProbeId::display).unwrap_or_default(),
+                probe_type = spec.probe_type.as_str(),
+                interval_ms = interval.as_millis(),
+                "remote probe job started"
+            );
+            run_job_loop(manager, spec, shutdown_rx).await;
+        });
+        JobWorkerControl {
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    /// 单次执行持续任务；禁用或限频时只记录日志，不上报 rejected。
+    async fn start_job(&self, spec: &RemoteProbeJobSpec) -> anyhow::Result<()> {
+        let request = spec.to_execution_request();
+        let config = self.config_manager.current();
+        let probe_config = config.remote_probe;
+        if !probe_config.enabled {
+            tracing::debug!(
+                job_id = %spec.job_id,
+                "remote probe job skipped because remote probe is disabled"
+            );
+            return Ok(());
+        }
+
+        if let Some(reason) = self.try_mark_started(&request, &probe_config) {
+            tracing::debug!(job_id = %spec.job_id, reason, "remote probe job skipped");
+            return Ok(());
+        }
+
+        let timeout = spec
+            .timeout
+            .map(|requested| requested.min(probe_config.timeout))
+            .unwrap_or(probe_config.timeout);
+        let agent_id = config.agent_id.clone();
+        self.spawn_probe_task(agent_id, request, timeout);
+        Ok(())
+    }
+
+    /// 启动真正的探测任务。
+    fn spawn_probe_task(
+        &self,
+        agent_id: String,
+        request: RemoteProbeExecutionRequest,
+        timeout: Duration,
+    ) {
+        let manager = self.clone();
+        let run_id = new_run_id();
         tracing::info!(
-            task_id = %display_task_id(&request.task_id),
+            run_id = %run_id,
+            probe_id = %request.display_id(),
+            point_id = %request.point_display_id(),
+            execution_id = %request.execution_display_id(),
             probe_type = request.probe_type.as_str(),
-            target = %request.target,
+            target_len = request.target.len(),
             timeout_ms = timeout.as_millis(),
             "remote probe accepted"
         );
 
         tokio::spawn(async move {
-            let task_id = request.task_id.clone();
-            let result = execute_remote_probe(request, timeout, manager.http_client.clone()).await;
+            let probe_id = request.display_id();
+            let point_id = request.point_display_id();
+            let execution_id = request.execution_display_id();
+            let result =
+                execute_remote_probe(run_id, request, timeout, manager.http_client.clone()).await;
+            let run_id = result.run_id.clone();
             let probe_type = result.probe_type.as_str();
-            let target = result.target.clone();
-            let value = result.value;
+            let target_len = result.target.len();
+            let status = result.status;
+            let latency_ms = result.latency_ms;
             let duration_ms = result.duration_ms;
-            let error = result.error.clone();
+            let errored = result.error.is_some();
             manager.send_result(agent_id, result).await;
             tracing::info!(
-                task_id = %display_task_id(&task_id),
+                run_id = %run_id,
+                probe_id = %probe_id,
+                point_id = %point_id,
+                execution_id = %execution_id,
                 probe_type,
-                target = %target,
-                value,
+                target_len,
+                status = ?status,
+                latency_ms,
                 duration_ms,
-                error = error.as_deref().unwrap_or(""),
+                errored,
                 "remote probe finished"
             );
         });
-
-        Ok(())
     }
 
     /// 检查并记录本次探测启动时间；返回 Some 表示被限频拒绝。
     fn try_mark_started(
         &self,
-        request: &RemoteProbeRunRequest,
+        request: &RemoteProbeExecutionRequest,
         config: &crate::config::model::RemoteProbeConfig,
     ) -> Option<String> {
         let now = Instant::now();
@@ -163,7 +639,6 @@ impl RemoteProbeManager {
             .rate_state
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        // 先清理过期目标，再判断上限和同目标限频，避免长期运行时 target map 只增不减。
         state.prune(now, config.target_min_interval);
 
         if state
@@ -186,41 +661,40 @@ impl RemoteProbeManager {
     }
 
     /// 立即投递失败结果。
-    fn queue_immediate_result(
+    async fn queue_immediate_result(
         &self,
         agent_id: String,
-        request: RemoteProbeRunRequest,
+        request: RemoteProbeExecutionRequest,
         reason: &str,
     ) -> anyhow::Result<()> {
         let now = unix_timestamp_secs();
-        let task_id_for_log = request.task_id.clone();
+        let run_id = new_run_id();
+        let probe_id_for_log = request.display_id();
+        let point_id_for_log = request.point_display_id();
+        let execution_id_for_log = request.execution_display_id();
         let probe_type_for_log = request.probe_type;
-        let target_for_log = request.target.clone();
-        let result = RemoteProbeResult {
-            task_id: request.task_id,
-            probe_type: request.probe_type,
-            target: request.target,
-            value: -1,
+        let target_len_for_log = request.target.len();
+        let result = request.into_result(RemoteProbeResultParts {
+            run_id: run_id.clone(),
+            status: RemoteProbeResultStatus::Rejected,
+            latency_ms: None,
             started_at: now,
             finished_at: now,
             duration_ms: 0,
             error: Some(reason.to_string()),
-        };
+        });
         let event = self.result_event(agent_id, result);
         self.outbound_tx
-            .try_send(event)
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("outbound event queue is full")
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("outbound event queue is closed")
-                }
-            })?;
+            .send(event)
+            .await
+            .map_err(|error| anyhow::anyhow!("outbound event send failed: {error}"))?;
         tracing::warn!(
-            task_id = %display_task_id(&task_id_for_log),
+            run_id = %run_id,
+            probe_id = %probe_id_for_log,
+            point_id = %point_id_for_log,
+            execution_id = %execution_id_for_log,
             probe_type = probe_type_for_log.as_str(),
-            target = %target_for_log,
+            target_len = target_len_for_log,
             reason,
             "remote probe rejected"
         );
@@ -229,12 +703,15 @@ impl RemoteProbeManager {
 
     /// 异步投递探测结果。
     async fn send_result(&self, agent_id: String, result: RemoteProbeResult) {
-        let task_id = result.task_id.clone();
+        let run_id = result.run_id.clone();
+        let probe_id = result.display_id();
         let event = self.result_event(agent_id, result);
-        if self.outbound_tx.send(event).await.is_err() {
+        if let Err(error) = self.outbound_tx.send(event).await {
             tracing::warn!(
-                task_id = %display_task_id(&task_id),
-                "outbound event queue closed; remote probe result dropped"
+                run_id = %run_id,
+                probe_id = %probe_id,
+                error = %error,
+                "remote probe result dropped"
             );
         }
     }
@@ -244,6 +721,88 @@ impl RemoteProbeManager {
         let sequence = self.sequence.next();
         OutboundEvent::RemoteProbeResult(RemoteProbeResultEnvelope::new(agent_id, sequence, result))
     }
+}
+
+/// 持续任务运行状态。
+#[derive(Debug, Default)]
+struct ProbeSchedulerState {
+    /// 当前持续任务代际。
+    generation: Option<u64>,
+    /// 当前持续任务列表。
+    jobs: HashMap<String, ScheduledProbeJob>,
+}
+
+/// 单个持续任务的运行状态。
+#[derive(Debug)]
+struct ScheduledProbeJob {
+    /// 当前任务定义。
+    spec: RemoteProbeJobSpec,
+    /// 可选 worker 控制句柄。
+    control: Option<JobWorkerControl>,
+}
+
+/// 单个持续任务 worker 控制句柄。
+#[derive(Debug)]
+struct JobWorkerControl {
+    /// worker 停止信号。
+    shutdown_tx: watch::Sender<bool>,
+    /// worker 任务句柄。
+    handle: JoinHandle<()>,
+}
+
+/// 停止一个持续任务 worker。
+fn stop_job_worker(control: Option<JobWorkerControl>) {
+    let Some(control) = control else {
+        return;
+    };
+    let _ = control.shutdown_tx.send_replace(true);
+    drop(control.handle);
+}
+
+/// 周期运行单个持续任务。
+async fn run_job_loop(
+    manager: RemoteProbeManager,
+    spec: RemoteProbeJobSpec,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let job_id = spec.job_id.clone();
+    let mut first_run = true;
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        if !first_run {
+            tokio::select! {
+                _ = tokio::time::sleep(spec.interval) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        first_run = false;
+
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        if let Err(error) = manager.start_job(&spec).await {
+            tracing::warn!(job_id = %job_id, error = ?error, "remote probe job execution failed");
+        }
+    }
+
+    tracing::info!(job_id = %job_id, "remote probe job stopped");
+}
+
+/// 校验可选探测 ID，避免空字符串进入结果回传。
+fn validate_optional_probe_id(field: &str, value: &Option<RemoteProbeId>) -> anyhow::Result<()> {
+    if matches!(value, Some(RemoteProbeId::String(value)) if value.trim().is_empty()) {
+        anyhow::bail!("{field} cannot be empty");
+    }
+    Ok(())
 }
 
 /// 频率保护状态。
@@ -280,7 +839,8 @@ impl ProbeRateState {
 
 /// 执行远程探测并构建结果。
 async fn execute_remote_probe(
-    request: RemoteProbeRunRequest,
+    run_id: String,
+    request: RemoteProbeExecutionRequest,
     timeout: Duration,
     http_client: reqwest::Client,
 ) -> RemoteProbeResult {
@@ -291,22 +851,30 @@ async fn execute_remote_probe(
         RemoteProbeType::Http => probe_http(&http_client, &request.target, timeout).await,
         RemoteProbeType::Icmp => Err(anyhow::anyhow!("icmp probe is not implemented")),
     };
-    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
-    let (value, error) = match result {
-        Ok(()) => (duration_ms, None),
-        Err(error) => (-1, Some(error.to_string())),
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let (status, latency_ms, error) = match result {
+        Ok(()) => (RemoteProbeResultStatus::Success, Some(duration_ms), None),
+        Err(error) => (
+            RemoteProbeResultStatus::Failed,
+            None,
+            Some(error.to_string()),
+        ),
     };
 
-    RemoteProbeResult {
-        task_id: request.task_id,
-        probe_type: request.probe_type,
-        target: request.target,
-        value,
+    request.into_result(RemoteProbeResultParts {
+        run_id,
+        status,
+        latency_ms,
         started_at,
         finished_at: unix_timestamp_secs(),
-        duration_ms: duration_ms.max(0) as u64,
+        duration_ms,
         error,
-    }
+    })
+}
+
+/// 生成单次探测运行 ID。
+fn new_run_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// 执行 TCP 连接探测。
@@ -364,12 +932,39 @@ fn http_target_url(target: &str) -> anyhow::Result<reqwest::Url> {
     Ok(url)
 }
 
-/// 把兼容协议的 task id 转成日志友好的字符串。
-pub(crate) fn display_task_id(task_id: &Value) -> String {
-    task_id
-        .as_str()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| task_id.to_string())
+/// 解析并去重持续任务列表。
+fn parse_jobs(jobs: Vec<RemoteProbeJob>) -> anyhow::Result<Vec<RemoteProbeJobSpec>> {
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let spec: RemoteProbeJobSpec = job.try_into()?;
+        if !seen.insert(spec.job_id.clone()) {
+            anyhow::bail!("duplicate remote_probe job_id: {}", spec.job_id);
+        }
+        parsed.push(spec);
+    }
+    Ok(parsed)
+}
+
+/// 归一化删除任务 ID 列表。
+fn normalize_job_ids(job_ids: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(job_ids.len());
+    for job_id in job_ids {
+        let job_id = job_id.trim().to_string();
+        if job_id.is_empty() {
+            anyhow::bail!("remote_probe.job_id cannot be empty");
+        }
+        if seen.insert(job_id.clone()) {
+            normalized.push(job_id);
+        }
+    }
+    Ok(normalized)
+}
+
+/// 把兼容协议的 probe id 转成日志友好的字符串。
+pub(crate) fn display_probe_id(probe_id: &RemoteProbeId) -> String {
+    probe_id.display()
 }
 
 #[cfg(test)]
@@ -387,7 +982,7 @@ mod tests {
         mut config: AgentConfig,
     ) -> (
         RemoteProbeManager,
-        tokio::sync::mpsc::Receiver<OutboundEvent>,
+        crate::service::message::outbound::OutboundReceiver,
     ) {
         config.agent_id = "agent-probe".to_string();
         let manager = ConfigManager::new(config).unwrap();
@@ -398,22 +993,70 @@ mod tests {
         (probe_manager, outbound_rx)
     }
 
-    /// 构造 TCP 探测请求。
-    fn tcp_request(task_id: impl Into<Value>, target: String) -> RemoteProbeRunRequest {
-        RemoteProbeRunRequest {
-            task_id: task_id.into(),
+    /// 构造 TCP 一次性探测请求。
+    fn tcp_request(
+        request_id: impl Into<RemoteProbeId>,
+        target: String,
+    ) -> RemoteProbeExecutionRequest {
+        let request_id = request_id.into();
+        RemoteProbeExecutionRequest {
+            source: RemoteProbeResultSource::Once,
+            point_id: Some(request_id.clone()),
+            request_id: Some(request_id),
+            job_id: None,
             probe_type: RemoteProbeType::Tcp,
             target,
+            timeout: None,
         }
     }
 
-    /// 验证默认关闭时不会发起网络探测，而是直接回传 -1。
+    /// 验证同一个业务探测点可以发起多次不同的一次性请求。
+    #[test]
+    fn remote_probe_once_allows_same_point_with_distinct_request_ids() {
+        let apply: RemoteProbeApply = RemoteProbeApplyRequest {
+            operation: RemoteProbeOperation::Once,
+            generation: None,
+            runs: vec![
+                RemoteProbeOnceRequest {
+                    request_id: RemoteProbeId::from("request-1"),
+                    point_id: Some(RemoteProbeId::from("point-a")),
+                    probe_type: RemoteProbeType::Tcp,
+                    target: "127.0.0.1:1".to_string(),
+                    timeout: None,
+                },
+                RemoteProbeOnceRequest {
+                    request_id: RemoteProbeId::from("request-2"),
+                    point_id: Some(RemoteProbeId::from("point-a")),
+                    probe_type: RemoteProbeType::Tcp,
+                    target: "127.0.0.1:2".to_string(),
+                    timeout: None,
+                },
+            ],
+            jobs: Vec::new(),
+            upsert_jobs: Vec::new(),
+            remove_job_ids: Vec::new(),
+        }
+        .try_into()
+        .unwrap();
+
+        let RemoteProbeApply::Once { runs } = apply else {
+            panic!("expected once apply");
+        };
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].point_id, Some(RemoteProbeId::from("point-a")));
+        assert_eq!(runs[1].point_id, Some(RemoteProbeId::from("point-a")));
+    }
+
+    /// 验证默认关闭时不会发起网络探测，而是直接回传 rejected。
     #[tokio::test]
-    async fn disabled_remote_probe_returns_negative_result() {
+    async fn disabled_remote_probe_returns_rejected_result() {
         let (manager, mut outbound_rx) = probe_manager(AgentConfig::default());
 
         manager
-            .start(tcp_request("probe-disabled", "127.0.0.1:1".to_string()))
+            .apply(RemoteProbeApply::Once {
+                runs: vec![tcp_request("probe-disabled", "127.0.0.1:1".to_string())],
+            })
+            .await
             .unwrap();
 
         let event = outbound_rx.recv().await.unwrap();
@@ -422,13 +1065,23 @@ mod tests {
         };
 
         assert_eq!(result.sequence, 1);
-        assert_eq!(result.result.value, -1);
+        assert_eq!(result.result.source, RemoteProbeResultSource::Once);
+        assert_eq!(
+            result.result.point_id,
+            Some(RemoteProbeId::from("probe-disabled"))
+        );
+        assert_eq!(
+            result.result.request_id,
+            Some(RemoteProbeId::from("probe-disabled"))
+        );
+        assert_eq!(result.result.status, RemoteProbeResultStatus::Rejected);
+        assert_eq!(result.result.latency_ms, None);
         assert!(result.result.error.as_deref().unwrap().contains("disabled"));
     }
 
-    /// 验证全局限频会直接返回 -1，不排队延迟执行。
+    /// 验证全局限频会直接返回 rejected，不排队延迟执行。
     #[tokio::test]
-    async fn remote_probe_global_rate_limit_returns_negative_result() {
+    async fn remote_probe_global_rate_limit_returns_rejected_result() {
         let mut config = AgentConfig::default();
         config.remote_probe.enabled = true;
         let (manager, mut outbound_rx) = probe_manager(config);
@@ -438,7 +1091,10 @@ mod tests {
         }
 
         manager
-            .start(tcp_request("probe-rate", "127.0.0.1:1".to_string()))
+            .apply(RemoteProbeApply::Once {
+                runs: vec![tcp_request("probe-rate", "127.0.0.1:1".to_string())],
+            })
+            .await
             .unwrap();
 
         let event = outbound_rx.recv().await.unwrap();
@@ -446,7 +1102,8 @@ mod tests {
             panic!("expected remote probe result");
         };
 
-        assert_eq!(result.result.value, -1);
+        assert_eq!(result.result.status, RemoteProbeResultStatus::Rejected);
+        assert_eq!(result.result.latency_ms, None);
         assert!(
             result
                 .result
@@ -469,7 +1126,12 @@ mod tests {
         config.remote_probe.enabled = true;
         let (manager, mut outbound_rx) = probe_manager(config);
 
-        manager.start(tcp_request("probe-ok", target)).unwrap();
+        manager
+            .apply(RemoteProbeApply::Once {
+                runs: vec![tcp_request("probe-ok", target)],
+            })
+            .await
+            .unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
             .await
@@ -480,8 +1142,13 @@ mod tests {
         };
         let _ = server.await;
 
-        assert_eq!(result.result.task_id, Value::String("probe-ok".to_string()));
-        assert!(result.result.value >= 0);
+        assert_eq!(result.result.source, RemoteProbeResultSource::Once);
+        assert_eq!(
+            result.result.request_id,
+            Some(RemoteProbeId::from("probe-ok"))
+        );
+        assert_eq!(result.result.status, RemoteProbeResultStatus::Success);
+        assert!(result.result.latency_ms.is_some());
         assert_eq!(result.result.error, None);
     }
 
@@ -506,11 +1173,18 @@ mod tests {
         let (manager, mut outbound_rx) = probe_manager(config);
 
         manager
-            .start(RemoteProbeRunRequest {
-                task_id: Value::from(7),
-                probe_type: RemoteProbeType::Http,
-                target,
+            .apply(RemoteProbeApply::Once {
+                runs: vec![RemoteProbeExecutionRequest {
+                    source: RemoteProbeResultSource::Once,
+                    point_id: Some(RemoteProbeId::from("point-7")),
+                    request_id: Some(RemoteProbeId::from(7)),
+                    job_id: None,
+                    probe_type: RemoteProbeType::Http,
+                    target,
+                    timeout: None,
+                }],
             })
+            .await
             .unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
@@ -522,8 +1196,143 @@ mod tests {
         };
         let _ = server.await;
 
-        assert_eq!(result.result.task_id, Value::from(7));
-        assert!(result.result.value >= 0);
+        assert_eq!(result.result.source, RemoteProbeResultSource::Once);
+        assert_eq!(result.result.point_id, Some(RemoteProbeId::from("point-7")));
+        assert_eq!(result.result.request_id, Some(RemoteProbeId::from(7)));
+        assert_eq!(result.result.status, RemoteProbeResultStatus::Success);
+        assert!(result.result.latency_ms.is_some());
         assert_eq!(result.result.error, None);
+    }
+
+    /// 验证 replace 持续任务会启动 worker 并上报结果。
+    #[tokio::test]
+    async fn remote_probe_replace_jobs_starts_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+        });
+        let mut config = AgentConfig::default();
+        config.remote_probe.enabled = true;
+        let (manager, mut outbound_rx) = probe_manager(config);
+
+        manager
+            .apply(RemoteProbeApply::Replace {
+                generation: 1,
+                jobs: vec![RemoteProbeJobSpec {
+                    job_id: "job-main".to_string(),
+                    point_id: Some(RemoteProbeId::from("point-main")),
+                    enabled: true,
+                    probe_type: RemoteProbeType::Tcp,
+                    target,
+                    interval: Duration::from_millis(50),
+                    timeout: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutboundEvent::RemoteProbeResult(result) = event else {
+            panic!("expected remote probe result");
+        };
+        let _ = server.await;
+
+        assert_eq!(result.result.source, RemoteProbeResultSource::Job);
+        assert_eq!(
+            result.result.point_id,
+            Some(RemoteProbeId::from("point-main"))
+        );
+        assert_eq!(result.result.job_id.as_deref(), Some("job-main"));
+        assert_eq!(result.result.status, RemoteProbeResultStatus::Success);
+        assert!(result.result.latency_ms.is_some());
+    }
+
+    /// 验证 patch 可以删除旧任务并启动新任务。
+    #[tokio::test]
+    async fn remote_probe_patch_replaces_running_job() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_target = first_listener.local_addr().unwrap().to_string();
+        let first_server = tokio::spawn(async move {
+            let (_stream, _) = first_listener.accept().await.unwrap();
+        });
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_target = second_listener.local_addr().unwrap().to_string();
+        let second_server = tokio::spawn(async move {
+            let (_stream, _) = second_listener.accept().await.unwrap();
+        });
+
+        let mut config = AgentConfig::default();
+        config.remote_probe.enabled = true;
+        let (manager, mut outbound_rx) = probe_manager(config);
+
+        manager
+            .apply(RemoteProbeApply::Replace {
+                generation: 1,
+                jobs: vec![RemoteProbeJobSpec {
+                    job_id: "job-old".to_string(),
+                    point_id: Some(RemoteProbeId::from("point-old")),
+                    enabled: true,
+                    probe_type: RemoteProbeType::Tcp,
+                    target: first_target,
+                    interval: Duration::from_secs(30),
+                    timeout: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let first_event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutboundEvent::RemoteProbeResult(first_result) = first_event else {
+            panic!("expected first remote probe result");
+        };
+        assert_eq!(first_result.result.source, RemoteProbeResultSource::Job);
+        assert_eq!(first_result.result.job_id.as_deref(), Some("job-old"));
+
+        manager
+            .apply(RemoteProbeApply::Patch {
+                generation: 2,
+                upsert_jobs: vec![RemoteProbeJobSpec {
+                    job_id: "job-new".to_string(),
+                    point_id: Some(RemoteProbeId::from("point-new")),
+                    enabled: true,
+                    probe_type: RemoteProbeType::Tcp,
+                    target: second_target,
+                    interval: Duration::from_millis(50),
+                    timeout: None,
+                }],
+                remove_job_ids: vec!["job-old".to_string()],
+            })
+            .await
+            .unwrap();
+
+        let second_event = tokio::time::timeout(Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutboundEvent::RemoteProbeResult(second_result) = second_event else {
+            panic!("expected second remote probe result");
+        };
+
+        let _ = first_server.await;
+        let _ = second_server.await;
+
+        assert_eq!(second_result.result.source, RemoteProbeResultSource::Job);
+        assert_eq!(
+            second_result.result.point_id,
+            Some(RemoteProbeId::from("point-new"))
+        );
+        assert_eq!(second_result.result.job_id.as_deref(), Some("job-new"));
+        assert_eq!(
+            second_result.result.status,
+            RemoteProbeResultStatus::Success
+        );
+        assert!(second_result.result.latency_ms.is_some());
     }
 }

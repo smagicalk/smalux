@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use smalux_core::model::info::{AgentReport, PublicIpStatus};
-use smalux_protocol::{RemoteProbeResult, RemoteTaskResult, RemoteTaskStatus};
+use smalux_protocol::{RemoteProbeId, RemoteProbeResult, RemoteTaskResult, RemoteTaskStatus};
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
@@ -273,8 +273,8 @@ pub struct PingResult {
     /// Komari WebSocket 消息类型。
     #[serde(rename = "type")]
     pub message_type: &'static str,
-    /// Komari server 下发的 ping task ID，保持原始 JSON 类型。
-    pub task_id: serde_json::Value,
+    /// Komari server 下发的 ping task ID，保持字符串或整数语义。
+    pub task_id: RemoteProbeId,
     /// 探测类型。
     pub ping_type: String,
     /// 延迟毫秒数；失败、禁用或限频时为 -1。
@@ -288,9 +288,9 @@ impl PingResult {
     pub fn from_remote_probe_result(result: &RemoteProbeResult) -> Self {
         Self {
             message_type: "ping_result",
-            task_id: result.task_id.clone(),
+            task_id: result.komari_task_id(),
             ping_type: result.probe_type.as_str().to_string(),
-            value: result.value,
+            value: result.komari_value(),
             finished_at: unix_secs_to_rfc3339(result.finished_at),
         }
     }
@@ -589,10 +589,15 @@ mod tests {
     #[test]
     fn ping_result_maps_remote_probe_result() {
         let result = RemoteProbeResult {
-            task_id: serde_json::Value::from(123),
+            run_id: "probe-run-1".to_string(),
+            source: smalux_protocol::RemoteProbeResultSource::Once,
+            point_id: Some(RemoteProbeId::from("point-123")),
+            request_id: Some(RemoteProbeId::from(123)),
+            job_id: None,
             probe_type: RemoteProbeType::Tcp,
             target: "example.com:443".to_string(),
-            value: 13,
+            status: smalux_protocol::RemoteProbeResultStatus::Success,
+            latency_ms: Some(13),
             started_at: 99,
             finished_at: 100,
             duration_ms: 13,

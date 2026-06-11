@@ -237,9 +237,10 @@ pub(crate) async fn export_supervisor(
                     OutboundEvent::RemoteProbeResult(result) => {
                         tracing::debug!(
                             sequence = result.sequence,
-                            task_id = %result.result.task_id,
+                            probe_id = %result.result.display_id(),
                             probe_type = result.result.probe_type.as_str(),
-                            value = result.result.value,
+                            status = ?result.result.status,
+                            latency_ms = result.result.latency_ms,
                             "remote probe result export requested"
                         );
                         if let Err(err) = queue_remote_probe_result(
@@ -504,7 +505,7 @@ async fn reconnect_pipeline_and_resume(
     .await?;
     // 恢复顺序固定为 latest report -> pending 即时事件。
     // server 先拿到最新监控状态，再收到 ack/error 或 remote result 时更容易关联上下文。
-    if let Err(err) = send_resume_events(
+    send_resume_events(
         &mut pipeline.transport_hub,
         &mut pipeline.router,
         &mut pipeline.deliveries,
@@ -512,13 +513,14 @@ async fn reconnect_pipeline_and_resume(
         pending_events.resume_events(),
     )
     .await
-    {
+    .map_err(|err| {
         tracing::warn!(
             context,
             error = ?err,
             "export resume events failed after reconnect"
         );
-    }
+        err
+    })?;
 
     Ok(())
 }
@@ -664,10 +666,15 @@ mod tests {
                 sequence: 11,
                 created_at: 100,
                 result: smalux_protocol::RemoteProbeResult {
-                    task_id: serde_json::Value::from(7),
+                    run_id: "probe-run-1".to_string(),
+                    source: smalux_protocol::RemoteProbeResultSource::Once,
+                    point_id: Some(smalux_protocol::RemoteProbeId::from("point-7")),
+                    request_id: Some(smalux_protocol::RemoteProbeId::from(7)),
+                    job_id: None,
                     probe_type: smalux_protocol::RemoteProbeType::Tcp,
                     target: "example.com:443".to_string(),
-                    value: 12,
+                    status: smalux_protocol::RemoteProbeResultStatus::Success,
+                    latency_ms: Some(12),
                     started_at: 99,
                     finished_at: 100,
                     duration_ms: 12,

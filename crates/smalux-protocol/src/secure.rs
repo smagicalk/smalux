@@ -92,7 +92,14 @@ pub fn encode_secure_hello(key_id: &str) -> anyhow::Result<Vec<u8>> {
 
 /// 解码 hello payload。
 pub fn decode_secure_hello(input: &[u8]) -> anyhow::Result<SecureHello> {
-    Ok(serde_json::from_slice(input)?)
+    let hello: SecureHello = serde_json::from_slice(input)?;
+    if hello.pattern != NOISE_PATTERN {
+        anyhow::bail!(
+            "secure hello pattern mismatch: expected {NOISE_PATTERN}, got {}",
+            hello.pattern
+        );
+    }
+    Ok(hello)
 }
 
 /// 创建 Noise initiator，agent 主动连接时使用。
@@ -213,6 +220,17 @@ mod tests {
         let error = parse_secure_token("bad.token").unwrap_err();
 
         assert!(error.to_string().contains("smx1"));
+    }
+
+    /// 验证 hello pattern 不匹配会在 decode 阶段被拒绝。
+    #[test]
+    fn decode_secure_hello_rejects_unexpected_pattern() {
+        let error = decode_secure_hello(
+            br#"{"key_id":"agent-key","pattern":"Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s"}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("pattern mismatch"));
     }
 
     /// 验证 Noise PSK 握手后可以加密解密 payload。

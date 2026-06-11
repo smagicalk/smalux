@@ -5,7 +5,7 @@
 
 use super::message::{RemoteShellOpenRequest, validate_open_request};
 use super::options::RemoteShellOptions;
-use super::session::{RemoteShellSession, RemoteShellSessionPermit};
+use super::session::{RemoteShellSession, RemoteShellSessionPermit, RemoteShellSessionReady};
 use super::stream::RemoteShellStreamCodecRef;
 use crate::config::model::{ExportConfig, RemoteShellConfig};
 use std::sync::Arc;
@@ -30,7 +30,7 @@ impl RemoteShellManager {
     }
 
     /// 处理主控制通道下发的 shell 打开请求。
-    pub(crate) fn open(
+    pub(crate) async fn open(
         &self,
         request: RemoteShellOpenRequest,
         export_config: &ExportConfig,
@@ -47,14 +47,25 @@ impl RemoteShellManager {
         let codec_name = stream_codec.name();
         let session =
             RemoteShellSession::new(request, export_config, shell_config, stream_codec, permit)?;
+        let ready = session.establish_ready().await?;
+        self.spawn_ready_session(ready, session_id, codec_name);
+        Ok(())
+    }
 
+    /// 启动已经完成 ready 阶段的 shell 会话。
+    fn spawn_ready_session(
+        &self,
+        ready: RemoteShellSessionReady,
+        session_id: String,
+        codec_name: &'static str,
+    ) {
         tokio::spawn(async move {
             tracing::info!(
                 session_id = %session_id,
                 codec = codec_name,
                 "remote shell session starting"
             );
-            if let Err(err) = session.run().await {
+            if let Err(err) = ready.run().await {
                 tracing::warn!(
                     session_id = %session_id,
                     codec = codec_name,
@@ -69,8 +80,6 @@ impl RemoteShellManager {
                 );
             }
         });
-
-        Ok(())
     }
 
     /// 尝试获取一个会话名额。
@@ -187,8 +196,8 @@ mod tests {
     }
 
     /// 验证默认关闭时拒绝打开 shell。
-    #[test]
-    fn manager_rejects_open_when_disabled() {
+    #[tokio::test]
+    async fn manager_rejects_open_when_disabled() {
         let manager = RemoteShellManager::new(RemoteShellOptions::default());
         let error = manager
             .open(
@@ -197,14 +206,15 @@ mod tests {
                 &RemoteShellConfig::default(),
                 smalux_codec(),
             )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("disabled"));
     }
 
     /// 验证会话上限会拒绝新的打开请求。
-    #[test]
-    fn manager_rejects_open_when_session_limit_is_reached() {
+    #[tokio::test]
+    async fn manager_rejects_open_when_session_limit_is_reached() {
         let manager = RemoteShellManager::new(RemoteShellOptions { enabled: true });
         let _permit = manager.acquire_session_permit(1).unwrap();
 
@@ -215,6 +225,7 @@ mod tests {
                 &RemoteShellConfig::default(),
                 smalux_codec(),
             )
+            .await
             .unwrap_err();
 
         assert!(error.to_string().contains("limit"));
@@ -321,6 +332,7 @@ mod tests {
                 },
                 raw_test_codec(),
             )
+            .await
             .unwrap();
 
         let (input_sent, output_seen, output_text) = timeout(Duration::from_secs(12), server_task)

@@ -7,19 +7,18 @@ mod collector;
 mod export;
 mod message;
 mod options;
-mod public_ip;
 mod remote;
 mod reporter;
 
 use crate::collect::LocalCollector;
 use crate::config::ConfigManager;
 use bootstrap::{bootstrap_once, public_ip_required_for_first_report, retry_identity_until_ready};
+use collector::public_ip::public_ip_refresh_loop;
 use collector::{collector_command_channel, collector_loop};
 use export::export_supervisor;
 use message::inbound::{ControlDispatcher, ControlDispatcherParts, inbound_command_loop};
 use message::outbound::{OutboundSequence, outbound_channel};
 use message::telemetry_update_channel;
-use public_ip::public_ip_refresh_loop;
 use remote::probe::RemoteProbeManager;
 use remote::task::RemoteTaskManager;
 use reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
@@ -33,7 +32,7 @@ pub(crate) use message::inbound::{
 pub(crate) use message::outbound;
 pub(crate) use options::{RemoteMetricPermission, ServiceOptions};
 pub(crate) use remote::probe;
-pub(crate) use remote::probe::{RemoteProbeRunRequest, display_task_id as display_probe_task_id};
+pub(crate) use remote::probe::{RemoteProbeApply, RemoteProbeExecutionRequest, display_probe_id};
 pub(crate) use remote::shell;
 pub(crate) use remote::shell::RemoteShellOpenRequest;
 pub(crate) use remote::task;
@@ -131,7 +130,8 @@ pub(crate) async fn run(
     tracing::info!("agent service bootstrap completed");
 
     let latest_telemetry = state.latest_telemetry;
-    // 后续采集循环和公网 IP 刷新只提交 update；reporter 持有 latest 缓存并组装业务 frame。
+    // 后续本机指标采集和公网 IP 身份刷新只提交 update；
+    // reporter 持有 latest 缓存并组装业务 frame。
     let collector_task = tokio::spawn(collector_loop(
         collector,
         telemetry_tx.clone(),
@@ -139,7 +139,7 @@ pub(crate) async fn run(
         collector_command_rx,
         shutdown_rx.clone(),
     ));
-    let public_ip_task = tokio::spawn(public_ip_refresh_loop(
+    let public_ip_refresh_task = tokio::spawn(public_ip_refresh_loop(
         LocalCollector::new(),
         telemetry_tx,
         config_manager.subscribe(),
@@ -164,9 +164,9 @@ pub(crate) async fn run(
             tracing::warn!("collector loop stopped");
             Ok(())
         }
-        result = public_ip_task => {
+        result = public_ip_refresh_task => {
             result.map_err(|err| anyhow::anyhow!("public IP refresh task failed: {err}"))?;
-            tracing::warn!("Public IP refresh loop stopped");
+            tracing::warn!("public IP refresh loop stopped");
             Ok(())
         }
         result = reporter_task => {
@@ -212,9 +212,9 @@ mod tests {
         SocketAccuracy, SocketInfo, SocketSource, SystemInfo,
     };
     use smalux_protocol::{
-        ClientPayload, MetricCollectionRequest, RemoteProbeRequest, RemoteProbeType,
-        RemoteShellOpenRequest, RemoteTaskRequest, ServerFrame, SnapshotRequest,
-        decode_client_frame, encode_server_frame, wire,
+        ClientPayload, MetricCollectionRequest, RemoteProbeType, RemoteShellOpenRequest,
+        RemoteTaskRequest, ServerFrame, SnapshotRequest, decode_client_frame, encode_server_frame,
+        wire,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -591,7 +591,7 @@ mod tests {
         /// 入站命令接收端。
         command_rx: InboundCommandReceiver,
         /// 保持测试出站队列接收端存活，避免 rejected 结果投递失败。
-        _outbound_rx: mpsc::Receiver<OutboundEvent>,
+        _outbound_rx: super::outbound::OutboundReceiver,
         /// reporter 控制命令接收端。
         reporter_command_rx: super::reporter::ReporterCommandReceiver,
     }
@@ -605,7 +605,7 @@ mod tests {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("inbound command channel closed"))?;
-            self.dispatcher.dispatch(command)
+            self.dispatcher.dispatch(command).await
         }
 
         /// 解析一条预期被 handler 丢弃的消息。
@@ -983,10 +983,15 @@ mod tests {
                     sequence: 1,
                     created_at: 100,
                     result: smalux_protocol::RemoteProbeResult {
-                        task_id: serde_json::Value::from(123),
+                        run_id: "probe-run-1".to_string(),
+                        source: smalux_protocol::RemoteProbeResultSource::Once,
+                        point_id: Some(smalux_protocol::RemoteProbeId::from("point-123")),
+                        request_id: Some(smalux_protocol::RemoteProbeId::from(123)),
+                        job_id: None,
                         probe_type: smalux_protocol::RemoteProbeType::Tcp,
                         target: "example.com:443".to_string(),
-                        value: 13,
+                        status: smalux_protocol::RemoteProbeResultStatus::Success,
+                        latency_ms: Some(13),
                         started_at: 99,
                         finished_at: 100,
                         duration_ms: 13,
@@ -1426,6 +1431,69 @@ mod tests {
         assert!(error.error.message.contains("remote shell is disabled"));
     }
 
+    /// 验证 framed remote shell 在 ready 阶段失败时不会误回成功确认。
+    #[tokio::test]
+    async fn smalux_control_handler_fails_remote_shell_before_ack_when_stream_unreachable() {
+        let mut config = crate::config::AgentConfig::default();
+        config.remote_shell.program = Some(if cfg!(windows) {
+            "cmd.exe".to_string()
+        } else {
+            "/bin/sh".to_string()
+        });
+        let manager = crate::config::ConfigManager::new(config).unwrap();
+        let diagnostics = ServiceOptions::default().diagnostics;
+        let (collector_commands, _collector_command_rx) = collector_command_channel();
+        let (inbound_commands, mut command_rx) = inbound_command_channel();
+        let (outbound_tx, mut outbound_rx) = outbound_channel();
+        let sequence = OutboundSequence::default();
+        let (reporter_commands, _reporter_command_rx) = reporter_command_channel();
+        let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
+            config_manager: manager.clone(),
+            remote_shell: super::shell::RemoteShellManager::new(super::shell::RemoteShellOptions {
+                enabled: true,
+            }),
+            remote_task: disabled_remote_task_manager(
+                manager.clone(),
+                outbound_tx.clone(),
+                sequence.clone(),
+            ),
+            remote_probe: make_remote_probe_manager(
+                manager.clone(),
+                outbound_tx.clone(),
+                sequence.clone(),
+            ),
+            collector_commands,
+            reporter_commands,
+            outbound_tx,
+            sequence,
+            diagnostics,
+        });
+        let handler = SmaluxControlHandler::new(manager, inbound_commands);
+        let message = encode_server_frame(&ServerFrame::remote_shell_open(
+            92,
+            100,
+            RemoteShellOpenRequest {
+                session_id: "shell-framed-fail".to_string(),
+                stream_url: "ws://127.0.0.1:1/shell".to_string(),
+                cols: Some(120),
+                rows: Some(30),
+            },
+        ))
+        .unwrap();
+
+        handler.handle_message(&message).await.unwrap();
+        let command = command_rx.recv().await.unwrap();
+        let error = dispatcher.dispatch(command).await.unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        let event = outbound_rx.recv().await.unwrap();
+        let OutboundEvent::ControlError(error) = event else {
+            panic!("expected control error");
+        };
+        assert_eq!(error.error.sequence, Some(92));
+        assert_eq!(error.error.code, "remote_shell_open_failed");
+    }
+
     /// 验证远程任务默认关闭时不会执行，只回传 rejected 结果。
     #[tokio::test]
     async fn smalux_control_handler_rejects_remote_task_when_disabled() {
@@ -1464,13 +1532,22 @@ mod tests {
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
 
-        let message = encode_server_frame(&ServerFrame::remote_probe_run(
+        let message = encode_server_frame(&ServerFrame::remote_probe_apply(
             92,
             100,
-            RemoteProbeRequest {
-                task_id: serde_json::Value::from(123),
-                probe_type: RemoteProbeType::Tcp,
-                target: "127.0.0.1:1".to_string(),
+            smalux_protocol::RemoteProbeApplyRequest {
+                operation: smalux_protocol::RemoteProbeOperation::Once,
+                generation: None,
+                runs: vec![smalux_protocol::RemoteProbeOnceRequest {
+                    request_id: smalux_protocol::RemoteProbeId::from(123),
+                    point_id: Some(smalux_protocol::RemoteProbeId::from("point-123")),
+                    probe_type: RemoteProbeType::Tcp,
+                    target: "127.0.0.1:1".to_string(),
+                    timeout: None,
+                }],
+                jobs: Vec::new(),
+                upsert_jobs: Vec::new(),
+                remove_job_ids: Vec::new(),
             },
         ))
         .unwrap();
@@ -1482,8 +1559,19 @@ mod tests {
             panic!("expected remote probe result");
         };
 
-        assert_eq!(result.result.task_id, serde_json::Value::from(123));
-        assert_eq!(result.result.value, -1);
+        assert_eq!(
+            result.result.point_id,
+            Some(smalux_protocol::RemoteProbeId::from("point-123"))
+        );
+        assert_eq!(
+            result.result.request_id,
+            Some(smalux_protocol::RemoteProbeId::from(123))
+        );
+        assert_eq!(
+            result.result.status,
+            smalux_protocol::RemoteProbeResultStatus::Rejected
+        );
+        assert_eq!(result.result.latency_ms, None);
         assert!(result.result.error.as_deref().unwrap().contains("disabled"));
     }
 

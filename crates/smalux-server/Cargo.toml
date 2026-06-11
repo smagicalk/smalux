@@ -42,6 +42,8 @@ thiserror = { version = "2.0.18", features = ["default"] }
 async-trait = { version = "0.1.89" }
 # Future/Stream/Sink 工具，WebSocket split、发送队列和异步组合会用到。
 futures-util = { version = "0.3.32", features = ["sink", "io"] }
+# URL query 编码工具，用于 SQLite 连接地址追加数据库参数。
+form_urlencoded = { version = "1.2.2" }
 # 二进制 buffer 类型，wire frame、WebSocket binary 和 HTTP body 会用到。
 bytes = { version = "1.11.1" }
 # HTTP 标准类型，便于在 axum、tower 和自定义中间件之间共享类型。
@@ -54,6 +56,8 @@ validator = { version = "0.20.0", features = ["derive"] }
 uuid = { version = "1.23.2", features = ["v4", "serde"] }
 # 时间处理与序列化，用于收包时间、过期时间、数据库字段和格式化。
 time = { version = "0.3.47", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
+# URL 构造和编码，用于安全生成 SeaORM/SQLx 数据库连接地址。
+url = { version = "2.5.8" }
 # 敏感值包装，避免 token、secret、PSK 被 Debug 或日志误打印。
 secrecy = { version = "0.10.3", features = ["serde"] }
 # 项目通用核心库，复用日志、公共工具和跨 crate 类型。

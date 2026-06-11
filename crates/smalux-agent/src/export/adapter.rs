@@ -160,7 +160,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         )?;
         tracing::debug!(
             sequence = result.sequence,
-            task_id = %crate::service::display_probe_task_id(&result.result.task_id),
+            probe_id = %result.result.display_id(),
             probe_type = result.result.probe_type.as_str(),
             target = %result.result.target,
             body_bytes = json.len(),

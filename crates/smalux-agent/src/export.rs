@@ -229,10 +229,15 @@ mod tests {
             sequence: 12,
             created_at: 100,
             result: smalux_protocol::RemoteProbeResult {
-                task_id: serde_json::Value::from(7),
+                run_id: "probe-run-1".to_string(),
+                source: smalux_protocol::RemoteProbeResultSource::Once,
+                point_id: Some(smalux_protocol::RemoteProbeId::from("point-7")),
+                request_id: Some(smalux_protocol::RemoteProbeId::from(7)),
+                job_id: None,
                 probe_type: smalux_protocol::RemoteProbeType::Tcp,
                 target: "example.com:443".to_string(),
-                value: 13,
+                status: smalux_protocol::RemoteProbeResultStatus::Success,
+                latency_ms: Some(13),
                 started_at: 99,
                 finished_at: 100,
                 duration_ms: 13,
@@ -250,8 +255,20 @@ mod tests {
         assert_eq!(*sequence, 12);
         match decoded.payload {
             ClientPayload::RemoteProbeResult { result } => {
-                assert_eq!(result.task_id, serde_json::Value::from(7));
-                assert_eq!(result.value, 13);
+                assert_eq!(result.run_id, "probe-run-1");
+                assert_eq!(
+                    result.point_id,
+                    Some(smalux_protocol::RemoteProbeId::from("point-7"))
+                );
+                assert_eq!(
+                    result.request_id,
+                    Some(smalux_protocol::RemoteProbeId::from(7))
+                );
+                assert_eq!(
+                    result.status,
+                    smalux_protocol::RemoteProbeResultStatus::Success
+                );
+                assert_eq!(result.latency_ms, Some(13));
             }
             _ => panic!("expected remote probe result payload"),
         }
