@@ -379,9 +379,10 @@ dashboard realtime queue capacity
 2. 使用 `clap` derive，给常用参数加长参数和短参数。
 3. 在 `ServerArgs::into_config()` 中只做 CLI 到稳定配置的转换。
 4. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`FrontendConfig`、`LogConfig`。
+   - `DatabaseConfig` 用 enum 变体承载不同 driver 的稳定配置，而不是平铺 struct。
 5. 在 `config/defaults.rs` 集中默认值。
-6. 在配置转换时根据 driver 补齐默认数据库目标、host 和端口。
-7. 在 `config/validation.rs` 实现配置校验，例如 SQLite 不允许网络字段、PostgreSQL/MySQL 必须有 user、`frontend.enabled=true` 且没有内置前端时 `frontend.dir` 非空、日志滚动参数大于 0。
+6. 在配置转换时根据 driver 补齐默认数据库目标、host 和端口，并直接收束成 `DatabaseConfig::Sqlite/Postgres/Mysql`。
+7. 在 `config/validation.rs` 实现配置校验，例如 PostgreSQL/MySQL 必须有 user、端口必须大于 0、`frontend.enabled=true` 且没有内置前端时 `frontend.dir` 非空、日志滚动参数大于 0。
 8. `main.rs` 只调用 bootstrap，暂不直接解析 CLI。
 
 测试：
@@ -1391,7 +1392,7 @@ src/http/rest.rs
 3. CLI 首批参数只实现启动必需项：
    - `--bind-addr`, `-b`
    - `--bind-port`, `-p`
-   - `--database-driver`, `-d`
+   - `--database-driver`
    - `--database-name`
    - `--database-host`
    - `--database-port`
@@ -1406,6 +1407,7 @@ src/http/rest.rs
    - `--log-max-size-mb`
 4. 在 `ServerArgs::into_config()` 中负责从 `ServerArgs` 转成稳定配置。
 5. 在 `config/model.rs` 定义 `ServerConfig`、`HttpConfig`、`DatabaseConfig`、`FrontendConfig`、`LogConfig`。
+   - `DatabaseConfig` 使用 enum 变体：`Sqlite`、`Postgres`、`Mysql`。
 6. 在 `config/validation.rs` 实现 `validate_server_config()`。
 7. 在 `bootstrap.rs` 实现 `run()`：
    - 解析 CLI。
@@ -2782,11 +2784,22 @@ ServerConfig
 HttpConfig
   bind_addr
 
-DatabaseConfig
-  driver
+DatabaseConfig::Sqlite
   name
+  params
+
+DatabaseConfig::Postgres
   host
   port
+  name
+  user
+  password
+  params
+
+DatabaseConfig::Mysql
+  host
+  port
+  name
   user
   password
   params
@@ -2824,7 +2837,7 @@ src/config/model.rs
 
 1. CLI 转换阶段校验 bind 地址可解析为 `IpAddr`，bind 端口可解析为 `u16`。
 2. 校验 database name 非空。
-3. 校验 SQLite 不允许传 host、port、user、password。
+3. `ServerArgs::into_config()` 负责按 driver 生成 `DatabaseConfig::Sqlite/Postgres/Mysql`。
 4. 校验 PostgreSQL/MySQL 必须有 host 和 user，port 缺失时由配置层补默认值。
 5. 校验 `frontend.enabled=true` 且未编译 `frontend-embed` 时，`frontend.dir` 非空。
 6. 校验 `log.retention_files > 0`。

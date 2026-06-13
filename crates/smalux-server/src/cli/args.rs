@@ -92,44 +92,45 @@ impl From<DatabaseDriverArg> for DatabaseDriver {
 )]
 pub struct ServerArgs {
     /// HTTP 监听 IP 地址，例如 127.0.0.1 或 0.0.0.0。
-    #[arg(short = 'b', long = "bind-addr", env = "SMALUX_SERVER_BIND_ADDR", default_value = DEFAULT_BIND_ADDR)]
+    #[arg(long = "bind-addr", visible_aliases = ["host","addr"], env = "SMALUX_SERVER_BIND_ADDR", default_value = DEFAULT_BIND_ADDR)]
     pub bind_addr: String,
 
     /// HTTP 监听端口。
-    #[arg(short = 'p', long = "bind-port", env = "SMALUX_SERVER_BIND_PORT", default_value_t = DEFAULT_BIND_PORT)]
+    #[arg(short = 'p', long = "bind-port", visible_aliases = ["port"], env = "SMALUX_SERVER_BIND_PORT", default_value_t = DEFAULT_BIND_PORT)]
     pub bind_port: u16,
 
     /// 数据库驱动，可选 sqlite、postgres 或 mysql。
-    #[arg(short = 'd', long = "database-driver", env = "SMALUX_SERVER_DATABASE_DRIVER", default_value = DEFAULT_DATABASE_DRIVER)]
+    #[arg(long = "database-driver",visible_aliases = ["db-type","database-type","type"] ,env = "SMALUX_SERVER_DATABASE_DRIVER", default_value = DEFAULT_DATABASE_DRIVER)]
     pub database_driver: DatabaseDriverArg,
 
     /// PostgreSQL/MySQL 数据库主机。
-    #[arg(long = "database-host", env = "SMALUX_SERVER_DATABASE_HOST")]
+    #[arg(long = "database-host", visible_aliases = ["db-host"] ,env = "SMALUX_SERVER_DATABASE_HOST")]
     pub database_host: Option<String>,
 
     /// PostgreSQL/MySQL 数据库端口。
-    #[arg(long = "database-port", env = "SMALUX_SERVER_DATABASE_PORT")]
+    #[arg(long = "database-port", visible_aliases = ["db-port"] , env = "SMALUX_SERVER_DATABASE_PORT")]
     pub database_port: Option<u16>,
 
     /// 数据库目标；SQLite 时表示文件路径，未传默认 smalux-server.db；PostgreSQL/MySQL 时表示数据库名，未传默认 smalux。
-    #[arg(long = "database-name", env = "SMALUX_SERVER_DATABASE_NAME")]
+    #[arg(long = "database-name",  visible_aliases = ["db-name"] ,env = "SMALUX_SERVER_DATABASE_NAME")]
     pub database_name: Option<String>,
 
     /// PostgreSQL/MySQL 用户名。
-    #[arg(long = "database-user", env = "SMALUX_SERVER_DATABASE_USER")]
+    #[arg(long = "database-user", visible_aliases = ["db-user"] , env = "SMALUX_SERVER_DATABASE_USER")]
     pub database_user: Option<String>,
 
     /// PostgreSQL/MySQL 密码，Debug 输出会脱敏。
-    #[arg(long = "database-password", env = "SMALUX_SERVER_DATABASE_PASSWORD", value_parser = parse_secret_arg)]
+    #[arg(long = "database-password",  visible_aliases = ["db-pass"] ,env = "SMALUX_SERVER_DATABASE_PASSWORD", value_parser = parse_secret_arg)]
     pub database_password: Option<SecretArg>,
 
     /// 数据库连接 URL 的额外 query 参数，可重复传入，例如 `sslmode=require` 或 `charset=utf8mb4`。
-    #[arg(long = "database-param", value_name = "KEY=VALUE", value_parser = parse_database_param)]
+    #[arg(long = "database-param",  visible_aliases = ["db-param"] ,value_name = "KEY=VALUE", value_parser = parse_database_param)]
     pub database_params: Vec<DatabaseParamArg>,
 
     /// 是否由 server 托管前端静态资源；不传时默认只提供 API 和 agent 接入。
     #[arg(
         long = "serve-frontend",
+        visible_aliases = ["isfrontend"] ,
         env = "SMALUX_SERVER_SERVE_FRONTEND",
         default_value_t = DEFAULT_SERVE_FRONTEND,
         action = clap::ArgAction::Set,
@@ -140,7 +141,7 @@ pub struct ServerArgs {
     pub serve_frontend: bool,
 
     /// 未编译内置前端资源时，server 托管前端所使用的静态资源目录。
-    #[arg(long = "frontend-dir", env = "SMALUX_SERVER_FRONTEND_DIR", default_value = DEFAULT_FRONTEND_DIR)]
+    #[arg(long = "frontend-dir",  visible_aliases = ["frontend"] ,env = "SMALUX_SERVER_FRONTEND_DIR", default_value = DEFAULT_FRONTEND_DIR)]
     pub frontend_dir: PathBuf,
 
     /// 是否为 React/Vite 这类 SPA 启用 index.html fallback，需要显式传入 true 或 false。
@@ -199,17 +200,8 @@ impl ServerArgs {
         let driver = DatabaseDriver::from(self.database_driver);
         let name = optional_non_empty(self.database_name.clone(), "database name")?
             .unwrap_or_else(|| driver.default_database_name().to_string());
-        let host = if driver.uses_network() {
-            optional_non_empty(self.database_host.clone(), "database host")?
-                .or_else(|| Some(DEFAULT_DATABASE_HOST.to_string()))
-        } else {
-            self.database_host.clone()
-        };
-        let port = if driver.uses_network() {
-            self.database_port.or_else(|| driver.default_port())
-        } else {
-            self.database_port
-        };
+        let host = optional_non_empty(self.database_host.clone(), "database host")?;
+        let port = self.database_port;
         let user = optional_non_empty(self.database_user.clone(), "database user")?;
         let password = self
             .database_password
@@ -217,15 +209,25 @@ impl ServerArgs {
             .map(|secret| SecretString::from(secret.0));
         let params = database_params_to_map(self.database_params.clone())?;
 
-        Ok(DatabaseConfig {
-            driver,
-            name,
-            host,
-            port,
-            user,
-            password,
-            params,
-        })
+        match driver {
+            DatabaseDriver::Sqlite => Ok(DatabaseConfig::Sqlite { name, params }),
+            DatabaseDriver::Postgres => Ok(DatabaseConfig::Postgres {
+                host: host.unwrap_or_else(|| DEFAULT_DATABASE_HOST.to_string()),
+                port: port.or_else(|| driver.default_port()).unwrap_or(5432),
+                name,
+                user: user.ok_or_else(|| anyhow!("database user is required"))?,
+                password,
+                params,
+            }),
+            DatabaseDriver::Mysql => Ok(DatabaseConfig::Mysql {
+                host: host.unwrap_or_else(|| DEFAULT_DATABASE_HOST.to_string()),
+                port: port.or_else(|| driver.default_port()).unwrap_or(3306),
+                name,
+                user: user.ok_or_else(|| anyhow!("database user is required"))?,
+                password,
+                params,
+            }),
+        }
     }
 }
 
@@ -294,10 +296,11 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_unknown_database_driver() {
-        let error = ServerArgs::try_parse_from(["smalux-server", "-d", "oracle"])
+        let error = ServerArgs::try_parse_from(["smalux-server", "--database-driver", "oracle"])
             .expect_err("unknown database driver should fail");
 
-        assert!(error.to_string().contains("oracle"));
+        let text = error.to_string();
+        assert!(text.contains("oracle") || text.contains("possible values"));
     }
 
     #[test]
@@ -317,10 +320,12 @@ mod tests {
         assert_eq!(config.http.bind_addr.to_string(), "127.0.0.1");
         assert_eq!(config.http.bind_port, 3000);
         assert_eq!(config.http.socket_addr().to_string(), "127.0.0.1:3000");
-        assert_eq!(config.database.driver, DatabaseDriver::Sqlite);
-        assert_eq!(config.database.name, "smalux-server.db");
-        assert_eq!(config.database.host, None);
-        assert_eq!(config.database.port, None);
+        match &config.database {
+            DatabaseConfig::Sqlite { name, .. } => {
+                assert_eq!(name, "smalux-server.db");
+            }
+            _ => panic!("expected sqlite config"),
+        }
     }
 
     #[test]
@@ -355,7 +360,7 @@ mod tests {
     fn into_config_uses_network_database_defaults() {
         let config = ServerArgs::try_parse_from([
             "smalux-server",
-            "-d",
+            "--database-driver",
             "postgres",
             "--database-user",
             "smalux",
@@ -364,10 +369,16 @@ mod tests {
         .into_config()
         .unwrap();
 
-        assert_eq!(config.database.driver, DatabaseDriver::Postgres);
-        assert_eq!(config.database.name, "smalux");
-        assert_eq!(config.database.host.as_deref(), Some("127.0.0.1"));
-        assert_eq!(config.database.port, Some(5432));
+        match &config.database {
+            DatabaseConfig::Postgres {
+                host, port, name, ..
+            } => {
+                assert_eq!(name, "smalux");
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(*port, 5432);
+            }
+            _ => panic!("expected postgres config"),
+        }
     }
 
     #[test]

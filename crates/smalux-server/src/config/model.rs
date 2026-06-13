@@ -35,22 +35,47 @@ pub struct HttpConfig {
 }
 
 /// 数据库连接配置。
+///
+/// 运行配置层直接按驱动拆成不同变体，避免 SQLite 还携带 host/user/password 这类无效字段。
 #[derive(Clone, Debug)]
-pub struct DatabaseConfig {
-    /// 数据库驱动。
-    pub driver: DatabaseDriver,
-    /// 数据库目标；SQLite 是文件路径或 `:memory:`，PostgreSQL/MySQL 是数据库名。
-    pub name: String,
-    /// PostgreSQL/MySQL 主机；SQLite 不使用。
-    pub host: Option<String>,
-    /// PostgreSQL/MySQL 端口；SQLite 不使用。
-    pub port: Option<u16>,
-    /// PostgreSQL/MySQL 用户名；SQLite 不使用。
-    pub user: Option<String>,
-    /// PostgreSQL/MySQL 密码；Debug 输出会由 secrecy 脱敏。
-    pub password: Option<SecretString>,
-    /// 数据库 URL query 参数，使用 BTreeMap 保证输出顺序稳定。
-    pub params: BTreeMap<String, String>,
+pub enum DatabaseConfig {
+    /// SQLite 文件数据库或内存数据库。
+    Sqlite {
+        /// 数据库目标；文件模式是路径，内存模式固定为 `:memory:`。
+        name: String,
+        /// URL query 参数，使用 BTreeMap 保证输出顺序稳定。
+        params: BTreeMap<String, String>,
+    },
+    /// PostgreSQL 数据库连接配置。
+    Postgres {
+        /// 数据库主机。
+        host: String,
+        /// 数据库端口。
+        port: u16,
+        /// 数据库名。
+        name: String,
+        /// 用户名。
+        user: String,
+        /// 密码；Debug 输出会由 secrecy 脱敏。
+        password: Option<SecretString>,
+        /// URL query 参数，使用 BTreeMap 保证输出顺序稳定。
+        params: BTreeMap<String, String>,
+    },
+    /// MySQL 数据库连接配置。
+    Mysql {
+        /// 数据库主机。
+        host: String,
+        /// 数据库端口。
+        port: u16,
+        /// 数据库名。
+        name: String,
+        /// 用户名。
+        user: String,
+        /// 密码；Debug 输出会由 secrecy 脱敏。
+        password: Option<SecretString>,
+        /// URL query 参数，使用 BTreeMap 保证输出顺序稳定。
+        params: BTreeMap<String, String>,
+    },
 }
 
 /// server 支持的数据库驱动。
@@ -112,11 +137,6 @@ impl DatabaseDriver {
             Self::Postgres | Self::Mysql => crate::config::defaults::DEFAULT_SERVER_DATABASE_NAME,
         }
     }
-
-    /// 标记该驱动是否需要网络连接字段。
-    pub fn uses_network(self) -> bool {
-        !matches!(self, Self::Sqlite)
-    }
 }
 
 impl HttpConfig {
@@ -132,73 +152,129 @@ impl DatabaseConfig {
     /// SQLite 的 `:memory:` 是 SQLx 特殊形式，不能用通用 URL builder 表示；
     /// PostgreSQL/MySQL 使用 `url` crate 处理用户名、密码和 query 编码。
     pub fn connection_url(&self) -> anyhow::Result<String> {
-        match self.driver {
-            DatabaseDriver::Sqlite => self.sqlite_connection_url(),
-            DatabaseDriver::Postgres | DatabaseDriver::Mysql => self.network_connection_url(false),
+        match self {
+            Self::Sqlite { name, params } => sqlite_connection_url(name, params),
+            Self::Postgres {
+                host,
+                port,
+                name,
+                user,
+                password,
+                params,
+            } => network_connection_url(
+                DatabaseDriver::Postgres,
+                host,
+                *port,
+                name,
+                user,
+                password.as_ref(),
+                params,
+                false,
+            ),
+            Self::Mysql {
+                host,
+                port,
+                name,
+                user,
+                password,
+                params,
+            } => network_connection_url(
+                DatabaseDriver::Mysql,
+                host,
+                *port,
+                name,
+                user,
+                password.as_ref(),
+                params,
+                false,
+            ),
         }
     }
 
     /// 生成脱敏后的数据库连接 URL，用于日志和调试输出。
     pub fn redacted_connection_url(&self) -> anyhow::Result<String> {
-        match self.driver {
-            DatabaseDriver::Sqlite => self.sqlite_connection_url(),
-            DatabaseDriver::Postgres | DatabaseDriver::Mysql => self.network_connection_url(true),
+        match self {
+            Self::Sqlite { name, params } => sqlite_connection_url(name, params),
+            Self::Postgres {
+                host,
+                port,
+                name,
+                user,
+                password,
+                params,
+            } => network_connection_url(
+                DatabaseDriver::Postgres,
+                host,
+                *port,
+                name,
+                user,
+                password.as_ref(),
+                params,
+                true,
+            ),
+            Self::Mysql {
+                host,
+                port,
+                name,
+                user,
+                password,
+                params,
+            } => network_connection_url(
+                DatabaseDriver::Mysql,
+                host,
+                *port,
+                name,
+                user,
+                password.as_ref(),
+                params,
+                true,
+            ),
         }
     }
+}
 
-    /// 构造 SQLite 连接 URL。
-    fn sqlite_connection_url(&self) -> anyhow::Result<String> {
-        let mut url = if self.name == ":memory:" {
-            "sqlite::memory:".to_string()
+/// 构造 SQLite 连接 URL。
+fn sqlite_connection_url(name: &str, params: &BTreeMap<String, String>) -> anyhow::Result<String> {
+    let mut url = if name == ":memory:" {
+        "sqlite::memory:".to_string()
+    } else {
+        format!("sqlite://{name}")
+    };
+
+    append_query_params(&mut url, params);
+    Ok(url)
+}
+
+/// 构造 PostgreSQL/MySQL 连接 URL。
+fn network_connection_url(
+    driver: DatabaseDriver,
+    host: &str,
+    port: u16,
+    name: &str,
+    user: &str,
+    password: Option<&SecretString>,
+    params: &BTreeMap<String, String>,
+    redact_password: bool,
+) -> anyhow::Result<String> {
+    // 先构造最小合法 URL，再通过 url crate 设置用户、密码和 query，避免手写编码。
+    let mut url = Url::parse(&format!("{}://{}:{}/{}", driver.scheme(), host, port, name))
+        .with_context(|| format!("invalid {} database URL parts", driver.scheme()))?;
+
+    url.set_username(user)
+        .map_err(|_| anyhow!("database username cannot be applied to URL"))?;
+
+    if let Some(password) = password {
+        let value = if redact_password {
+            "***"
         } else {
-            format!("sqlite://{}", self.name)
+            password.expose_secret()
         };
-
-        append_query_params(&mut url, &self.params);
-        Ok(url)
+        url.set_password(Some(value))
+            .map_err(|_| anyhow!("database password cannot be applied to URL"))?;
     }
 
-    /// 构造 PostgreSQL/MySQL 连接 URL。
-    fn network_connection_url(&self, redact_password: bool) -> anyhow::Result<String> {
-        let host = self
-            .host
-            .as_deref()
-            .ok_or_else(|| anyhow!("database host is required"))?;
-        let user = self
-            .user
-            .as_deref()
-            .ok_or_else(|| anyhow!("database user is required"))?;
-        let port = self
-            .port
-            .or_else(|| self.driver.default_port())
-            .ok_or_else(|| anyhow!("database port is required"))?;
-
-        // 先构造最小合法 URL，再通过 url crate 设置用户、密码和 query，避免手写编码。
-        let mut url = Url::parse(&format!(
-            "{}://{}:{}/{}",
-            self.driver.scheme(),
-            host,
-            port,
-            self.name
-        ))
-        .with_context(|| format!("invalid {} database URL parts", self.driver.scheme()))?;
-
-        url.set_username(user)
-            .map_err(|_| anyhow!("database username cannot be applied to URL"))?;
-
-        if let Some(password) = &self.password {
-            let value = if redact_password {
-                "***"
-            } else {
-                password.expose_secret()
-            };
-            url.set_password(Some(value))
-                .map_err(|_| anyhow!("database password cannot be applied to URL"))?;
-        }
-
-        append_url_query_params(&mut url, &self.params);
-        Ok(url.to_string())
-    }
+    append_url_query_params(&mut url, params);
+    Ok(url.to_string())
 }
 
 /// 为 `sqlite://...` 这种手工 URL 追加已编码 query 参数。
@@ -246,13 +322,8 @@ mod tests {
 
     #[test]
     fn sqlite_connection_url_uses_file_name() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Sqlite,
+        let config = DatabaseConfig::Sqlite {
             name: "smalux-server.db".to_string(),
-            host: None,
-            port: None,
-            user: None,
-            password: None,
             params: BTreeMap::new(),
         };
 
@@ -264,13 +335,8 @@ mod tests {
 
     #[test]
     fn sqlite_connection_url_keeps_memory_database() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Sqlite,
+        let config = DatabaseConfig::Sqlite {
             name: ":memory:".to_string(),
-            host: None,
-            port: None,
-            user: None,
-            password: None,
             params: BTreeMap::new(),
         };
 
@@ -279,13 +345,8 @@ mod tests {
 
     #[test]
     fn sqlite_connection_url_adds_query_params() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Sqlite,
+        let config = DatabaseConfig::Sqlite {
             name: "smalux-server.db".to_string(),
-            host: None,
-            port: None,
-            user: None,
-            password: None,
             params: params(&[("cache", "shared"), ("mode", "rwc")]),
         };
 
@@ -297,12 +358,11 @@ mod tests {
 
     #[test]
     fn postgres_connection_url_uses_default_port_and_encodes_secret_parts() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Postgres,
+        let config = DatabaseConfig::Postgres {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
             name: "smalux".to_string(),
-            host: Some("127.0.0.1".to_string()),
-            port: None,
-            user: Some("user@example".to_string()),
+            user: "user@example".to_string(),
             password: Some("p@ ss".into()),
             params: params(&[("options", "--search_path=public"), ("sslmode", "require")]),
         };
@@ -315,12 +375,11 @@ mod tests {
 
     #[test]
     fn mysql_connection_url_uses_default_port() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Mysql,
+        let config = DatabaseConfig::Mysql {
+            host: "localhost".to_string(),
+            port: 3306,
             name: "smalux".to_string(),
-            host: Some("localhost".to_string()),
-            port: None,
-            user: Some("root".to_string()),
+            user: "root".to_string(),
             password: None,
             params: params(&[("charset", "utf8mb4")]),
         };
@@ -333,12 +392,11 @@ mod tests {
 
     #[test]
     fn redacted_connection_url_hides_password() {
-        let config = DatabaseConfig {
-            driver: DatabaseDriver::Postgres,
+        let config = DatabaseConfig::Postgres {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
             name: "smalux".to_string(),
-            host: Some("127.0.0.1".to_string()),
-            port: Some(5432),
-            user: Some("user".to_string()),
+            user: "user".to_string(),
             password: Some("password".into()),
             params: BTreeMap::new(),
         };

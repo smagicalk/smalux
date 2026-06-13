@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::model::{DatabaseDriver, ServerConfig};
+use crate::config::model::{DatabaseConfig, ServerConfig};
 
 /// 校验 server 稳定配置。
 ///
@@ -29,45 +29,49 @@ fn validate_http_config(config: &ServerConfig) -> Result<()> {
 fn validate_database_config(config: &ServerConfig) -> Result<()> {
     let database = &config.database;
 
-    if database.name.trim().is_empty() {
-        bail!("database name cannot be empty");
-    }
-
-    for key in database.params.keys() {
-        if key.trim().is_empty() {
-            bail!("database param key cannot be empty");
-        }
-    }
-
-    match database.driver {
-        DatabaseDriver::Sqlite => {
-            if database.host.is_some() {
-                bail!("database host is not used by sqlite");
+    match database {
+        DatabaseConfig::Sqlite { name, params } => {
+            if name.trim().is_empty() {
+                bail!("database name cannot be empty");
             }
-            if database.port.is_some() {
-                bail!("database port is not used by sqlite");
-            }
-            if database.user.is_some() {
-                bail!("database user is not used by sqlite");
-            }
-            if database.password.is_some() {
-                bail!("database password is not used by sqlite");
+            for key in params.keys() {
+                if key.trim().is_empty() {
+                    bail!("database param key cannot be empty");
+                }
             }
         }
-        DatabaseDriver::Postgres | DatabaseDriver::Mysql => {
-            if database
-                .host
-                .as_ref()
-                .is_none_or(|host| host.trim().is_empty())
-            {
+        DatabaseConfig::Postgres {
+            host,
+            port,
+            name,
+            user,
+            params,
+            ..
+        }
+        | DatabaseConfig::Mysql {
+            host,
+            port,
+            name,
+            user,
+            params,
+            ..
+        } => {
+            if name.trim().is_empty() {
+                bail!("database name cannot be empty");
+            }
+            if host.trim().is_empty() {
                 bail!("database host is required");
             }
-            if database
-                .user
-                .as_ref()
-                .is_none_or(|user| user.trim().is_empty())
-            {
+            if user.trim().is_empty() {
                 bail!("database user is required");
+            }
+            if *port == 0 {
+                bail!("database port must be greater than 0");
+            }
+            for key in params.keys() {
+                if key.trim().is_empty() {
+                    bail!("database param key cannot be empty");
+                }
             }
         }
     }
@@ -105,8 +109,6 @@ fn validate_log_config(config: &ServerConfig) -> Result<()> {
 mod tests {
     use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 
-    use secrecy::SecretString;
-
     use super::*;
     use crate::config::model::{
         DatabaseConfig, FrontendConfig, HttpConfig, LogConfig, ServerConfig,
@@ -133,25 +135,19 @@ mod tests {
     }
 
     fn sqlite_database() -> DatabaseConfig {
-        DatabaseConfig {
-            driver: DatabaseDriver::Sqlite,
+        DatabaseConfig::Sqlite {
             name: "smalux-server.db".to_string(),
-            host: None,
-            port: None,
-            user: None,
-            password: None,
             params: BTreeMap::new(),
         }
     }
 
     fn postgres_database() -> DatabaseConfig {
-        DatabaseConfig {
-            driver: DatabaseDriver::Postgres,
+        DatabaseConfig::Postgres {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
             name: "smalux".to_string(),
-            host: Some("127.0.0.1".to_string()),
-            port: Some(5432),
-            user: Some("smalux".to_string()),
-            password: Some(SecretString::from("password")),
+            user: "smalux".to_string(),
+            password: Some(secrecy::SecretString::from("password")),
             params: BTreeMap::new(),
         }
     }
@@ -164,25 +160,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_sqlite_network_fields() {
-        let mut database = sqlite_database();
-        database.host = Some("127.0.0.1".to_string());
-        let config = base_config(database);
-
-        let error = validate_server_config(&config).expect_err("sqlite host should fail");
-
-        assert!(error.to_string().contains("not used by sqlite"));
-    }
-
-    #[test]
     fn validate_rejects_network_database_without_user() {
         let mut database = postgres_database();
-        database.user = None;
+        if let DatabaseConfig::Postgres { user, .. } = &mut database {
+            *user = "".to_string();
+        }
         let config = base_config(database);
 
         let error = validate_server_config(&config).expect_err("missing user should fail");
 
         assert!(error.to_string().contains("user is required"));
+    }
+
+    #[test]
+    fn validate_rejects_network_database_with_zero_port() {
+        let mut database = postgres_database();
+        if let DatabaseConfig::Postgres { port, .. } = &mut database {
+            *port = 0;
+        }
+        let config = base_config(database);
+
+        let error = validate_server_config(&config).expect_err("zero port should fail");
+
+        assert!(error.to_string().contains("database port"));
     }
 
     #[test]

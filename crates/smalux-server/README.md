@@ -101,13 +101,13 @@ server CLI 只负责 server 进程启动时必须确定的静态运行环境，�
 | --- | --- | --- | --- | --- |
 | `--bind-addr <ADDR>` | `-b` | `SMALUX_SERVER_BIND_ADDR` | `127.0.0.1` | HTTP 监听 IP 地址 |
 | `--bind-port <PORT>` | `-p` | `SMALUX_SERVER_BIND_PORT` | `3000` | HTTP 监听端口 |
-| `--database-driver <DRIVER>` | `-d` | `SMALUX_SERVER_DATABASE_DRIVER` | `sqlite` | 数据库类型，支持 `sqlite`、`postgres`、`mysql` |
-| `--database-name <NAME>` | 无 | `SMALUX_SERVER_DATABASE_NAME` | 按 driver 决定 | 数据库目标；SQLite 默认 `smalux-server.db`，PostgreSQL/MySQL 默认 `smalux` |
-| `--database-host <HOST>` | 无 | `SMALUX_SERVER_DATABASE_HOST` | PostgreSQL/MySQL 默认 `127.0.0.1` | PostgreSQL/MySQL 主机；SQLite 不允许传入 |
-| `--database-port <PORT>` | 无 | `SMALUX_SERVER_DATABASE_PORT` | PostgreSQL 默认 `5432`，MySQL 默认 `3306` | PostgreSQL/MySQL 端口；SQLite 不允许传入 |
-| `--database-user <USER>` | 无 | `SMALUX_SERVER_DATABASE_USER` | 无 | PostgreSQL/MySQL 用户名 |
-| `--database-password <PASSWORD>` | 无 | `SMALUX_SERVER_DATABASE_PASSWORD` | 无 | PostgreSQL/MySQL 密码，Debug 输出会脱敏 |
-| `--database-param <KEY=VALUE>` | 无 | 不支持 | 无 | 额外数据库连接 query 参数，可重复传入，例如 `mode=rwc`、`sslmode=require`、`charset=utf8mb4`、`options=--search_path=public` |
+| `--database-driver <DRIVER>` | 无 | `SMALUX_SERVER_DATABASE_DRIVER` | `sqlite` | 数据库类型，支持 `sqlite`、`postgres`、`mysql`；当前可见别名有 `--db-type`、`--database-type`、`--type` |
+| `--database-name <NAME>` | 无 | `SMALUX_SERVER_DATABASE_NAME` | 按 driver 决定 | 数据库目标；SQLite 默认 `smalux-server.db`，PostgreSQL/MySQL 默认 `smalux`；可见别名 `--db-name` |
+| `--database-host <HOST>` | 无 | `SMALUX_SERVER_DATABASE_HOST` | PostgreSQL/MySQL 默认 `127.0.0.1` | PostgreSQL/MySQL 主机；CLI 层可传，最终只会在 `Postgres/Mysql` 配置变体中保留；可见别名 `--db-host` |
+| `--database-port <PORT>` | 无 | `SMALUX_SERVER_DATABASE_PORT` | PostgreSQL 默认 `5432`，MySQL 默认 `3306` | PostgreSQL/MySQL 端口；CLI 层可传，最终只会在 `Postgres/Mysql` 配置变体中保留；可见别名 `--db-port` |
+| `--database-user <USER>` | 无 | `SMALUX_SERVER_DATABASE_USER` | 无 | PostgreSQL/MySQL 用户名；可见别名 `--db-user` |
+| `--database-password <PASSWORD>` | 无 | `SMALUX_SERVER_DATABASE_PASSWORD` | 无 | PostgreSQL/MySQL 密码，Debug 输出会脱敏；可见别名 `--db-pass` |
+| `--database-param <KEY=VALUE>` | 无 | 不支持 | 无 | 额外数据库连接 query 参数，可重复传入，例如 `mode=rwc`、`sslmode=require`、`charset=utf8mb4`、`options=--search_path=public`；可见别名 `--db-param` |
 | `--serve-frontend [true|false]` | 无 | `SMALUX_SERVER_SERVE_FRONTEND` | `false` | 是否由 server 托管前端静态资源；只传 `--serve-frontend` 等价于 `true` |
 | `--frontend-dir <PATH>` | 无 | `SMALUX_SERVER_FRONTEND_DIR` | `apps/smalux-web/dist` | 未编译内置前端资源时，server 托管的前端构建目录 |
 | `--frontend-spa-fallback <true|false>` | 无 | `SMALUX_SERVER_FRONTEND_SPA_FALLBACK` | `true` | 是否为 React/Vite SPA 启用 `index.html` fallback |
@@ -129,13 +129,13 @@ cargo run -p smalux-server -- --bind-addr 127.0.0.1 --bind-port 3000
 cargo run -p smalux-server -- --bind-addr 127.0.0.1 --bind-port 3000
 
 # 使用 SQLite，并托管 Vite/React 构建后的前端目录。
-cargo run -p smalux-server -- -b 0.0.0.0 -p 3000 -d sqlite --database-name smalux-server.db --database-param mode=rwc --serve-frontend --frontend-dir apps/smalux-web/dist
+cargo run -p smalux-server -- --bind-addr 0.0.0.0 --bind-port 3000 --database-driver sqlite --database-name smalux-server.db --database-param mode=rwc --serve-frontend --frontend-dir apps/smalux-web/dist
 
 # 使用 PostgreSQL。
-cargo run -p smalux-server -- -d postgres --database-user user --database-password password --database-param sslmode=disable --database-param options=--search_path=public
+cargo run -p smalux-server -- --database-driver postgres --database-user user --database-password password --database-param sslmode=disable --database-param options=--search_path=public
 
 # 使用 MySQL。
-cargo run -p smalux-server -- -d mysql --database-user user --database-password password --database-param charset=utf8mb4
+cargo run -p smalux-server -- --database-driver mysql --database-user user --database-password password --database-param charset=utf8mb4
 ```
 
 ## 配置转换流程
@@ -154,9 +154,9 @@ ServerArgs::parse()
 配置层规则：
 
 - `cli/args.rs` 只处理 clap 参数、环境变量和 CLI 专用类型，例如 `DatabaseDriverArg`。
-- `config/model.rs` 保存稳定运行配置，不依赖 clap，后续配置文件或数据库下发配置也可以复用。
+- `config/model.rs` 保存稳定运行配置，不依赖 clap，后续配置文件或数据库下发配置也可以复用。数据库配置当前已经收束为 enum：`Sqlite`、`Postgres`、`Mysql` 三个变体分别持有自己的字段。
 - HTTP 配置在模型中拆成 `bind_addr` 和 `bind_port`，真正绑定时通过 `HttpConfig::socket_addr()` 合成 `SocketAddr`。
-- `config/validation.rs` 处理跨字段校验，例如 SQLite 不允许传 host/port/user/password，PostgreSQL/MySQL 必须有 user。
+- `config/validation.rs` 处理跨字段校验，例如 PostgreSQL/MySQL 必须有 host/user 且端口大于 0。SQLite 的无效网络字段不会进入稳定配置层，而是在 `ServerArgs::into_config()` 收束时被直接忽略。
 - `database-param` 在 CLI 可重复传入，但配置层会转换成稳定 map；重复 key 直接报错，避免覆盖行为不清晰。
 - 数据库明文密码只参与真实连接 URL 构造；日志和 debug 摘要只使用 `redacted_connection_url()`，不会打印原始密码。
 
@@ -164,11 +164,11 @@ ServerArgs::parse()
 
 | driver | 输入示例 | 生成结果 |
 | --- | --- | --- |
-| SQLite | `-d sqlite` | `sqlite://smalux-server.db` |
-| SQLite memory | `-d sqlite --database-name :memory:` | `sqlite::memory:` |
-| SQLite + query | `-d sqlite --database-param mode=rwc` | `sqlite://smalux-server.db?mode=rwc` |
-| PostgreSQL | `-d postgres --database-user user --database-password password` | `postgres://user:***@127.0.0.1:5432/smalux`，日志脱敏；真实连接 URL 使用明文密码 |
-| MySQL | `-d mysql --database-user user --database-param charset=utf8mb4` | `mysql://user@127.0.0.1:3306/smalux?charset=utf8mb4` |
+| SQLite | `--database-driver sqlite` | `sqlite://smalux-server.db` |
+| SQLite memory | `--database-driver sqlite --database-name :memory:` | `sqlite::memory:` |
+| SQLite + query | `--database-driver sqlite --database-param mode=rwc` | `sqlite://smalux-server.db?mode=rwc` |
+| PostgreSQL | `--database-driver postgres --database-user user --database-password password` | `postgres://user:***@127.0.0.1:5432/smalux`，日志脱敏；真实连接 URL 使用明文密码 |
+| MySQL | `--database-driver mysql --database-user user --database-param charset=utf8mb4` | `mysql://user@127.0.0.1:3306/smalux?charset=utf8mb4` |
 
 暂时不要加入到 server CLI 的内容：
 
