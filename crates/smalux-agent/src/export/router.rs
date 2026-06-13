@@ -6,7 +6,7 @@
 use super::{ExportDeliveryId, ProtocolAdapter, TransportHub, TransportPlan, TransportRequest};
 use crate::config::model::ExportConfig;
 use crate::service::outbound::{
-    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
+    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteJobResultEnvelope,
     RemoteTaskResultEnvelope,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -155,33 +155,29 @@ impl ExportRouter {
         Ok(request_count)
     }
 
-    /// 编码并投递远程探测结果。
-    pub(crate) async fn send_remote_probe_result(
+    /// 编码并投递通用远程 job 结果。
+    pub(crate) async fn send_remote_job_result(
         &mut self,
         transport_hub: &mut TransportHub,
-        result: &RemoteProbeResultEnvelope,
+        result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<usize> {
-        let requests = self.adapter.encode_remote_probe_result(result)?;
+        let requests = self.adapter.encode_remote_job_result(result)?;
         let request_count = requests.len();
         tracing::trace!(
-            delivery = ExportDeliveryId::RemoteProbeResult.as_str(),
+            delivery = ExportDeliveryId::JobResult.as_str(),
             sequence = result.sequence,
             request_count,
-            "export router encoded remote probe result"
+            "export router encoded remote job result"
         );
 
         for request in requests {
             trace_transport_request(
-                ExportDeliveryId::RemoteProbeResult,
+                ExportDeliveryId::JobResult,
                 result.sequence,
                 &request,
                 self.log_options,
             );
-            transport_hub.enqueue(
-                ExportDeliveryId::RemoteProbeResult,
-                result.sequence,
-                request,
-            )?;
+            transport_hub.enqueue(ExportDeliveryId::JobResult, result.sequence, request)?;
         }
 
         Ok(request_count)

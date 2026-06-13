@@ -284,8 +284,8 @@ pub struct PingResult {
 }
 
 impl PingResult {
-    /// 从内部远程探测结果映射为 Komari ping_result WebSocket 消息。
-    pub fn from_remote_probe_result(result: &RemoteProbeResult) -> Self {
+    /// 从内部 probe job 结果映射为 Komari ping_result WebSocket 消息。
+    pub fn from_probe_job_result(result: &RemoteProbeResult) -> Self {
         Self {
             message_type: "ping_result",
             task_id: result.komari_task_id(),
@@ -587,7 +587,7 @@ mod tests {
 
     /// 验证 Komari ping_result 会保持 task_id 的原始 JSON 类型。
     #[test]
-    fn ping_result_maps_remote_probe_result() {
+    fn ping_result_maps_probe_job_result() {
         let result = RemoteProbeResult {
             run_id: "probe-run-1".to_string(),
             source: smalux_protocol::RemoteProbeResultSource::Once,
@@ -604,7 +604,7 @@ mod tests {
             error: None,
         };
 
-        let body = serde_json::to_value(PingResult::from_remote_probe_result(&result)).unwrap();
+        let body = serde_json::to_value(PingResult::from_probe_job_result(&result)).unwrap();
 
         assert_eq!(body["type"], "ping_result");
         assert_eq!(body["task_id"], 123);

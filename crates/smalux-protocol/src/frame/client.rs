@@ -1,7 +1,7 @@
 //! agent 发往 server 的 frame。
 
 use super::{
-    Ack, DeltaReport, Heartbeat, ProtocolError, RemoteProbeResult, RemoteTaskResult,
+    Ack, DeltaReport, Heartbeat, ProtocolError, RemoteJobResult, RemoteTaskResult,
     SMALUX_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -79,9 +79,9 @@ pub enum ClientPayload {
         /// 任务执行结果。
         result: RemoteTaskResult,
     },
-    /// 远程网络探测结果。
-    RemoteProbeResult {
-        /// 探测执行结果。
-        result: RemoteProbeResult,
+    /// 通用远程 job 执行结果。
+    JobResult {
+        /// job 执行结果。
+        result: RemoteJobResult,
     },
 }

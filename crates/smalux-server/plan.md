@@ -479,9 +479,10 @@ RemoteTaskResult
   started_at
   finished_at
 
-RemoteProbeResult
+RemoteJobResult
   run_id
   agent_id
+  kind
   source
   request_id
   job_id
@@ -582,10 +583,11 @@ remote_task_results
   finished_at
   updated_at
 
-remote_probe_results
+remote_job_results
   id
   run_id
   agent_id
+  kind
   source
   request_id
   job_id
@@ -765,8 +767,8 @@ error
 remote_task_result
   -> upsert remote task result。
 
-remote_probe_result
-  -> upsert remote probe result。
+job_result
+  -> 按 kind 分发；当前 kind=probe 时 upsert remote job result。
 
 unknown
   -> 记录 warning 后忽略，不让单个未知类型打断连接。
@@ -799,7 +801,7 @@ unknown
 snapshot_request
 config_patch
 remote_task_run
-remote_probe_apply
+job_apply
 remote_shell_open
 remote_shell_input
 remote_shell_resize
@@ -929,6 +931,7 @@ snapshot_requested
 - 前端收到事件后可以用 REST 拉 latest 补齐。
 - 队列满时可以丢弃旧 dashboard 事件。
 - 命令结果不能只靠 realtime 保存，必须落库后再广播。
+- 事件 JSON 统一使用 `{"event":"...","data":{...}}` envelope，具体形状对齐 `crates/smalux-server/README.md`。
 
 实现步骤：
 
@@ -1566,8 +1569,26 @@ src/storage/repository.rs
 6. 离线时按命令类型拒绝或保存 desired state。
 7. 处理 agent `ack`。
 8. 处理 agent `error`。
-9. 处理 `remote_task_result` 和 `remote_probe_result`。
+9. 处理 `remote_task_result` 和 `job_result`。
 10. 实现 `GET /api/v1/commands/{command_id}`。
+
+本阶段落地时，REST/协议 JSON 形状直接对齐 `crates/smalux-server/README.md`：
+
+- `GET /api/v1/agents`
+  - 返回 `items + total`。
+  - `items[]` 至少包含 `agent_id`、`online`、`last_seen_at`、`last_frame_sequence`、`public_ip_status`。
+- `GET /api/v1/agents/{agent_id}`
+  - 返回 `agent_id`、连接状态、`delta_base_sequence`、`latest_report`。
+  - `latest_report` 不存在时返回 `null`，未知 agent 才返回 `404`。
+- `POST /api/v1/agents/{agent_id}/commands`
+  - 请求体统一用 `command` envelope，不按命令类型拆多个 REST 路径。
+  - 返回 `command_id`、`status`、`server_sequence`、`command_type`。
+- `GET /api/v1/commands/{command_id}`
+  - 返回 `request_json`、`response_json`、`status`、`updated_at`，方便 UI 和调试工具直接查看。
+- `GET /api/v1/agents/{agent_id}/tasks/{task_id}`
+  - 直接返回 latest task result，不再额外包一层 `data`。
+- `GET /api/v1/agents/{agent_id}/probes/{run_id}`
+  - 返回 `kind=probe` 的 latest job result 扁平结构。
 
 验收标准：
 
@@ -2242,7 +2263,7 @@ service::command::dispatch_command()
 service::command::handle_ack()
 service::command::handle_error()
 service::command::handle_remote_task_result()
-service::command::handle_remote_probe_result()
+service::command::handle_remote_job_result()
 http::rest::create_agent_command()
 http::rest::get_command()
 ```
@@ -2336,6 +2357,29 @@ Milestone 4 完成后，README 必须写清：
 - 哪些命令要求 agent 在线。
 - shell/task/probe 由 CLI 静态开关控制。
 - REST 创建命令默认不等待执行完成。
+
+Milestone 4 时序必须固定成下面这条链路：
+
+```text
+REST POST /api/v1/agents/{agent_id}/commands
+  -> http::rest::create_agent_command()
+  -> service::command::create_command()
+  -> storage.create_command(status=queued)
+  -> connection registry lookup
+  -> if online:
+       encode ServerFrame
+       enqueue to agent outbound queue
+       storage.mark_command_sent()
+  -> if offline:
+       reject or save desired config
+  -> return command_id + status + server_sequence
+
+agent websocket inbound
+  -> ingest::frame
+  -> ack/error => mark_command_acked/failed
+  -> remote_task_result => upsert task result + finish command
+  -> job_result(kind=probe) => upsert remote job result + finish command when source=once
+```
 
 ### Milestone 5 函数级交付物
 
@@ -2519,7 +2563,7 @@ frontend/admin
 
 ```text
 agent
-  -> ack/error/remote_task_result/remote_probe_result
+  -> ack/error/remote_task_result/job_result
   -> websocket read loop
   -> ingest::frame
   -> service::command::handle_ack/handle_error/handle_result()
@@ -2986,7 +3030,7 @@ src/storage/memory.rs
    - `CommandRecord`
    - `CommandStatus`
    - `RemoteTaskResultRecord`
-   - `RemoteProbeResultRecord`
+   - `RemoteJobResultRecord`
 2. 在 `storage/repository.rs` 定义 repository trait。
 3. repository trait 包含 latest 写入方法：
    - `apply_snapshot`
@@ -3560,8 +3604,8 @@ src/http/rest.rs
 4. `error` 更新 command failed。
 5. ingest 识别 `remote_task_result`。
 6. 保存 stdout、stderr、exit_code、status。
-7. ingest 识别 `remote_probe_result`。
-8. 保存 probe result JSON。
+7. ingest 识别 `job_result`。
+8. 按 `kind` 保存 job result JSON；当前 `kind=probe` 写入 remote job result。
 9. 实现 `GET /api/v1/commands/{command_id}`。
 10. command 状态变化产生实时事件。
 
@@ -3577,12 +3621,12 @@ src/http/rest.rs
    - 识别 ack payload。
    - 识别 error payload。
    - 识别 remote task result。
-   - 识别 remote probe result。
+   - 识别 remote job result。
 2. 再改 `service/command.rs`：
    - 实现 `handle_ack()`。
    - 实现 `handle_error()`。
    - 实现 `handle_remote_task_result()`。
-   - 实现 `handle_remote_probe_result()`。
+   - 实现 `handle_remote_job_result()`。
 3. 再改 `storage/repository.rs`：
    - 添加 result upsert 方法。
    - command 状态更新必须幂等。

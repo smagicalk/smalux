@@ -6,7 +6,7 @@
 
 use crate::frame::{
     Ack, ClientFrame, ClientPayload, OutboundReport, OutboundReportKind, ProtocolError,
-    RemoteProbeResult, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskResult,
+    RemoteJobResult, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskResult,
     ServerFrame,
 };
 
@@ -47,18 +47,18 @@ pub fn encode_remote_task_result_as_smalux_json_bytes(
     serde_json::to_vec(&frame)
 }
 
-/// 将远程探测结果编码为 smalux 默认 JSON bytes。
-pub fn encode_remote_probe_result_as_smalux_json_bytes(
+/// 将通用远程 job 结果编码为 smalux 默认 JSON bytes。
+pub fn encode_remote_job_result_as_smalux_json_bytes(
     agent_id: &str,
     sequence: u64,
     sent_at: u64,
-    result: &RemoteProbeResult,
+    result: &RemoteJobResult,
 ) -> serde_json::Result<Vec<u8>> {
     let frame = ClientFrame::new(
         agent_id.to_string(),
         sequence,
         sent_at,
-        ClientPayload::RemoteProbeResult {
+        ClientPayload::JobResult {
             result: result.clone(),
         },
     );
@@ -346,6 +346,31 @@ mod tests {
         }
     }
 
+    /// 验证自有 job_apply 只接受 request_id，不接受第三方 task_id alias。
+    #[test]
+    fn server_job_apply_rejects_probe_task_id_alias() {
+        let json = r#"{
+            "protocol_version": 1,
+            "sequence": 9,
+            "sent_at": 100,
+            "type": "job_apply",
+            "request": {
+                "operation": "once",
+                "runs": [
+                    {
+                        "kind": "probe",
+                        "task_id": "probe-1",
+                        "probe_type": "tcp",
+                        "target": "example.com:443"
+                    }
+                ]
+            }
+        }"#;
+
+        let error = decode_server_frame(json).unwrap_err();
+        assert!(error.to_string().contains("request_id"));
+    }
+
     /// 验证 server remote shell open frame 可以往返 JSON。
     #[test]
     fn server_remote_shell_open_roundtrips_json() {
@@ -436,9 +461,9 @@ mod tests {
         }
     }
 
-    /// 验证远程探测结果可以编码为 client frame。
+    /// 验证通用远程 job 结果可以编码为 client frame。
     #[test]
-    fn remote_probe_result_encodes_as_client_frame() {
+    fn remote_job_result_encodes_as_client_frame() {
         let result = RemoteProbeResult {
             run_id: "probe-run-1".to_string(),
             source: RemoteProbeResultSource::Once,
@@ -455,14 +480,22 @@ mod tests {
             error: None,
         };
 
-        let json =
-            encode_remote_probe_result_as_smalux_json_bytes("agent-1", 8, 101, &result).unwrap();
+        let json = encode_remote_job_result_as_smalux_json_bytes(
+            "agent-1",
+            8,
+            101,
+            &RemoteJobResult::probe(result),
+        )
+        .unwrap();
         let decoded = decode_client_frame(std::str::from_utf8(&json).unwrap()).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.sequence, 8);
         match decoded.payload {
-            ClientPayload::RemoteProbeResult { result } => {
+            ClientPayload::JobResult { result } => {
+                let Some(result) = result.as_probe() else {
+                    panic!("expected probe job result");
+                };
                 assert_eq!(result.run_id, "probe-run-1");
                 assert_eq!(result.source, RemoteProbeResultSource::Once);
                 assert_eq!(result.point_id, Some(RemoteProbeId::from("point-7")));
@@ -472,7 +505,7 @@ mod tests {
                 assert_eq!(result.status, RemoteProbeResultStatus::Success);
                 assert_eq!(result.latency_ms, Some(12));
             }
-            _ => panic!("expected remote probe result payload"),
+            _ => panic!("expected remote job result payload"),
         }
     }
 

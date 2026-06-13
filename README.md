@@ -15,7 +15,7 @@
 
 - `crates/smalux-agent`
   - 运行在目标主机上的采集与上报进程。
-  - 已实现本机采集、动态配置、导出、控制消息处理、remote task、remote probe、remote shell、Komari 兼容。
+  - 已实现本机采集、动态配置、导出、控制消息处理、remote task、remote job、remote shell、Komari 兼容。
 - `crates/smalux-core`
   - 共享模型、日志初始化、脱敏工具和公共辅助函数。
 - `crates/smalux-protocol`
@@ -35,7 +35,7 @@
 - `snapshot`、可选 `delta`、业务级 `heartbeat`。
 - `smalux_json` 自有协议和 Komari 兼容导出。
 - `binary_plain` 与 `secure_psk` WebSocket wire。
-- `config_patch`、`snapshot_request`、一次性诊断、remote task、remote probe、remote shell。
+- `config_patch`、`snapshot_request`、一次性诊断、remote task、job_apply(kind=probe)、remote shell。
 
 关键入口：
 
@@ -79,37 +79,56 @@
 - [crates/smalux-server/README.md](crates/smalux-server/README.md)
 - [crates/smalux-server/plan.md](crates/smalux-server/plan.md)
 
-## Non-server Fixes In This Session
+## Protocol Status
 
-本轮已修复非 server 模块的几个明确问题：
+当前自有协议已经统一到通用远程 job 模型：
 
-- `smalux-core`
-  - 修复文本脱敏在转义引号场景下可能泄漏敏感值尾部的问题。
-- `smalux-protocol`
-  - `RemoteProbeId` 从任意 JSON 收紧为“字符串或整数”，当前用于 `remote_probe_apply.request_id` 和 Komari ping task id。
-  - `decode_secure_hello()` 现在会显式校验 Noise pattern，不再把错误拖到更晚的握手阶段。
-- `smalux-agent`
-  - 控制层 `ack/error` 不再用 `try_send`，避免队列满时静默丢失。
-  - disabled/rate-limited 的 remote task/probe 即时拒绝结果改为可靠异步发送。
-  - export 重连后的 pending 恢复失败现在会继续向上返回错误，避免 pending 事件卡住不再重试。
-  - 进程和 socket 的 unsupported/stale 状态现在会保留调用方请求的采样级别，避免把 `light/details` 误报成默认 `count` 语义。
-  - Komari exec 入站日志不再打印原始命令字符串，只记录 `task_id` 和长度，降低敏感参数落盘风险。
-  - `remote_shell_open` 现在在 stream 建连、PTY 启动并成功发出 `opened` 事件后才视为 ready，避免过早成功确认。
-  - 出站事件改为高低优先级双通道：control ack/error 与 remote task/probe result 优先于普通 report/basic info。
-  - export 重连恢复现在按 latest state、控制响应、远程结果三层执行，减少整批恢复时的耦合。
-  - 补充了协议适配边界测试，固定 Smalux 与 Komari handler 不能串线解析对方消息。
-  - 收紧了 Smalux server error 入站日志，不再直接打印对端原始 `message`，只记录 `code` 和长度。
-  - 收紧了 remote task/probe 运行日志，不再直接打印本地程序名或探测目标原文，改为长度/计数等结构化摘要。
+- server -> agent：`job_apply`
+- agent -> server：`job_result`
+- 当前稳定 job 类型：`kind=probe`
+
+这意味着：
+
+- 自有协议不再使用 `remote_probe_apply` / `remote_probe_result`。
+- 远程网络探测是 `job_apply(kind=probe)` 的首个执行器。
+- Komari 兼容层仍然保留，但它只在 adapter 内做转换：
+  - Komari `ping` -> 内部 `job_apply(operation=once, kind=probe)`
+  - 内部 `job_result(kind=probe)` -> Komari `ping_result`
+
+相关入口：
+
+- [crates/smalux-protocol/src/frame/remote/job.rs](crates/smalux-protocol/src/frame/remote/job.rs)
+- [crates/smalux-agent/src/service/remote/job.rs](crates/smalux-agent/src/service/remote/job.rs)
+
+## Interaction Matrix
+
+当前主要交互面可以直接按下面理解：
+
+| 方向 | 通道 | 协议/格式 | 主要消息 |
+| --- | --- | --- | --- |
+| agent -> server | 主 WebSocket | `smalux_json` + `binary_plain` / `secure_psk` | `snapshot` / `delta` / `heartbeat` / `ack` / `error` / `remote_task_result` / `job_result` |
+| server -> agent | 主 WebSocket | `smalux_json` + `binary_plain` / `secure_psk` | `snapshot_request` / `config_patch` / `collect_processes_once` / `collect_sockets_once` / `remote_task_run` / `job_apply` / `remote_shell_open` |
+| shell server -> agent | 临时 shell stream | shell stream JSON + wire | `input` / `resize` / `close` / `heartbeat` |
+| shell agent -> server | 临时 shell stream | shell stream JSON + wire | `opened` / `output` / `exit` / `error` |
+| agent -> Komari | report WebSocket / HTTP | Komari 文本 JSON | report / `uploadBasicInfo` / `task/result` / `ping_result` |
+| Komari -> agent | WebSocket 文本 | Komari 文本 JSON | `terminal` / `exec` / `ping` |
+
+建议阅读顺序：
+
+- 协议字段定义：`crates/smalux-protocol/README.md`
+- agent 实际交互流程：`crates/smalux-agent/README.md`
+- server 对接和 REST/WS 形状：`crates/smalux-server/README.md`
 
 ## Validation
 
-本轮已验证：
+当前主线已验证：
 
 ```powershell
-cargo test -p smalux-core
+cargo fmt --all --check
+cargo check --workspace
 cargo test -p smalux-protocol
 cargo test -p smalux-agent
-cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Recommended Reading Order

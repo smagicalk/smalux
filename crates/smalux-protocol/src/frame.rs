@@ -22,10 +22,11 @@ pub use self::client::{ClientFrame, ClientPayload};
 pub use self::control::{Ack, ProtocolError};
 pub use self::outbound::{OutboundReport, OutboundReportKind};
 pub use self::remote::{
-    RemoteProbeApplyRequest, RemoteProbeId, RemoteProbeJob, RemoteProbeOnceRequest,
-    RemoteProbeOperation, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
-    RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,
-    RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus,
+    RemoteJobApplyRequest, RemoteJobKind, RemoteJobOperation, RemoteJobResult, RemoteJobRunRequest,
+    RemoteJobSpec, RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource,
+    RemoteProbeResultStatus, RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest,
+    RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult,
+    RemoteTaskStatus,
 };
 pub use self::report::{DeltaReport, Heartbeat, MetricCollectionRequest, SnapshotRequest};
 pub use self::server::{ServerFrame, ServerPayload};
@@ -66,16 +67,16 @@ mod tests {
         assert_eq!(frame.sequence, 3);
     }
 
-    /// 验证 server remote probe request frame 会带协议版本。
+    /// 验证 server job apply frame 会带协议版本。
     #[test]
-    fn server_remote_probe_apply_uses_protocol_version() {
-        let frame = ServerFrame::remote_probe_apply(
+    fn server_job_apply_uses_protocol_version() {
+        let frame = ServerFrame::job_apply(
             4,
             100,
-            RemoteProbeApplyRequest {
-                operation: RemoteProbeOperation::Once,
+            RemoteJobApplyRequest {
+                operation: RemoteJobOperation::Once,
                 generation: None,
-                runs: vec![RemoteProbeOnceRequest {
+                runs: vec![RemoteJobRunRequest::Probe {
                     request_id: RemoteProbeId::from(7),
                     point_id: Some(RemoteProbeId::from("point-7")),
                     probe_type: RemoteProbeType::Tcp,

@@ -6,12 +6,12 @@ use super::{
 };
 use crate::config::model::{ExportConfig, ExportFormat};
 use crate::service::outbound::{
-    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
+    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteJobResultEnvelope,
     RemoteTaskResultEnvelope,
 };
 use smalux_protocol::{
     OutboundReport, encode_ack_as_smalux_json_bytes, encode_outbound_report_as_smalux_json_bytes,
-    encode_protocol_error_as_smalux_json_bytes, encode_remote_probe_result_as_smalux_json_bytes,
+    encode_protocol_error_as_smalux_json_bytes, encode_remote_job_result_as_smalux_json_bytes,
     encode_remote_task_result_as_smalux_json_bytes,
 };
 
@@ -51,10 +51,10 @@ pub(crate) trait ProtocolAdapter {
         Ok(vec![])
     }
 
-    /// 将远程网络探测结果编码成零到多条 transport 请求。
-    fn encode_remote_probe_result(
+    /// 将通用远程 job 结果编码成零到多条 transport 请求。
+    fn encode_remote_job_result(
         &mut self,
-        _result: &RemoteProbeResultEnvelope,
+        _result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
         Ok(vec![])
     }
@@ -147,12 +147,12 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         }])
     }
 
-    /// 编码远程探测结果为 smalux JSON bytes。
-    fn encode_remote_probe_result(
+    /// 编码通用远程 job 结果为 smalux JSON bytes。
+    fn encode_remote_job_result(
         &mut self,
-        result: &RemoteProbeResultEnvelope,
+        result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let json = encode_remote_probe_result_as_smalux_json_bytes(
+        let json = encode_remote_job_result_as_smalux_json_bytes(
             &result.agent_id,
             result.sequence,
             result.created_at,
@@ -160,11 +160,10 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         )?;
         tracing::debug!(
             sequence = result.sequence,
-            probe_id = %result.result.display_id(),
-            probe_type = result.result.probe_type.as_str(),
-            target = %result.result.target,
+            job_kind = result.result.kind().as_str(),
+            job_id = %result.result.display_id(),
             body_bytes = json.len(),
-            "remote probe result encoded as websocket binary payload"
+            "remote job result encoded as websocket binary payload"
         );
 
         Ok(vec![TransportRequest::WebSocketBinary {

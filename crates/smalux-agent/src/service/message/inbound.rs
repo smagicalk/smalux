@@ -12,7 +12,7 @@ use crate::service::collector::{CollectorCommand, CollectorCommandSender};
 use crate::service::options::DiagnosticOptions;
 use crate::service::reporter::{ReporterCommand, ReporterCommandSender};
 use crate::service::{
-    probe::{RemoteProbeApply, RemoteProbeManager},
+    RemoteJobApply, RemoteJobManager,
     shell::{RemoteShellManager, RemoteShellOpenRequest, RemoteShellStreamCodecRef},
     task::{RemoteTaskManager, RemoteTaskRunRequest},
 };
@@ -75,10 +75,10 @@ pub(crate) enum InboundCommand {
         /// 远程任务请求。
         request: RemoteTaskRunRequest,
     },
-    /// 应用远程网络探测请求。
-    RemoteProbeApply {
-        /// 远程探测请求。
-        request: RemoteProbeApply,
+    /// 应用通用远程 job 请求。
+    RemoteJobApply {
+        /// 远程 job 请求。
+        request: RemoteJobApply,
     },
     /// 请求尽快发送完整 snapshot。
     SnapshotRequest {
@@ -96,7 +96,7 @@ impl InboundCommand {
             Self::CollectSocketsOnce { .. } => "collect_sockets_once",
             Self::RemoteShellOpen { .. } => "remote_shell_open",
             Self::RemoteTaskRun { .. } => "remote_task_run",
-            Self::RemoteProbeApply { .. } => "remote_probe_apply",
+            Self::RemoteJobApply { .. } => "job_apply",
             Self::SnapshotRequest { .. } => "snapshot_request",
         }
     }
@@ -145,8 +145,8 @@ pub(crate) struct ControlDispatcher {
     remote_shell: RemoteShellManager,
     /// 远程非交互任务管理器。
     remote_task: RemoteTaskManager,
-    /// 远程网络探测管理器。
-    remote_probe: RemoteProbeManager,
+    /// 通用远程 job 管理器。
+    remote_job: RemoteJobManager,
     /// 采集控制命令发送端。
     collector_commands: CollectorCommandSender,
     /// reporter 控制命令发送端。
@@ -170,8 +170,8 @@ pub(crate) struct ControlDispatcherParts {
     pub(crate) remote_shell: RemoteShellManager,
     /// 远程非交互任务管理器。
     pub(crate) remote_task: RemoteTaskManager,
-    /// 远程网络探测管理器。
-    pub(crate) remote_probe: RemoteProbeManager,
+    /// 通用远程 job 管理器。
+    pub(crate) remote_job: RemoteJobManager,
     /// 采集控制命令发送端。
     pub(crate) collector_commands: CollectorCommandSender,
     /// reporter 控制命令发送端。
@@ -191,7 +191,7 @@ impl ControlDispatcher {
             config_manager: parts.config_manager,
             remote_shell: parts.remote_shell,
             remote_task: parts.remote_task,
-            remote_probe: parts.remote_probe,
+            remote_job: parts.remote_job,
             collector_commands: parts.collector_commands,
             reporter_commands: parts.reporter_commands,
             outbound_tx: parts.outbound_tx,
@@ -233,7 +233,7 @@ impl ControlDispatcher {
                     .await
             }
             InboundCommand::RemoteTaskRun { request } => self.remote_task.start(request).await,
-            InboundCommand::RemoteProbeApply { request } => self.remote_probe.apply(request).await,
+            InboundCommand::RemoteJobApply { request } => self.remote_job.apply(request).await,
             InboundCommand::SnapshotRequest { reason } => self.request_snapshot(reason),
         }
     }
@@ -446,7 +446,7 @@ fn control_response_queue_error(error: &super::outbound::OutboundSendError) -> S
         OutboundEvent::ControlAck(_) => "control ack",
         OutboundEvent::ControlError(_) => "control error",
         OutboundEvent::RemoteTaskResult(_) => "remote task result",
-        OutboundEvent::RemoteProbeResult(_) => "remote probe result",
+        OutboundEvent::RemoteJobResult(_) => "remote job result",
     };
     let reason = match error.kind() {
         super::outbound::OutboundSendErrorKind::Closed => "closed",

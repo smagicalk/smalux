@@ -2,6 +2,19 @@
 
 `smalux-agent` 是运行在被监控主机上的采集与上报进程。
 
+## 手册导航
+
+如果是按问题查阅，建议直接跳到对应章节：
+
+- 想看功能范围：`当前已完成功能`
+- 想看代码入口：`目录结构`、`代码阅读路线`
+- 想看扩展边界：`扩展边界`
+- 想看导出与 wire：`导出协议`
+- 想看 server 如何对接：`Server 自实现对接流程`
+- 想看远程能力：`远程能力`
+- 想看 patch 规则：`Server Patch`、`更新语义汇总`
+- 想看完整 JSON：`数据格式`、`Komari 格式`
+
 ## 当前已完成功能
 
 - 启动参数解析：所有参数都有默认值，支持短参数，启动时不依赖配置文件。
@@ -17,12 +30,12 @@
 - 进程与连接：支持 `count` / `light` / `details` 三个级别；默认只采集进程总数、TCP socket 总数、UDP socket 总数，server 远程触发的最高级别由启动参数 `--allow-process-level` / `--allow-socket-level` 控制。
 - 独立采样频率：core、disk、network、processes、sockets、public_ip、snapshot/heartbeat 和 outbound delivery 可以分别配置频率。
 - Telemetry 状态：`collector_loop` 按采集调度点提交 `TelemetryUpdate`；同一调度点到期的采样组会合并成一个 update，`reporter_loop` 独占 `LatestTelemetry` 最新缓存并组装 snapshot、delta 或业务级 heartbeat。
-- 上报策略：默认周期完整快照；可选启用业务级 heartbeat 和 delta 增量上报；server 可通过 `snapshot_request` 按需请求完整快照；reporter、control ack/error、remote task 结果和 remote probe 结果通过统一有界出站队列进入 export，避免无界堆积。
+- 上报策略：默认周期完整快照；可选启用业务级 heartbeat 和 delta 增量上报；server 可通过 `snapshot_request` 按需请求完整快照；reporter、control ack/error、remote task 结果和 remote job 结果通过统一有界出站队列进入 export，避免无界堆积。
 - 导出抽象：service 通过 `ExportRouter` 和 `TransportHub` 投递数据，具体格式由 `ProtocolAdapter` 实现；transport 真实发送由 `export/worker.rs` 后台执行并回传 `TransportEvent`，当前支持 `smalux_json` 与 `komari`，后续可扩展 gRPC 等 transport。
 - WebSocket：支持 `ws` / `wss`、额外 query、query token、bearer token、ping heartbeat、断线重连、server close 清理、Smalux binary wire 和 `secure_psk`；wire packet 与安全通道实现来自 `smalux-protocol`，agent/server 共用。
 - HTTP：支持 JSON POST、请求超时、TLS 跳过校验开关；当前用于 Komari basic info 和 exec task result。
-- 协议层：`export.format` 当前支持 `smalux_json` 和 `komari`；`smalux_json` 可编码 `snapshot`、`delta`、业务级 `heartbeat`、控制层 `ack/error`、`remote_task_result` 和 `remote_probe_result`，通过 WebSocket binary wire 发送；`komari` 兼容实时 report、basic info、terminal、exec task result 和 ping result。
-- 控制消息：`smalux_json` 自有协议通过 `ServerFrame` 下发 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply` 和 `remote_shell_open`；带 `sequence` 的命令调度后会收到控制层 `ack/error`，`target_agent_id` 不匹配时会被直接丢弃。
+- 协议层：`export.format` 当前支持 `smalux_json` 和 `komari`；`smalux_json` 可编码 `snapshot`、`delta`、业务级 `heartbeat`、控制层 `ack/error`、`remote_task_result` 和 `job_result`，通过 WebSocket binary wire 发送；`komari` 兼容实时 report、basic info、terminal、exec task result 和 ping result。
+- 控制消息：`smalux_json` 自有协议通过 `ServerFrame` 下发 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`job_apply` 和 `remote_shell_open`；带 `sequence` 的命令调度后会收到控制层 `ack/error`，`target_agent_id` 不匹配时会被直接丢弃。
 - 远程 shell：通过 CLI-only 参数启用；`smalux_json` 控制通道接收 `remote_shell_open`，每个会话使用独立临时 WebSocket stream 转发原始 PTY 输入、输出和 resize。
 - 远程 task：通过 CLI-only 参数启用；`remote_task_run` 执行非交互命令，受并发、超时和输出大小限制，结果通过主出站队列回传 `remote_task_result`。
 - 远程 probe：默认关闭，可通过启动参数给初始值，也可由 server `config_patch.remote_probe.enabled=true` 动态开启；支持 TCP / HTTP 探测，ICMP 当前会回 `status=failed`，所有探测受全局和同目标频率保护。
@@ -56,7 +69,7 @@ src/
     message.rs     # message 子模块入口
     message/       # handler / inbound / outbound：协议 handler、控制分发、出站事件
     remote.rs      # remote 子模块入口
-    remote/        # shell / task / probe：远程 shell、一次性任务和探测能力
+    remote/        # shell / task / job / probe：远程 shell、一次性任务、通用 job 和探测执行器
   export.rs        # 导出抽象
   export/          # WebSocket、HTTP、Komari、rustls 和 transport worker 适配
   export/komari/   # Komari model、URL、server message、terminal/exec 消息解析
@@ -70,7 +83,7 @@ src/
    - 只做启动装配：CLI、日志、`ConfigManager` 和 `service::run()`。
    - 如果启动参数行为不符合预期，先看 `src/config/cli/args.rs` 和 `src/config/cli/startup.rs`。
 2. `src/service.rs`
-   - 看 `run()` 如何创建队列、启动 `export_supervisor()`、`collector_loop()`、`collector::public_ip::public_ip_refresh_loop()` 和 `reporter_loop()`。
+   - 看 `run()` 如何创建队列、启动 `export_supervisor()`、`collector_loop()`、`collector::identity::identity_refresh_loop()` 和 `reporter_loop()`。
    - 这里只看生命周期，具体业务细节继续进入子模块。
 3. `src/service/collector.rs` + `src/collect.rs`
    - `collector_loop()` 决定什么时候采样。
@@ -83,10 +96,11 @@ src/
    - `ProtocolAdapter` 只做格式转换，`TransportHub` 只做 transport 投递。
 6. `src/service/message/*`
    - `SmaluxControlHandler` 把自有 `ServerFrame` 转成 `InboundCommand`。
-   - `ControlDispatcher` 执行配置更新、一次性诊断、远程 task/probe/shell，并回 `ack/error`。
+   - `ControlDispatcher` 执行配置更新、一次性诊断、远程 task/job/shell，并回 `ack/error`。
 7. `src/service/remote/*`
    - `task.rs` 是非交互命令执行。
-   - `probe.rs` 是远程网络探测。
+   - `job.rs` 是通用远程 job 外壳，当前把 `kind=probe` 委派给 probe 执行器。
+   - `probe.rs` 是远程网络探测执行器。
    - `shell/*` 是交互式 PTY 和临时 stream 桥接。
 8. `src/export/komari/*`
    - Komari 兼容集中放这里；删除或替换第三方兼容时优先从这个目录和 `export/komari.rs` 入手。
@@ -100,7 +114,7 @@ src/
 ### 导出格式边界
 
 - `ExportFormat` / `ProtocolAdapter` 只负责把内部语义转换成外部消息格式：
-  - 输入是 `OutboundReport`、`remote_task_result`、`remote_probe_result`、控制层 `ack/error`
+  - 输入是 `OutboundReport`、`remote_task_result`、`job_result`、控制层 `ack/error`
   - 输出是一个或多个 `TransportRequest`
 - `ProtocolAdapter` 不负责：
   - 采集系统数据
@@ -472,7 +486,7 @@ CliArgs::parse()
     "format": "smalux_json", // 导出数据编码格式；支持 smalux_json / komari
     "wire_mode": "binary_plain", // Smalux wire 模式；binary_plain | secure_psk
     "secure_required": false, // true 时要求 smalux_json + secure_psk；当前配置为 true 后 server patch 不能关闭
-    "token": "dev-token", // query/bearer 认证 token；secure_psk 时格式为 smx1.<key_id>.<secret_base64url>
+    "token": "REPLACE_WITH_TRANSPORT_TOKEN", // query/bearer 认证 token；secure_psk 时格式为 smx1.<key_id>.<secret_base64url>
     "auth_mode": "bearer", // none | query | bearer；secure_psk 时必须为 none，避免 token 明文泄露
     "query_token_param": "token", // query token 参数名，仅 auth_mode=query 时使用
     "query": {
@@ -588,7 +602,7 @@ CLI-only 服务静态选项不属于 `AgentConfig`，只在进程启动时由 CL
       "format": "smalux_json", // 可选；smalux_json | komari
       "wire_mode": "binary_plain", // 可选；binary_plain | secure_psk；Komari 不使用
       "secure_required": false, // 可选；true 后 server patch 不能再关闭
-      "token": "server-issued-token", // 可选；认证 token；secure_psk 时格式为 smx1.<key_id>.<secret_base64url>
+      "token": "REPLACE_WITH_SERVER_ISSUED_TOKEN", // 可选；认证 token；secure_psk 时格式为 smx1.<key_id>.<secret_base64url>
       "auth_mode": "bearer", // 可选；none | query | bearer
       "query_token_param": "token", // 可选；query token 参数名，仅 auth_mode=query 时使用
       "query": {
@@ -614,7 +628,7 @@ cargo run -p smalux-agent -- `
   -f smalux_json `
   --wire-mode binary_plain `
   -a bearer `
-  -t dev-token `
+  -t REPLACE_WITH_TRANSPORT_TOKEN `
   -c 2s `
   -d 10s `
   -n 10s `
@@ -668,7 +682,7 @@ cargo run -p smalux-agent -- `
   -s http://127.0.0.1:9000 `
   -f smalux_json `
   --wire-mode binary_plain `
-  -t dev-token `
+  -t REPLACE_WITH_TRANSPORT_TOKEN `
   -a bearer `
   -k token `
   -q agent_id=agent-1 `
@@ -735,7 +749,7 @@ cargo run -p smalux-agent -- `
 如需 query token：
 
 ```powershell
-cargo run -p smalux-agent -- -a query -t dev-token -k access_token
+cargo run -p smalux-agent -- -a query -t REPLACE_WITH_TRANSPORT_TOKEN -k access_token
 ```
 
 Komari WebSocket 兼容示例：
@@ -755,13 +769,13 @@ Komari 兼容约束：
 - token 必须通过 query 提供，推荐使用 `auth_mode=query` + `export.token`；也可以用 `export.query` 显式放入 token 参数。不要把 token 放到 URL 里。
 - `https://host` 会自动派生为 `wss://host/api/clients/report`、`https://host/api/clients/uploadBasicInfo`、`https://host/api/clients/task/result` 和 `wss://host/api/clients/terminal`。
 - 不支持 `auth_mode=bearer`，因为 Komari report / basic info 使用 query token。
-- 不支持业务级 `heartbeat` 和 `delta`；Komari adapter 发送完整 snapshot 映射后的 report，把 `remote_task_result` 映射为 task/result HTTP 请求，把 `remote_probe_result` 映射为 WebSocket `ping_result`。
+- 不支持业务级 `heartbeat` 和 `delta`；Komari adapter 发送完整 snapshot 映射后的 report，把 `remote_task_result` 映射为 task/result HTTP 请求，把 `job_result(kind=probe)` 映射为 WebSocket `ping_result`。
 - Komari `basic info` 是 reporter 产生的独立低频事件，第一份 telemetry ready 后按 `outbound.basic_info.send_on_start` 决定是否立即发送，之后按 `outbound.basic_info.refresh_interval` 发送，默认 5 分钟。
 - Komari 实时 `report` 是独立 `realtime_report` delivery，跟随 reporter 产生的最新完整 snapshot 通过 WebSocket 发送；HTTP `basic_info` 由 `OutboundEvent::BasicInfo` 触发，经 Komari adapter 编码为 `POST /api/clients/uploadBasicInfo`。
 - Komari report 要求 `report.interval <= 10s`，用于保证定时 snapshot 兜底，避免第三方服务长时间没有业务数据帧导致断开。
 - WebSocket 模式收到 `{ "message": "terminal", "request_id": "..." }` 时，会打开 `/api/clients/terminal?id=...` 临时 stream 并复用 remote shell；需要启动时开启 `--remote-shell-enabled true`。
 - WebSocket 模式收到 `{ "message": "exec", "task_id": "...", "command": "..." }` 时，会转换成内部 `remote_task`；需要启动时开启 `--remote-task-enabled true`。执行结果会通过 `POST /api/clients/task/result?token=...` 回传。
-- WebSocket 模式收到 `{ "message": "ping", "ping_task_id": 123, "ping_type": "tcp", "ping_target": "host:443" }` 时，会转换成内部 `remote_probe_apply(operation=once)`。默认不发包并回内部 `status=rejected`，Komari 输出时仍会映射成 `value=-1`；server 可通过 `config_patch.remote_probe.enabled=true` 动态开启，频率受 `remote_probe.global_min_interval` 和 `remote_probe.target_min_interval` 限制。
+- WebSocket 模式收到 `{ "message": "ping", "ping_task_id": 123, "ping_type": "tcp", "ping_target": "host:443" }` 时，会转换成内部 `job_apply(operation=once, kind=probe)`。默认不发包并回内部 `status=rejected`，Komari 输出时仍会映射成 `value=-1`；server 可通过 `config_patch.remote_probe.enabled=true` 动态开启，频率受 `remote_probe.global_min_interval` 和 `remote_probe.target_min_interval` 限制。
 - 重复敏感 query 参数会被拒绝，例如 `export.query` 已经包含 `token=...` 时不要再同时使用 `-a query -t ...`。
 
 `log_file`、`log_retention_files`、`log_max_size_mb`、`log_payload` 和 `log_payload_max_bytes` 只在启动阶段生效，不接受 server patch。当前 `tracing` subscriber 初始化后不会热切换日志文件、保留数量或大小阈值；payload 日志也不会由 server 动态开启，避免远端把敏感内容写入本机日志。如果后续确实需要热切换日志，需要单独设计 reloadable writer。
@@ -774,6 +788,8 @@ Komari 兼容约束：
 2. 启动参数显式传入 `--log-payload true`，并可用 `--log-payload-max-bytes 4096` 控制预览上限。
 
 payload 预览会标出 `kind`、`encoding`、原始 `bytes`、`redacted`、`truncated` 和 `preview`。JSON 会递归按字段名脱敏，文本会按常见 `key=value` / `key: value` 关键词脱敏，UTF-8 二进制如果能解析为 JSON 也会先按 JSON 脱敏；无法识别的二进制仍只按 base64 预览。当前敏感字段包括 `token`、`access_token`、`authorization`、`password`、`secret`、`api_key`、`private_key`、`psk`、`command`、`stdout`、`stderr`，并会对 shell stream 的 `data` 和 Komari task result 的 `result` 做上下文脱敏。开启后仍可能包含非敏感 telemetry JSON 或第三方兼容 payload，生产环境建议只在短时间排障时开启。
+
+安全检查重点：常规日志不应输出完整 token、Authorization header、secure_psk secret、远程命令、stdout/stderr 或 shell stream data；URL 日志必须先脱敏敏感 query；`unsafe_cert` 只允许启动时设置；远程 shell 和 remote task 只能通过 CLI 开启，不能由 server 动态开启。`--log-payload true` 只适合短时排障，即使脱敏后也可能包含非敏感但仍有业务价值的 telemetry 内容。
 
 脱敏实现位于 `smalux-core::utils::redact`，并通过 `smalux_core::log` re-export 常用入口。server 需要记录请求或协议 payload 时可以直接复用 `smalux_core::log::redact_sensitive_json()`、`redact_sensitive_json_text()`、`redact_sensitive_json_bytes()` 和 `redact_sensitive_text()`，避免 agent/server 使用不同规则。
 
@@ -833,7 +849,7 @@ adapter 输出语义：
 - `secure_psk` 使用 `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` 握手；`export.token` 只用于本地派生 PSK，完整 token 不会进入 URL 或 header。
 - `secure_psk` 下 `export.auth_mode` 必须为 `none`；如果需要额外路由参数，用 `export.query` 放非敏感字段。
 
-`smalux_json` 使用的 inbound handler 是 `SmaluxControlHandler`，只识别 `smalux_protocol::ServerFrame`。当前稳定下行命令包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply` 和 `remote_shell_open`，handler 会保留 server `sequence` 并在调度后回传 `ack` 或 `error`；如果 `target_agent_id` 存在且不等于当前 agent ID，会记录日志并直接丢弃，不回 ack/error。解析失败或未知 `type` 同样只丢弃，不断开主连接。`komari` 当前使用 `KomariInboundHandler`，把 terminal 消息转换成远程 shell 入站命令，把 exec 消息转换成远程 task 入站命令，把 ping 消息转换成 `remote_probe_apply(operation=once)`，其它第三方 server 文本消息会安全忽略，避免把 Komari 的事件误解析成 smalux 控制消息。如果要兼容更多服务端控制消息，可以新增：
+`smalux_json` 使用的 inbound handler 是 `SmaluxControlHandler`，只识别 `smalux_protocol::ServerFrame`。当前稳定下行命令包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`job_apply` 和 `remote_shell_open`，handler 会保留 server `sequence` 并在调度后回传 `ack` 或 `error`；如果 `target_agent_id` 存在且不等于当前 agent ID，会记录日志并直接丢弃，不回 ack/error。解析失败或未知 `type` 同样只丢弃，不断开主连接。`komari` 当前使用 `KomariInboundHandler`，把 terminal 消息转换成远程 shell 入站命令，把 exec 消息转换成远程 task 入站命令，把 ping 消息转换成 `job_apply(operation=once, kind=probe)`，其它第三方 server 文本消息会安全忽略，避免把 Komari 的事件误解析成 smalux 控制消息。如果要兼容更多服务端控制消息，可以新增：
 
 - 新的 `InboundProtocolHandler` 实现，解析第三方服务端控制消息。
 - 新的 message adapter，把第三方消息转换为 `InboundCommand`。
@@ -987,7 +1003,7 @@ server 侧 secure_psk 最小实现步骤：
    -> type=heartbeat: 更新业务在线时间，不修改指标状态
    -> type=ack/error: 关联 server 下发命令的 sequence
    -> type=remote_task_result: 关联 task_id，记录非交互任务结果
-   -> type=remote_probe_result: 关联 point_id 和 request_id/job_id，记录网络探测结果
+   -> type=job_result + kind=probe: 关联 point_id 和 request_id/job_id，记录网络探测结果
 
 4. 维护每个 agent 的状态
    -> agent_id 来自 ClientFrame.agent_id，也会出现在 snapshot payload.report.agent_id
@@ -1001,7 +1017,7 @@ server 侧 secure_psk 最小实现步骤：
    -> ServerFrame 的 ack 只代表命令已被调度，不代表后续结果已经产生
 ```
 
-建议 server 第一版只实现 `snapshot`、`heartbeat`、`ServerFrame(type=snapshot_request)` 和 `ServerFrame(type=config_patch)`，确认 agent 能稳定连接、上报、请求完整快照和调整采样频率后，再接 `remote_task_result`、`remote_probe_result`、一次性诊断采集和 `ServerFrame(type=remote_shell_open)`。
+建议 server 第一版只实现 `snapshot`、`heartbeat`、`ServerFrame(type=snapshot_request)` 和 `ServerFrame(type=config_patch)`，确认 agent 能稳定连接、上报、请求完整快照和调整采样频率后，再接 `remote_task_result`、`job_result`、一次性诊断采集和 `ServerFrame(type=remote_shell_open)`。
 
 delta 合并规则要简单：server 不做字段级深度合并。`snapshot` 覆盖完整状态；`delta` 出现哪个顶层采样组，就整体覆盖该采样组；采样组为 `null` 时清空该组。server 如果没有对应 `base_sequence`，直接发 `snapshot_request`，不要尝试猜测补齐。
 
@@ -1021,7 +1037,7 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 - `heartbeat`：只更新业务在线时间和最后通信时间，不修改指标快照。
 - `ack/error`：用 `ack.sequence` 或 `error.sequence` 关联 server 之前下发的控制命令。
 - `remote_task_result`：用 `result.task_id` 关联任务记录，保存 status、exit_code、stdout/stderr、error 和 finished_at。
-- `remote_probe_result`：用 `result.run_id` 作为单次探测运行唯一键；`point_id` 是 server 下发的业务探测点 ID，会随结果原样带回；`source=once` 时用 `request_id` 关联一次性请求，`source=job` 时用 `job_id` 关联持续任务。server 保存 point_id、probe_type、target、status、latency_ms、duration_ms、error 和 finished_at。
+- `job_result(kind=probe)`：用 `result.run_id` 作为单次探测运行唯一键；`point_id` 是 server 下发的业务探测点 ID，会随结果原样带回；`source=once` 时用 `request_id` 关联一次性请求，`source=job` 时用 `job_id` 关联持续任务。server 保存 point_id、probe_type、target、status、latency_ms、duration_ms、error 和 finished_at。
 - `ServerFrame 下发`：自有协议命令生成 server 侧递增 `sequence`，填 `protocol_version=1`、`sent_at`、`type`，可选填 `target_agent_id`，再按当前 wire mode 封包发送。
 - `config_patch`：只下发动态字段；不要下发日志字段、`diagnostics`、`remote_shell.enabled` 或 `remote_task.enabled`。
 - `snapshot_request`：当 server 缺完整状态、delta 基准不匹配或需要主动刷新时下发；短时间重复请求可以合并。
@@ -1037,12 +1053,12 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 - 采集 update 会触发 reporter 立即尝试生成 report；`report.interval` 负责定时 snapshot/heartbeat 兜底，不再是唯一 report 生成来源。
 - `latest_report` 仍是 export supervisor 的最新状态语义；realtime delivery 收到新 report 会立即尝试投递，server 端仍应保存 latest state，而不是试图按每个 report 建无界队列。
 - `ack/error` 只说明带 `sequence` 的 `ServerFrame` 是否被调度，不说明远程 task/probe 已完成。
-- `error.code` 当前按 `{server_frame_type}_failed` 生成，例如 `snapshot_request_failed`、`remote_probe_apply_failed`、`remote_shell_open_failed`。server 逻辑判断只依赖 `error.code` 和 `error.sequence`，不要依赖自然语言 `message`。
+- `error.code` 当前按 `{server_frame_type}_failed` 生成，例如 `snapshot_request_failed`、`job_apply_failed`、`remote_shell_open_failed`。server 逻辑判断只依赖 `error.code` 和 `error.sequence`，不要依赖自然语言 `message`。
 - `config_patch` 调度成功会先回控制层 `ack`，但它只表示 patch 已通过校验并应用到运行配置；server 如果要确认采样节奏或导出连接实际变化，还应继续观察后续 snapshot/delta 或新连接。
 - `secure_psk` 模式下，server 不能发送 WebSocket text 控制消息；agent 会直接拒绝连接路径。
 - `remote_shell_open.stream_url` 是单个 shell 会话的临时 WebSocket 地址；自有 `smalux_json` server 仍要在这个 stream 上执行同样的 binary wire / `secure_psk` 规则，文档中的 shell JSON 只是 wire payload 里的业务 JSON。
 - `remote_task_run` 有副作用，重连后不要盲目重发；用 `task_id` 做幂等。
-- `remote_probe_apply(operation=once)` 被禁用或限频时，agent 不会发网络包，但仍会回 `remote_probe_result.status=rejected`，并带 `error` 说明原因。
+- `job_apply(operation=once, kind=probe)` 被禁用或限频时，agent 不会发网络包，但仍会回 `job_result(kind=probe).result.status=rejected`，并带 `error` 说明原因。
 - 进程和 socket 的 `level=details` 即使通过 server patch 请求，也需要 agent 启动时允许 details；否则会返回控制错误或拒绝一次性采集。
 - `public_ip.status=failed/stale/disabled` 都是正常上报状态，server 不应因为公网 IP 不 ready 就拒绝整包。
 
@@ -1059,9 +1075,10 @@ server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_m
 - 部分 shell 会发送终端控制查询，例如 Windows PowerShell 可能输出 `ESC[6n` 查询光标位置；完整终端前端需要把终端模拟器产生的响应通过 `input` 回写给 agent。
 - `remote_task` 面向非交互的一次性任务，例如后续备份、更新、脚本执行。主控制通道接收 `remote_task_run`，agent 直接执行指定 `program + args`，不会把参数拼成 shell 字符串。任务受 `remote_task.max_concurrent`、`remote_task.timeout`、`remote_task.max_stdout_bytes` 和 `remote_task.max_stderr_bytes` 限制；stdout/stderr 超过上限会截断但继续 drain，避免子进程因 pipe 堵塞卡死。
 - `remote_task_result` 走主出站队列；`smalux_json` 编码为 WebSocket binary `ClientFrame(type=remote_task_result)`，`komari` 编码为 HTTP `POST /api/clients/task/result?token=...`。Komari 的 `command` 字符串会按平台转换为 shell 执行：Windows 使用 `powershell.exe -NoProfile -Command`，其它平台使用 `/bin/sh -c`。
-- `remote_probe` 面向远程网络连通性探测。主控制通道接收 `remote_probe_apply`；`operation=once` 用于单次探测，`operation=replace/patch` 用于同步持续任务。Komari `ping` 会转换成 `remote_probe_apply(operation=once)`。当前支持 `tcp` 和 `http`；`icmp` 先返回 `status=failed`，后续如果需要真实 ICMP 再单独接跨平台实现。
-- `remote_probe_result` 走主出站队列；`smalux_json` 编码为 WebSocket binary `ClientFrame(type=remote_probe_result)`，结果会带回 `point_id`、`request_id/job_id`、`probe_type` 和 `target`；`komari` 编码为 WebSocket text `{ "type": "ping_result", ... }`，Komari 格式本身只带 `task_id/ping_type/value`。
-- `operation=once` 在 `remote_probe.enabled=false`、全局间隔未到或同目标间隔未到时，agent 不发网络包，立即回传 `status=rejected`。持续任务 `replace/patch` 会在 agent 本地启动或更新 worker，worker 按各自 `interval` 持续探测并持续上报 `remote_probe_result`；持续任务命中限频时只跳过当次执行，不回 rejected 结果。
+- `remote_job` 是远程周期/一次性能力的统一外壳。主控制通道接收 `job_apply`；`operation=once` 用于立即运行一次，`operation=replace/patch` 用于同步持续 job 表。首版只实现 `kind=probe`，后续 backup、health_check 等能力应新增 job kind 和执行器，而不是新增 `remote_xxx_apply` 协议入口。
+- `remote_probe` 面向远程网络连通性探测，是 `job_apply(kind=probe)` 当前唯一执行器。Komari `ping` 会转换成 `job_apply(operation=once, kind=probe)`。当前支持 `tcp` 和 `http`；`icmp` 先返回 `status=failed`，后续如果需要真实 ICMP 再单独接跨平台实现。
+- `job_result(kind=probe)` 走主出站队列；`smalux_json` 编码为 WebSocket binary `ClientFrame(type=job_result)`，结果会带回 `point_id`、`request_id/job_id`、`probe_type` 和 `target`；`komari` 编码为 WebSocket text `{ "type": "ping_result", ... }`，Komari 格式本身只带 `task_id/ping_type/value`。
+- `operation=once` 在 `remote_probe.enabled=false`、全局间隔未到或同目标间隔未到时，agent 不发网络包，立即回传 `status=rejected`。持续任务 `replace/patch` 会在 agent 本地启动或更新 worker，worker 按各自 `interval` 持续探测并持续上报 `job_result(kind=probe)`；持续任务命中限频时只跳过当次执行，不回 rejected 结果。
 - server patch 不允许开启 `remote_shell.enabled` / `remote_task.enabled`，避免服务端在 agent 运行中扩大远程执行权限；运行限制可以调整，但只会在能力已由 CLI 开启时产生实际效果。
 - Komari 的 terminal 消息会转换成同一套 `remote_shell` 管理逻辑，exec 消息会转换成同一套 `remote_task` 管理逻辑，ping 消息会转换成同一套 `remote_probe` 管理逻辑，而不是在 Komari adapter 里直接执行。
 
@@ -1126,7 +1143,7 @@ server 控制通道使用 Smalux `ServerFrame`。所有自有下行命令都带 
     "export": {
       "format": "smalux_json",
       "auth_mode": "bearer",
-      "token": "server-issued-token",
+      "token": "REPLACE_WITH_SERVER_ISSUED_TOKEN",
       "reconnect_interval": "10s",
       "query": { "agent_id": "agent-1" }
     }
@@ -1162,7 +1179,7 @@ server 想确认 patch 是否生效，可以按字段类型观察：
 | `outbound.basic_info` | reporter 生成 basic info 事件的开关、首次发送策略或发送节奏变化；realtime report 始终跟随最新 report 触发 |
 | `network.include_interfaces` / `exclude_interfaces` | `network.value.networks` 和汇总值只包含筛选后的网卡 |
 | `processes.level` / `sockets.level` | 总数字段始终存在，`light` / `details` 字段按级别出现 |
-| `remote_probe.enabled` | 后续 `remote_probe_apply(operation=once)` 从 `status=rejected` 变为实际 TCP/HTTP 探测结果；持续任务也会开始本地调度 |
+| `remote_probe.enabled` | 后续 `job_apply(operation=once, kind=probe)` 从 `status=rejected` 变为实际 TCP/HTTP 探测结果；持续任务也会开始本地调度 |
 | `export.*` 连接字段 | agent 会按新配置重建导出连接，server 可能看到旧连接关闭和新连接建立 |
 
 如果 patch 下发后没有变化，先看三点：字段是否属于 server patch 模型、值是否和当前配置相同、是否被 CLI-only 或 startup-only 限制挡住。完全相同的 patch 会被忽略，不会重建任务；`agent_id`、`remote_shell.enabled`、`remote_task.enabled`、`diagnostics.*`、`export.unsafe_cert`、`public_ip.required_for_first_report`、`public_ip.retry_interval` 和日志字段本来就不能动态修改。
@@ -1234,13 +1251,13 @@ server 想确认 patch 是否生效，可以按字段类型观察：
 | `snapshot_request` | 不是配置更新 | 单次命令 | 请求 reporter 生成完整 snapshot；受 `report.force_snapshot_min_interval` 保护，重复请求会合并 |
 | `collect_processes_once` / `collect_sockets_once` | 不是配置更新 | 单次命令 | 只触发一次采样，提交 `TelemetryUpdate`，不修改 `AgentConfig` |
 | `remote_task_run` | 不是配置更新 | 单次命令 | 执行非交互命令，结果通过 `remote_task_result` 回传，不修改 `AgentConfig` |
-| `remote_probe_apply` | 不是配置更新 | 单次探测或持续任务同步 | `operation=once` 执行一次 TCP/HTTP 探测；`operation=replace/patch` 同步持续任务，由 agent 本地 worker 按 interval 持续探测并通过 `remote_probe_result` 回传 |
+| `job_apply` | 不是配置更新 | 通用远程 job 同步 | `operation=once` 立即运行一次 job；`operation=replace/patch` 同步持续 job 表。首版稳定 `kind=probe`，由 agent 本地 worker 按 interval 持续探测并通过 `job_result(kind=probe)` 回传 |
 | `ack` | 不是配置更新 | 控制层确认 | 只对带 `sequence` 的 Smalux server frame 回传，表示命令已被接收并成功调度 |
 | `error` | 不是配置更新 | 控制层错误 | 只对带 `sequence` 的 Smalux server frame 回传，表示命令被拒绝或调度失败 |
 | `snapshot` 上报 | 不属于部分更新 | 完整当前状态 | 每次 snapshot 包含完整 `AgentReport`；禁用采样组会省略 |
 | `delta` 上报 | 支持 | 采样组级 | 只发送变化的 `identity/core/disk/network/processes/sockets`；出现对象表示替换整个采样组；进程和连接采样组只要出现就仍包含总数 |
 | `heartbeat` 上报 | 不包含监控数据 | 业务在线信号 | 只携带最近完整 snapshot 时间和序号，不更新指标 |
-| `komari` report | 不支持 delta | 第三方实时 JSON + HTTP 辅助请求 | `export.format=komari` 发送 Komari 格式快照，把 remote task result 映射为 task/result，把 remote probe result 映射为 ping_result；配置层会拒绝业务级 delta/heartbeat |
+| `komari` report | 不支持 delta | 第三方实时 JSON + HTTP 辅助请求 | `export.format=komari` 发送 Komari 格式快照，把 remote task result 映射为 task/result，把 `job_result(kind=probe)` 映射为 ping_result；配置层会拒绝业务级 delta/heartbeat |
 
 因此，监控数据的“部分更新”只到采样组级别，不到嵌套字段级别。例如 `network.value.networks[0].received` 变化时，delta 会发送整个 `network` 采样组；`processes.value.details.items[]` 变化时，delta 会发送整个 `processes` 采样组。server 应把 delta 中出现的采样组整体替换到 latest state 中，而不是尝试按内部字段 merge。
 
@@ -1271,15 +1288,15 @@ main()
         -> adapter.transport_plan()
         -> TransportPlan::apply_outbound_config(config.outbound)
         -> TransportHub
-     -> SmaluxControlHandler(config patch / snapshot request / one-shot collect / remote shell open / remote task run / remote probe apply)
+     -> SmaluxControlHandler(config patch / snapshot request / one-shot collect / remote shell open / remote task run / job apply)
      -> bootstrap_once()
      -> retry_identity_until_ready()
      -> initial LatestTelemetry moved into reporter_loop()
      -> collector_loop()
-     -> collector::public_ip::public_ip_refresh_loop()
+     -> collector::identity::identity_refresh_loop()
      -> reporter_loop()
         -> ReporterCommand::ForceSnapshot when server requests snapshot
-        -> TelemetryUpdate from collector/public_ip
+        -> TelemetryUpdate from collector/identity
         -> LatestTelemetry::build_report()
         -> TelemetryAggregator
            -> OutboundReport::Snapshot | Delta | Heartbeat | skip
@@ -1303,13 +1320,14 @@ main()
         -> OutboundEvent::RemoteTaskResult bounded queue
         -> export_supervisor()
         -> ExportRouter::send_remote_task_result()
-     -> remote probe manager
-        -> remote_probe_apply
+     -> remote job manager
+        -> job_apply(kind=probe)
+        -> delegate to remote probe manager
         -> check dynamic enabled and rate limits
         -> TCP / HTTP probe or immediate status=rejected
-        -> OutboundEvent::RemoteProbeResult bounded queue
+        -> OutboundEvent::RemoteJobResult bounded queue
         -> export_supervisor()
-        -> ExportRouter::send_remote_probe_result()
+        -> ExportRouter::send_remote_job_result()
      -> ControlDispatcher
         -> framed server command success/failure
         -> OutboundEvent::ControlAck | ControlError bounded queue
@@ -1350,7 +1368,7 @@ ServerFrame JSON bytes
      -> spawn 非交互任务
      -> 结果写入 OutboundEventQueue
      -> export_supervisor() 通过主上报 transport 回传 remote_task_result
-     -> remote_probe_apply:
+     -> job_apply(kind=probe):
      -> operation=once:
      -> 校验 remote_probe.enabled
      -> 校验 global_min_interval / target_min_interval
@@ -1361,7 +1379,7 @@ ServerFrame JSON bytes
      -> 启动或更新本地 job worker
      -> worker 按 interval 持续执行 TCP/HTTP 探测
      -> 结果写入 OutboundEventQueue
-     -> export_supervisor() 通过主上报 transport 回传 remote_probe_result
+     -> export_supervisor() 通过主上报 transport 回传 job_result(kind=probe)
   -> if sequence meta exists:
      -> success: OutboundEvent::ControlAck
      -> failure: OutboundEvent::ControlError
@@ -1406,11 +1424,12 @@ ServerFrame(type=remote_task_run)
      -> smalux_json: ClientFrame(type=remote_task_result)
      -> komari: POST /api/clients/task/result?token=...
 
-ServerFrame(type=remote_probe_apply) / Komari ping
+ServerFrame(type=job_apply) / Komari ping
   -> SmaluxControlHandler::on_message()
-  -> InboundCommand::RemoteProbeApply
+  -> InboundCommand::RemoteJobApply
   -> ControlDispatcher::dispatch()
-  -> RemoteProbeManager::apply()
+  -> RemoteJobManager::apply()
+     -> kind=probe delegate to RemoteProbeManager
      -> operation=once:
      -> dynamic enabled guard
      -> global_min_interval / target_min_interval rate guard
@@ -1420,10 +1439,10 @@ ServerFrame(type=remote_probe_apply) / Komari ping
      -> operation=replace/patch:
      -> sync jobs into in-memory scheduler
      -> per-job worker runs on interval
-     -> RemoteProbeResultEnvelope
-     -> OutboundEvent::RemoteProbeResult
-     -> ExportRouter::send_remote_probe_result()
-     -> smalux_json: ClientFrame(type=remote_probe_result)
+     -> RemoteJobResultEnvelope
+     -> OutboundEvent::RemoteJobResult
+     -> ExportRouter::send_remote_job_result()
+     -> smalux_json: ClientFrame(type=job_result, kind=probe)
      -> komari: WebSocket text ping_result
 ```
 
@@ -1454,7 +1473,19 @@ LocalCollector
 
 身份采样始终会生成 `IdentityInfo`。公网 IP 获取成功时写入 `ready`；外部服务不可用、超时或没有可用公网候选地址时写入 `failed`；低频刷新失败且已有旧 IP 时写入 `stale`。因此 `public_ip.required_for_first_report=false` 时，第一包可以携带公网 IP 失败状态正常上报。
 
-service 启动后会把初始 `LatestTelemetry` 移交给 `reporter_loop()`，后续不再用共享锁连接采集和上报。`collector_loop()` 使用中心采集调度表按 core/disk/network/processes/sockets 的独立频率计算到期 group；同一调度点到期的 group 会合并成一个 `TelemetryUpdate::Batch`，一次性提交给 reporter，一次性诊断命令也会提交对应 group 的 `TelemetryUpdate`。`collector::public_ip::public_ip_refresh_loop()` 属于采集模块里的低频身份刷新任务，按 `public_ip.refresh_interval` 刷新公网 IP，并提交 `TelemetryUpdate::IdentityRefresh`；刷新失败且已有旧公网 IP 时，reporter 内部 latest 缓存会保留旧 IP 并标记为 `stale`。`reporter_loop()` 是 latest telemetry 缓存的唯一拥有者：收到 update 后先应用到 `LatestTelemetry`，再交给 `TelemetryAggregator` 决定发送完整 `snapshot`、`delta`、业务级 `heartbeat`，或在无变化且未到心跳间隔时跳过；`report.interval` 仍用于定时 snapshot/heartbeat 兜底。在 Komari 模式下，reporter 还会按 `outbound.basic_info.send_on_start` 和 `outbound.basic_info.refresh_interval` 从同一份 latest telemetry 构建 `OutboundEvent::BasicInfo`。server 入站消息先由协议 handler 转换为 `InboundCommandEnvelope`，写入容量为 `128` 的有界入站命令队列，再由 `ControlDispatcher` 统一校验和执行；`snapshot_request` 会转成 `ReporterCommand::ForceSnapshot` 投递给 reporter。reporter 会把 `OutboundEvent::Report` 和 `OutboundEvent::BasicInfo` 写入容量为 `256` 的有界出站队列；remote task 完成后会把 `OutboundEvent::RemoteTaskResult` 写入同一队列；remote probe 完成、被禁用或被限频时会把 `OutboundEvent::RemoteProbeResult` 写入同一队列；带 `sequence` 的 server frame 执行后还会把 `OutboundEvent::ControlAck` 或 `OutboundEvent::ControlError` 写入同一队列。队列满时 reporter 会等待 export 端消费，remote task / remote probe 结果和控制响应会按各自路径等待或返回错误，避免无界堆积。`export_supervisor()` 消费出站队列并维护 `latest_report`；`realtime_report` 跟随最新 report 触发，`basic_info` 由 `OutboundEvent::BasicInfo` 触发，即时任务和探测结果则直接通过 `ExportRouter::send_remote_task_result()` / `send_remote_probe_result()` 投递，控制响应通过 `send_control_ack()` / `send_control_error()` 投递。`TransportHub` 为每个 transport 启动 `export::worker` transport task，worker 发送队列默认容量为 `128`；投递满队列时返回错误，真实发送成功或失败会通过 `TransportEvent::Sent` / `TransportEvent::Failed` 回到 `export_supervisor`。`last_sent_sequence` 只在收到 `Sent` 后更新；`Failed` 按当前 delivery 的 failure policy 决定重连或只记录日志。basic info 是低频辅助事件，不做 pending，失败后等待下一次 `outbound.basic_info.refresh_interval` 自然重试。远程任务结果、远程探测结果和控制响应在收到 `Sent` 前会保留 pending 副本，重连后会重投；如果当前 adapter 不支持该事件，会记录为跳过并移除 pending。
+service 启动后会把初始 `LatestTelemetry` 移交给 `reporter_loop()`，后续不再用共享锁连接采集和上报。运行期按下面几层流转：
+
+- 采集层：`collector_loop()` 使用中心采集调度表按 core/disk/network/processes/sockets 的独立频率计算到期 group；同一调度点到期的 group 会合并成一个 `TelemetryUpdate::Batch`，一次性提交给 reporter；一次性诊断命令也会提交对应 group 的 `TelemetryUpdate`。
+- 身份层：`collector::identity::identity_refresh_loop()` 属于采集模块里的低频身份刷新任务，按 `public_ip.refresh_interval` 刷新公网 IP，并提交 `TelemetryUpdate::IdentityRefresh`；这里配置字段仍叫 `public_ip`，因为当前低频身份刷新只包含公网 IP 状态。刷新失败且已有旧公网 IP 时，reporter 内部 latest 缓存会保留旧 IP 并标记为 `stale`。
+- reporter 层：`reporter_loop()` 是 latest telemetry 缓存的唯一拥有者；收到 update 后先应用到 `LatestTelemetry`，再交给 `TelemetryAggregator` 决定发送完整 `snapshot`、`delta`、业务级 `heartbeat`，或在无变化且未到心跳间隔时跳过；`report.interval` 仍用于定时 snapshot/heartbeat 兜底。
+- Komari basic info：Komari 模式下，reporter 会按 `outbound.basic_info.send_on_start` 和 `outbound.basic_info.refresh_interval` 从同一份 latest telemetry 构建 `OutboundEvent::BasicInfo`；basic info 是低频辅助事件，不做 pending，失败后等待下一次 refresh interval 自然重试。
+- 入站控制：server 入站消息先由协议 handler 转换为 `InboundCommandEnvelope`，写入容量为 `128` 的有界入站命令队列，再由 `ControlDispatcher` 统一校验和执行；`snapshot_request` 会转成 `ReporterCommand::ForceSnapshot` 投递给 reporter。
+- 出站队列：reporter 会把 `OutboundEvent::Report` 和 `OutboundEvent::BasicInfo` 写入容量为 `256` 的有界出站队列；remote task 完成后写入 `OutboundEvent::RemoteTaskResult`；remote job 完成、被禁用或被限频时写入 `OutboundEvent::RemoteJobResult`；带 `sequence` 的 server frame 执行后写入 `OutboundEvent::ControlAck` 或 `OutboundEvent::ControlError`。队列满时 reporter 会等待 export 端消费，remote task / remote job 结果和控制响应会按各自路径等待或返回错误，避免无界堆积。
+- export 层：`export_supervisor()` 消费出站队列并维护 `latest_report`；`realtime_report` 跟随最新 report 触发，`basic_info` 由 `OutboundEvent::BasicInfo` 触发，即时任务和 job 结果通过 `ExportRouter::send_remote_task_result()` / `send_remote_job_result()` 投递，控制响应通过 `send_control_ack()` / `send_control_error()` 投递。
+- transport 层：`TransportHub` 为每个 transport 启动 `export::worker` transport task，worker 发送队列默认容量为 `128`；投递满队列时返回错误，真实发送成功或失败会通过 `TransportEvent::Sent` / `TransportEvent::Failed` 回到 `export_supervisor`。
+- pending 语义：`last_sent_sequence` 只在收到 `Sent` 后更新；`Failed` 按当前 delivery 的 failure policy 决定重连或只记录日志。远程任务结果、远程 job 结果和控制响应在收到 `Sent` 前会保留 pending 副本，重连后会重投；如果当前 adapter 不支持该事件，会记录为跳过并移除 pending。
+
+身份低频刷新只响应身份相关配置变化：`public_ip.refresh_interval` 变化只重建定时器；`agent_id` 或 `public_ip.enabled/prefer_interface_candidate/verify_interface_candidate/lookup_timeout/max_concurrency` 变化会立刻重新采样一次身份信息；无关的 core/disk/network/processes/sockets 配置变化不会触发身份刷新。
 
 默认兼容模式下 `report.delta_enabled=false` 且 `report.heartbeat_enabled=false`，采集 update 或 `report.interval` tick 都会生成完整 `snapshot`。启用 delta 后，第一包仍然发送完整 `snapshot`；后续只在 identity/core/disk/network/processes/sockets 有变化时发送 `delta`，并按 `report.snapshot_interval` 定期强制刷新完整 `snapshot`。server 也可以发送 `snapshot_request` 请求完整快照；agent 会先检查 `report.enabled`，再受 `report.force_snapshot_min_interval` 保护，间隔内重复请求会合并为下一次允许的完整 snapshot。启用业务级 heartbeat 后，无变化且达到 `report.heartbeat_interval` 时发送 `heartbeat`，用于让 server 确认 agent 业务状态仍在线。`report.snapshot_interval` 和 `report.heartbeat_interval` 使用 `Duration` 精度判断，亚秒值不会被截断成 0。`export.heartbeat` 是 WebSocket ping 间隔，属于传输层 keepalive，不是业务级 heartbeat。
 
@@ -1462,7 +1493,9 @@ service 启动后会把初始 `LatestTelemetry` 移交给 `reporter_loop()`，�
 
 ## 数据格式
 
-server 控制消息当前由 `smalux_json` 主 WebSocket 承载。Smalux 自有 server 应按当前 `export.wire_mode` 发送 binary wire payload；`binary_plain` 模式为了本地调试可以直接用 WebSocket text 发送 `ServerFrame` JSON，`secure_psk` 模式会拒绝明文 text。自有协议控制 payload 统一是 `ServerFrame`，当前支持 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply` 和 `remote_shell_open`。`ServerFrame` 包含 server `sequence`，agent 调度后回 `ack/error`；可选 `target_agent_id` 不匹配时会直接丢弃，不回 ack/error。
+server 控制消息当前由 `smalux_json` 主 WebSocket 承载。Smalux 自有 server 应按当前 `export.wire_mode` 发送 binary wire payload；`binary_plain` 模式为了本地调试可以直接用 WebSocket text 发送 `ServerFrame` JSON，`secure_psk` 模式会拒绝明文 text。自有协议控制 payload 统一是 `ServerFrame`，当前支持 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`job_apply` 和 `remote_shell_open`。`ServerFrame` 包含 server `sequence`，agent 调度后回 `ack/error`；可选 `target_agent_id` 不匹配时会直接丢弃，不回 ack/error。
+
+字段定义和稳定协议边界以 [crates/smalux-protocol/README.md](/abs/path/F:/code/rust/smalux/crates/smalux-protocol/README.md) 为准；本节重点描述 agent 视角下的交互流程、运行约束和示例 payload。
 
 下面所有 Smalux 自有控制示例都是解包或解密后的 `ServerFrame` JSON。真正通过 WebSocket 发送时还要按 wire mode 加一层封装：
 
@@ -1536,7 +1569,7 @@ agent 接收并成功调度带 `sequence` 的 server frame 后，会回传控制
 }
 ```
 
-`ack` 只表示控制命令已被 agent 接收并成功调度，不等于后续 snapshot、remote task 或 remote probe 结果已经送达 server。真正的完整快照仍以 `type=snapshot` 的业务 frame 上报；remote task 的执行结果仍以 `type=remote_task_result` 回传；remote probe 的探测结果以 `type=remote_probe_result` 回传。
+`ack` 只表示控制命令已被 agent 接收并成功调度，不等于后续 snapshot、remote task 或 remote job 结果已经送达 server。真正的完整快照仍以 `type=snapshot` 的业务 frame 上报；remote task 的执行结果仍以 `type=remote_task_result` 回传；remote job 的执行结果以 `type=job_result` 回传，当前 probe 探测结果放在 `kind=probe` 分支内。
 
 远程 shell 打开请求：
 
@@ -1637,11 +1670,12 @@ shell stream 上 agent 发给 server 的消息：
   "sequence": 303,
   "sent_at": 1710000202,
   "target_agent_id": "agent-1", // 可选
-  "type": "remote_probe_apply",
+  "type": "job_apply",
   "request": {
     "operation": "once",
     "runs": [
       {
+        "kind": "probe",
         "request_id": 123, // server 生成的探测请求 ID，字符串或数字都可以，结果会原样带回
         "point_id": "point-main-api", // 可选；server 业务探测点 ID，结果会原样带回，推荐批量 ping 时填写
         "probe_type": "tcp", // tcp | http | icmp；icmp 当前返回 status=failed
@@ -1661,12 +1695,13 @@ shell stream 上 agent 发给 server 的消息：
   "sequence": 304,
   "sent_at": 1710000203,
   "target_agent_id": "agent-1", // 可选
-  "type": "remote_probe_apply",
+  "type": "job_apply",
   "request": {
     "operation": "replace",
     "generation": 12, // server 维护的单调递增版本
     "jobs": [
       {
+        "kind": "probe",
         "job_id": "main-api",
         "point_id": "point-main-api",
         "enabled": true,
@@ -1680,7 +1715,7 @@ shell stream 上 agent 发给 server 的消息：
 }
 ```
 
-`smalux_json` 远程探测结果会作为 `smalux_protocol::ClientFrame` 回传：
+`smalux_json` 远程 job 结果会作为 `smalux_protocol::ClientFrame` 回传；当前网络探测结果使用 `kind=probe` 分支：
 
 ```jsonc
 {
@@ -1688,21 +1723,24 @@ shell stream 上 agent 发给 server 的消息：
   "agent_id": "agent-1",
   "sequence": 11,
   "sent_at": 1710000101,
-  "type": "remote_probe_result",
+  "type": "job_result",
   "result": {
-    "run_id": "4c21e6f8-8ef3-4ee5-9c91-8f630f650b92", // agent 为本次探测运行生成的唯一 ID
-    "source": "once", // once | job；once 表示一次性请求，job 表示持续探测任务
-    "point_id": "point-main-api", // server 业务探测点 ID；下发时有就会原样带回
-    "request_id": 123, // source=once 时存在，等于 server 下发 runs[].request_id
-    "job_id": "main-api", // source=job 时存在，等于持续任务 job_id；source=once 时没有
-    "probe_type": "tcp",
-    "target": "example.com:443",
-    "status": "success", // success | failed | rejected
-    "latency_ms": 13, // 成功时存在；failed/rejected 时通常没有
-    "started_at": 1710000100,
-    "finished_at": 1710000101,
-    "duration_ms": 13,
-    "error": "remote probe is disabled" // 可选；失败、禁用、限频或未实现时出现
+    "kind": "probe",
+    "result": {
+      "run_id": "4c21e6f8-8ef3-4ee5-9c91-8f630f650b92", // agent 为本次探测运行生成的唯一 ID
+      "source": "once", // once | job；once 表示一次性请求，job 表示持续探测任务
+      "point_id": "point-main-api", // server 业务探测点 ID；下发时有就会原样带回
+      "request_id": 123, // source=once 时存在，等于 server 下发 runs[].request_id
+      "job_id": "main-api", // source=job 时存在，等于持续任务 job_id；source=once 时没有
+      "probe_type": "tcp",
+      "target": "example.com:443",
+      "status": "success", // success | failed | rejected
+      "latency_ms": 13, // 成功时存在；failed/rejected 时通常没有
+      "started_at": 1710000100,
+      "finished_at": 1710000101,
+      "duration_ms": 13,
+      "error": "remote probe is disabled" // 可选；失败、禁用、限频或未实现时出现
+    }
   }
 }
 ```
@@ -1781,7 +1819,7 @@ Komari ping 结果通过 WebSocket report 通道回传：
     "export": {
       "base_url": "https://example.com",
       "auth_mode": "query",
-      "token": "secret",
+      "token": "REPLACE_WITH_TRANSPORT_TOKEN",
       "query_token_param": "access_token",
       "query": {
         "agent_id": "agent-1",
@@ -1820,7 +1858,7 @@ secure_psk 配置示例：
   "agent_id": "agent-1", // agent 实例 ID，冗余放在 frame 顶层便于 server 快速路由
   "sequence": 1, // agent 侧递增消息序号，用于发现跳号或后续 delta 基准
   "sent_at": 1710000000, // frame 发送时间，Unix 秒
-  "type": "snapshot", // snapshot | delta | heartbeat | ack | error | remote_task_result | remote_probe_result
+  "type": "snapshot", // snapshot | delta | heartbeat | ack | error | remote_task_result | job_result
   "report": {
     // 完整 AgentReport，字段结构见下方
   }
@@ -1876,7 +1914,7 @@ delta 字段语义：
 
 ### Komari 格式
 
-`export.format=komari` 时，周期监控只消费 `OutboundReport::Snapshot`。`delta` 和业务级 `heartbeat` 在配置校验阶段会被拒绝；`remote_task_result` 会映射到 Komari `task/result` HTTP 接口；`remote_probe_result` 会映射到 Komari WebSocket `ping_result`；控制层 `ack/error` 当前不映射到 Komari 格式，会返回空请求列表并跳过发送。
+`export.format=komari` 时，周期监控只消费 `OutboundReport::Snapshot`。`delta` 和业务级 `heartbeat` 在配置校验阶段会被拒绝；`remote_task_result` 会映射到 Komari `task/result` HTTP 接口；`job_result(kind=probe)` 会映射到 Komari WebSocket `ping_result`；控制层 `ack/error` 当前不映射到 Komari 格式，会返回空请求列表并跳过发送。
 
 Komari WebSocket report endpoint。配置 `export.base_url=https://host` 时，agent 会把它派生为下面的实际请求 URL；这个 URL 不是 CLI 或配置文件里直接填写的值：
 
@@ -2230,20 +2268,11 @@ basic info JSON：
 - `processes.value.count`、`sockets.value.tcp`、`sockets.value.udp` 不受 `level` 影响，只要对应采样组启用并完成采样就会上报。
 - `identity.public_ip` 是必填对象，但 `ip`、`source`、`sampled_at`、`verified_at`、`last_attempt_at`、`error` 会按状态和是否有值决定是否出现。
 
-真实上报 loop 已接入导出发送；当前 `smalux_json` adapter 负责编码为 smalux `ClientFrame` JSON bytes，WebSocket transport 负责 binary wire 封包和可选 `secure_psk` 加密，`komari` adapter 负责编码为 Komari report / basic info / task result / ping result。`outbound.realtime_report` 控制 realtime delivery 开关和首次发送策略，发送跟随最新 report 触发；`outbound.basic_info` 控制 reporter 生成 Komari basic info 事件的开关、间隔和首次发送策略。remote task result、remote probe result 和控制层 ack/error 属于即时事件，不受 interval delivery 控制。
+真实上报 loop 已接入导出发送；当前 `smalux_json` adapter 负责编码为 smalux `ClientFrame` JSON bytes，WebSocket transport 负责 binary wire 封包和可选 `secure_psk` 加密，`komari` adapter 负责编码为 Komari report / basic info / task result / ping result。`outbound.realtime_report` 控制 realtime delivery 开关和首次发送策略，发送跟随最新 report 触发；`outbound.basic_info` 控制 reporter 生成 Komari basic info 事件的开关、间隔和首次发送策略。remote task result、remote job result 和控制层 ack/error 属于即时事件，不受 interval delivery 控制。
 
 ## 当前状态
 
-- 采集模型、动态配置、缓存和 service 骨架已经完成。
-- `main.rs` 已接入 CLI、ConfigManager 和 service。
-- 导出层已有 adapter + transport 扩展点，当前 adapter 是 `smalux_json` / `komari`，transport 是 WebSocket / HTTP。
-- WebSocket transport 已能接收 server `ServerFrame` 下发的 `config_patch`、`snapshot_request`、一次性诊断采集、`remote_shell_open`、`remote_task_run` 和 `remote_probe_apply`；`smalux_json` 支持 binary_plain 和 secure_psk 两种 wire 模式。
-- 真实定时上报 loop 已接入导出发送，当前支持 WebSocket 和 HTTP transport，导出 delivery 支持运行时 patch 独立调整。
-- 控制层 `ack/error` 已接入；带 `sequence` 的 Smalux server frame 成功调度后回 `ack`，失败或被拒绝回 `error`。
-- remote shell 已接入 smalux_json 控制通道和临时 WebSocket stream；当前使用 `portable-pty` 提供交互式 PTY。
-- remote task 已接入 smalux_json 控制通道和主出站回传；Komari exec 会复用 remote task，并通过 HTTP task/result 回传；默认关闭，只能 CLI 启用，运行时受并发、超时和输出大小限制。
-- remote probe 已接入 smalux_json 控制通道和主出站回传；Komari ping 会复用 remote probe，并通过 WebSocket ping_result 回传；默认关闭，但可以由 server 动态开启，运行时受本地频率保护。
-- 进程和连接已接入三层采集：默认 `count`，server 远程触发的最高级别由启动参数授权；温度、GPU、电池等功能暂未接入。
+当前 agent 主线已经完整覆盖：采集、动态配置、reporter/export、`smalux_json` 自有协议、Komari 兼容、remote shell、remote task、`job_apply(kind=probe)` 和控制层 `ack/error`。更细的能力列表以文档开头 `当前已完成功能` 为准，完整交互 JSON 以 `数据格式` 和 `Komari 格式` 为准。
 
 ## 常用命令
 

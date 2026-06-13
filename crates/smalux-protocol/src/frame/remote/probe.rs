@@ -1,4 +1,6 @@
 //! 远程网络探测协议模型。
+//!
+//! probe 是通用 `job_apply(kind=probe)` 的首个执行类型。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -117,88 +119,6 @@ impl RemoteProbeType {
             Self::Icmp => "icmp",
         }
     }
-}
-
-/// 远程探测一次性请求。
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoteProbeOnceRequest {
-    /// server 侧生成的请求 ID。
-    #[serde(alias = "task_id")]
-    pub request_id: RemoteProbeId,
-    /// server 侧业务探测点 ID；用于把一次执行结果关联回固定探测点。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_id: Option<RemoteProbeId>,
-    /// 探测类型。
-    pub probe_type: RemoteProbeType,
-    /// 探测目标，TCP 使用 `host:port`，HTTP 使用 URL 或 host。
-    pub target: String,
-    /// 本次请求的超时；缺省时使用 agent 默认值。
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "humantime_serde::option"
-    )]
-    pub timeout: Option<std::time::Duration>,
-}
-
-/// 远程探测持续任务。
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoteProbeJob {
-    /// server 侧生成的任务 ID。
-    pub job_id: String,
-    /// server 侧业务探测点 ID；用于把持续任务结果关联回固定探测点。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub point_id: Option<RemoteProbeId>,
-    /// 是否启用该任务。
-    pub enabled: bool,
-    /// 探测类型。
-    pub probe_type: RemoteProbeType,
-    /// 探测目标，TCP 使用 `host:port`，HTTP 使用 URL 或 host。
-    pub target: String,
-    /// 持续探测间隔。
-    #[serde(with = "humantime_serde")]
-    pub interval: std::time::Duration,
-    /// 本次任务的超时；缺省时使用 agent 默认值。
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "humantime_serde::option"
-    )]
-    pub timeout: Option<std::time::Duration>,
-}
-
-/// 远程探测操作。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteProbeOperation {
-    /// 立即执行一次。
-    Once,
-    /// 整组替换持续任务。
-    Replace,
-    /// 增量更新持续任务。
-    Patch,
-}
-
-/// 远程探测应用请求。
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoteProbeApplyRequest {
-    /// 操作类型。
-    pub operation: RemoteProbeOperation,
-    /// 请求代际，用于 server 乱序保护。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-    /// 一次性探测请求。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runs: Vec<RemoteProbeOnceRequest>,
-    /// 持续任务整组替换列表。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<RemoteProbeJob>,
-    /// 持续任务增量 upsert 列表。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub upsert_jobs: Vec<RemoteProbeJob>,
-    /// 持续任务删除列表。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remove_job_ids: Vec<String>,
 }
 
 /// 远程探测结果来源。

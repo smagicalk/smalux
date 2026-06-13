@@ -64,8 +64,8 @@ pub(crate) enum ExportDeliveryId {
     BasicInfo,
     /// 远程任务结果即时回传。
     RemoteTaskResult,
-    /// 远程网络探测结果即时回传。
-    RemoteProbeResult,
+    /// 通用远程 job 结果即时回传。
+    JobResult,
     /// 控制命令确认即时回传。
     ControlAck,
     /// 控制命令错误即时回传。
@@ -79,7 +79,7 @@ impl ExportDeliveryId {
             Self::RealtimeReport => "realtime_report",
             Self::BasicInfo => "basic_info",
             Self::RemoteTaskResult => "remote_task_result",
-            Self::RemoteProbeResult => "remote_probe_result",
+            Self::JobResult => "job_result",
             Self::ControlAck => "control_ack",
             Self::ControlError => "control_error",
         }
@@ -237,7 +237,7 @@ fn apply_matching_outbound_config(
             true
         }
         ExportDeliveryId::RemoteTaskResult
-        | ExportDeliveryId::RemoteProbeResult
+        | ExportDeliveryId::JobResult
         | ExportDeliveryId::ControlAck
         | ExportDeliveryId::ControlError => true,
     }

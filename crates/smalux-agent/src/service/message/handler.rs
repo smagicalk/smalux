@@ -96,7 +96,7 @@ impl SmaluxControlHandler {
                 let request: RemoteTaskRunRequest = request.into();
                 InboundCommand::RemoteTaskRun { request }
             }
-            ServerPayload::RemoteProbeApply { request } => InboundCommand::RemoteProbeApply {
+            ServerPayload::JobApply { request } => InboundCommand::RemoteJobApply {
                 request: request.try_into()?,
             },
             ServerPayload::RemoteShellOpen { request } => InboundCommand::RemoteShellOpen {
@@ -212,28 +212,6 @@ mod tests {
                 "type": "remote_shell_open",
                 "session_id": "shell-raw",
                 "stream_url": "ws://127.0.0.1:1/shell"
-            }"#,
-            )
-            .unwrap();
-
-        assert!(decoded.is_none());
-    }
-
-    /// 验证 raw remote_probe_apply 会被丢弃，不再作为自有协议入口。
-    #[test]
-    fn decode_message_drops_raw_remote_probe_apply() {
-        let decoded = handler("agent-1")
-            .decode_message(
-                r#"{
-                "type": "remote_probe_apply",
-                "operation": "once",
-                "runs": [
-                    {
-                        "request_id": "probe-raw",
-                        "probe_type": "tcp",
-                        "target": "127.0.0.1:80"
-                    }
-                ]
             }"#,
             )
             .unwrap();

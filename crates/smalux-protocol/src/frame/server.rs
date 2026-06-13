@@ -1,7 +1,7 @@
 //! server 发往 agent 的 frame。
 
 use super::{
-    Ack, MetricCollectionRequest, ProtocolError, RemoteProbeApplyRequest, RemoteShellOpenRequest,
+    Ack, MetricCollectionRequest, ProtocolError, RemoteJobApplyRequest, RemoteShellOpenRequest,
     RemoteTaskRequest, SMALUX_PROTOCOL_VERSION, SnapshotRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -84,17 +84,9 @@ impl ServerFrame {
         )
     }
 
-    /// 构造远程网络探测应用请求 frame。
-    pub fn remote_probe_apply(
-        sequence: u64,
-        sent_at: u64,
-        request: RemoteProbeApplyRequest,
-    ) -> Self {
-        Self::new(
-            sequence,
-            sent_at,
-            ServerPayload::RemoteProbeApply { request },
-        )
+    /// 构造通用远程 job 应用请求 frame。
+    pub fn job_apply(sequence: u64, sent_at: u64, request: RemoteJobApplyRequest) -> Self {
+        Self::new(sequence, sent_at, ServerPayload::JobApply { request })
     }
 
     /// 构造远程 shell 打开请求 frame。
@@ -163,13 +155,12 @@ pub enum ServerPayload {
         /// 远程任务请求。
         request: RemoteTaskRequest,
     },
-    /// 请求 agent 执行一次或一组远程网络探测变更。
+    /// 请求 agent 应用通用远程 job。
     ///
-    /// 该命令有协议级 sequence，因此 agent 调度成功会先回 `ack`。`once` 会在真实探测
-    /// 完成后回 `remote_probe_result`；持续任务 `replace/patch` 只更新本地调度状态。
-    RemoteProbeApply {
-        /// 探测应用请求。
-        request: RemoteProbeApplyRequest,
+    /// `once` 会在真实执行完成后回 `job_result`；`replace/patch` 只更新本地 job 调度状态。
+    JobApply {
+        /// job 应用请求。
+        request: RemoteJobApplyRequest,
     },
     /// 请求 agent 打开一个交互式远程 shell stream。
     ///

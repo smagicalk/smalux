@@ -48,8 +48,7 @@ mod tests {
     use super::*;
     use crate::config::model::{ExportConfig, ExportFormat};
     use crate::service::outbound::{
-        ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
-        RemoteTaskResultEnvelope,
+        ControlAckEnvelope, ControlErrorEnvelope, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
     };
     use base64::Engine;
     use smalux_core::model::info::AgentReport;
@@ -220,15 +219,15 @@ mod tests {
         ));
     }
 
-    /// 验证 smalux_json adapter 会输出远程探测结果。
+    /// 验证 smalux_json adapter 会输出通用远程 job 结果。
     #[test]
-    fn smalux_json_adapter_outputs_remote_probe_result() {
+    fn smalux_json_adapter_outputs_remote_job_result() {
         let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
-        let result = RemoteProbeResultEnvelope {
+        let result = RemoteJobResultEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 12,
             created_at: 100,
-            result: smalux_protocol::RemoteProbeResult {
+            result: smalux_protocol::RemoteJobResult::probe(smalux_protocol::RemoteProbeResult {
                 run_id: "probe-run-1".to_string(),
                 source: smalux_protocol::RemoteProbeResultSource::Once,
                 point_id: Some(smalux_protocol::RemoteProbeId::from("point-7")),
@@ -242,10 +241,10 @@ mod tests {
                 finished_at: 100,
                 duration_ms: 13,
                 error: None,
-            },
+            }),
         };
 
-        let requests = adapter.encode_remote_probe_result(&result).unwrap();
+        let requests = adapter.encode_remote_job_result(&result).unwrap();
 
         let [TransportRequest::WebSocketBinary { sequence, body, .. }] = requests.as_slice() else {
             panic!("expected smalux_json websocket binary request");
@@ -254,7 +253,10 @@ mod tests {
 
         assert_eq!(*sequence, 12);
         match decoded.payload {
-            ClientPayload::RemoteProbeResult { result } => {
+            ClientPayload::JobResult { result } => {
+                let Some(result) = result.as_probe() else {
+                    panic!("expected probe job result");
+                };
                 assert_eq!(result.run_id, "probe-run-1");
                 assert_eq!(
                     result.point_id,
@@ -270,7 +272,7 @@ mod tests {
                 );
                 assert_eq!(result.latency_ms, Some(13));
             }
-            _ => panic!("expected remote probe result payload"),
+            _ => panic!("expected remote job result payload"),
         }
     }
 

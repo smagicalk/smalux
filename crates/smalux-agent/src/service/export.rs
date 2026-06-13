@@ -7,7 +7,7 @@ mod pipeline;
 use super::inbound::InboundCommandSender;
 use super::outbound::{
     ControlAckEnvelope, ControlErrorEnvelope, OutboundEvent, OutboundReceiver,
-    RemoteProbeResultEnvelope, RemoteTaskResultEnvelope, ReportEnvelope,
+    RemoteJobResultEnvelope, RemoteTaskResultEnvelope, ReportEnvelope,
 };
 use crate::config::ConfigManager;
 use delivery::{
@@ -16,7 +16,7 @@ use delivery::{
 };
 use pending::{
     PendingResumeEvents, handle_transport_event, queue_basic_info, queue_control_ack,
-    queue_control_error, queue_remote_probe_result, queue_remote_task_result, send_resume_events,
+    queue_control_error, queue_remote_job_result, queue_remote_task_result, send_resume_events,
 };
 use pipeline::{
     ConnectedExportPipeline, close_transport_hub, connect_export_pipeline, rebuild_delivery_states,
@@ -234,25 +234,23 @@ pub(crate) async fn export_supervisor(
                             }
                         }
                     }
-                    OutboundEvent::RemoteProbeResult(result) => {
+                    OutboundEvent::RemoteJobResult(result) => {
                         tracing::debug!(
                             sequence = result.sequence,
-                            probe_id = %result.result.display_id(),
-                            probe_type = result.result.probe_type.as_str(),
-                            status = ?result.result.status,
-                            latency_ms = result.result.latency_ms,
-                            "remote probe result export requested"
+                            job_id = %result.result.display_id(),
+                            job_kind = result.result.kind().as_str(),
+                            "remote job result export requested"
                         );
-                        if let Err(err) = queue_remote_probe_result(
+                        if let Err(err) = queue_remote_job_result(
                             &mut pipeline.transport_hub,
                             &mut pipeline.router,
-                            &mut pending_events.remote_probe_results,
+                            &mut pending_events.remote_job_results,
                             result.clone(),
                         ).await {
                             tracing::warn!(
                                 error = ?err,
                                 reconnect_interval_ms = pipeline.export_config.reconnect_interval.as_millis(),
-                                "remote probe result export failed; reconnecting"
+                                "remote job result export failed; reconnecting"
                             );
                             let reconnect_interval = pipeline.export_config.reconnect_interval;
                             reconnect_pipeline_and_resume(
@@ -262,15 +260,15 @@ pub(crate) async fn export_supervisor(
                                 reconnect_interval,
                                 latest_report.as_ref(),
                                 &mut pending_events,
-                                "remote probe result",
+                                "remote job result",
                             ).await?;
-                            if let Err(err) = queue_remote_probe_result(
+                            if let Err(err) = queue_remote_job_result(
                                 &mut pipeline.transport_hub,
                                 &mut pipeline.router,
-                                &mut pending_events.remote_probe_results,
+                                &mut pending_events.remote_job_results,
                                 result,
                             ).await {
-                                tracing::warn!(error = ?err, "remote probe result export failed after reconnect");
+                                tracing::warn!(error = ?err, "remote job result export failed after reconnect");
                             }
                         }
                     }
@@ -298,7 +296,7 @@ pub(crate) async fn export_supervisor(
                     event,
                     &mut pipeline.deliveries,
                     &mut pending_events.remote_task_results,
-                    &mut pending_events.remote_probe_results,
+                    &mut pending_events.remote_job_results,
                     &mut pending_events.control_acks,
                     &mut pending_events.control_errors,
                 ) {
@@ -321,7 +319,7 @@ pub(crate) async fn export_supervisor(
                 tracing::debug!(
                     pending_total = pending_events.total_len(),
                     pending_remote_task_results = pending_events.remote_task_results.len(),
-                    pending_remote_probe_results = pending_events.remote_probe_results.len(),
+                    pending_remote_job_results = pending_events.remote_job_results.len(),
                     pending_control_acks = pending_events.control_acks.len(),
                     pending_control_errors = pending_events.control_errors.len(),
                     "export transport event handled"
@@ -427,8 +425,8 @@ pub(crate) async fn export_supervisor(
 struct PendingExportEvents {
     /// 等待确认的远程任务结果。
     remote_task_results: BTreeMap<u64, RemoteTaskResultEnvelope>,
-    /// 等待确认的远程探测结果。
-    remote_probe_results: BTreeMap<u64, RemoteProbeResultEnvelope>,
+    /// 等待确认的通用远程 job 结果。
+    remote_job_results: BTreeMap<u64, RemoteJobResultEnvelope>,
     /// 等待确认的控制命令确认。
     control_acks: BTreeMap<u64, ControlAckEnvelope>,
     /// 等待确认的控制命令错误。
@@ -445,7 +443,7 @@ impl PendingExportEvents {
     fn resume_events(&mut self) -> PendingResumeEvents<'_> {
         PendingResumeEvents {
             remote_task_results: &mut self.remote_task_results,
-            remote_probe_results: &mut self.remote_probe_results,
+            remote_job_results: &mut self.remote_job_results,
             control_acks: &mut self.control_acks,
             control_errors: &mut self.control_errors,
         }
@@ -454,7 +452,7 @@ impl PendingExportEvents {
     /// 返回所有 pending 即时事件数量。
     fn total_len(&self) -> usize {
         self.remote_task_results.len()
-            + self.remote_probe_results.len()
+            + self.remote_job_results.len()
             + self.control_acks.len()
             + self.control_errors.len()
     }
@@ -536,7 +534,7 @@ mod tests {
     };
     use crate::service::export::delivery::DeliveryState;
     use crate::service::outbound::{
-        ControlAckEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
+        ControlAckEnvelope, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
     };
     use std::collections::BTreeMap;
 
@@ -656,37 +654,39 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    /// 验证远程探测结果确认发送后会从待确认缓存移除。
+    /// 验证通用远程 job 结果确认发送后会从待确认缓存移除。
     #[test]
-    fn remote_probe_sent_event_removes_pending_result() {
+    fn remote_job_sent_event_removes_pending_result() {
         let mut pending = BTreeMap::from([(
             11,
-            RemoteProbeResultEnvelope {
+            RemoteJobResultEnvelope {
                 agent_id: "agent-1".to_string(),
                 sequence: 11,
                 created_at: 100,
-                result: smalux_protocol::RemoteProbeResult {
-                    run_id: "probe-run-1".to_string(),
-                    source: smalux_protocol::RemoteProbeResultSource::Once,
-                    point_id: Some(smalux_protocol::RemoteProbeId::from("point-7")),
-                    request_id: Some(smalux_protocol::RemoteProbeId::from(7)),
-                    job_id: None,
-                    probe_type: smalux_protocol::RemoteProbeType::Tcp,
-                    target: "example.com:443".to_string(),
-                    status: smalux_protocol::RemoteProbeResultStatus::Success,
-                    latency_ms: Some(12),
-                    started_at: 99,
-                    finished_at: 100,
-                    duration_ms: 12,
-                    error: None,
-                },
+                result: smalux_protocol::RemoteJobResult::probe(
+                    smalux_protocol::RemoteProbeResult {
+                        run_id: "probe-run-1".to_string(),
+                        source: smalux_protocol::RemoteProbeResultSource::Once,
+                        point_id: Some(smalux_protocol::RemoteProbeId::from("point-7")),
+                        request_id: Some(smalux_protocol::RemoteProbeId::from(7)),
+                        job_id: None,
+                        probe_type: smalux_protocol::RemoteProbeType::Tcp,
+                        target: "example.com:443".to_string(),
+                        status: smalux_protocol::RemoteProbeResultStatus::Success,
+                        latency_ms: Some(12),
+                        started_at: 99,
+                        finished_at: 100,
+                        duration_ms: 12,
+                        error: None,
+                    },
+                ),
             },
         )]);
 
         handle_transport_event(
             TransportEvent::Sent {
                 transport: TransportId::RealtimeReport,
-                delivery: ExportDeliveryId::RemoteProbeResult,
+                delivery: ExportDeliveryId::JobResult,
                 sequence: 11,
             },
             &mut [],

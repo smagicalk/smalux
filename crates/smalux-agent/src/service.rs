@@ -13,7 +13,7 @@ mod reporter;
 use crate::collect::LocalCollector;
 use crate::config::ConfigManager;
 use bootstrap::{bootstrap_once, public_ip_required_for_first_report, retry_identity_until_ready};
-use collector::public_ip::public_ip_refresh_loop;
+use collector::identity::identity_refresh_loop;
 use collector::{collector_command_channel, collector_loop};
 use export::export_supervisor;
 use message::inbound::{ControlDispatcher, ControlDispatcherParts, inbound_command_loop};
@@ -31,8 +31,8 @@ pub(crate) use message::inbound::{
 };
 pub(crate) use message::outbound;
 pub(crate) use options::{RemoteMetricPermission, ServiceOptions};
-pub(crate) use remote::probe;
-pub(crate) use remote::probe::{RemoteProbeApply, RemoteProbeExecutionRequest, display_probe_id};
+pub(crate) use remote::job::{RemoteJobApply, RemoteJobManager};
+pub(crate) use remote::probe::{RemoteProbeExecutionRequest, display_probe_id};
 pub(crate) use remote::shell;
 pub(crate) use remote::shell::RemoteShellOpenRequest;
 pub(crate) use remote::task;
@@ -93,13 +93,14 @@ pub(crate) async fn run(
         outbound_tx.clone(),
         outbound_sequence.clone(),
     );
+    let remote_job_manager = RemoteJobManager::new(remote_probe_manager.clone());
     let (inbound_command_tx, inbound_command_rx) = inbound_command_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let control_dispatcher = ControlDispatcher::new(ControlDispatcherParts {
         config_manager: config_manager.clone(),
         remote_shell: remote_shell_manager.clone(),
         remote_task: remote_task_manager,
-        remote_probe: remote_probe_manager,
+        remote_job: remote_job_manager,
         collector_commands: collector_command_tx.clone(),
         reporter_commands: reporter_command_tx,
         outbound_tx: outbound_tx.clone(),
@@ -139,7 +140,7 @@ pub(crate) async fn run(
         collector_command_rx,
         shutdown_rx.clone(),
     ));
-    let public_ip_refresh_task = tokio::spawn(public_ip_refresh_loop(
+    let identity_refresh_task = tokio::spawn(identity_refresh_loop(
         LocalCollector::new(),
         telemetry_tx,
         config_manager.subscribe(),
@@ -164,9 +165,9 @@ pub(crate) async fn run(
             tracing::warn!("collector loop stopped");
             Ok(())
         }
-        result = public_ip_refresh_task => {
-            result.map_err(|err| anyhow::anyhow!("public IP refresh task failed: {err}"))?;
-            tracing::warn!("public IP refresh loop stopped");
+        result = identity_refresh_task => {
+            result.map_err(|err| anyhow::anyhow!("identity refresh task failed: {err}"))?;
+            tracing::warn!("identity refresh loop stopped");
             Ok(())
         }
         result = reporter_task => {
@@ -195,11 +196,11 @@ mod tests {
     };
     use super::message::{TelemetryUpdateSender, telemetry_update_channel};
     use super::outbound::{
-        OutboundEvent, OutboundSequence, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
+        OutboundEvent, OutboundSequence, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
         outbound_channel,
     };
     use super::reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
-    use super::{RemoteMetricPermission, ServiceOptions};
+    use super::{RemoteJobManager, RemoteMetricPermission, RemoteProbeManager, ServiceOptions};
     use crate::collect::{CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample};
     use crate::config::model::{ExportAuthMode, ExportFormat};
     use crate::service::collector::{CollectorCommand, collector_command_channel};
@@ -220,11 +221,28 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, watch};
-    use tokio::task::JoinHandle;
+    use tokio::task::{JoinHandle, JoinSet};
     use tokio_tungstenite::tungstenite::protocol::Message;
 
     /// 测试用接收超时时间。
     const TEST_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Komari mock 同时等待 WebSocket report 和 HTTP basic info 两条连接。
+    const KOMARI_MOCK_EXPECTED_CONNECTIONS: usize = 2;
+    /// Komari mock HTTP 成功响应。
+    const KOMARI_HTTP_OK_RESPONSE: &[u8] =
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK";
+    /// Komari mock HTTP 失败响应。
+    const KOMARI_HTTP_FAILURE_RESPONSE: &[u8] =
+        b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\nFAIL";
+
+    /// Komari mock 接收到的连接类型。
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum KomariMockConnectionKind {
+        /// WebSocket 实时 report 连接。
+        WebSocket,
+        /// HTTP JSON basic info 请求。
+        HttpJson,
+    }
 
     /// service 级 agent 测试句柄。
     struct ServiceHarness {
@@ -353,14 +371,9 @@ mod tests {
         let (http_tx, http_rx) = mpsc::channel(16);
 
         let task = tokio::spawn(async move {
-            let (http_stream, _) = listener.accept().await.unwrap();
-            let capture = read_http_json_request(http_stream).await.unwrap();
-            http_tx.send(capture).await.unwrap();
-
-            let (ws_stream, _) = listener.accept().await.unwrap();
-            let ws_task = tokio::spawn(handle_komari_ws_connection(ws_stream, ws_tx));
-
-            let _ = ws_task.await;
+            accept_komari_mock_connections(listener, ws_tx, http_tx, KOMARI_HTTP_OK_RESPONSE)
+                .await
+                .unwrap();
         });
 
         (url, ws_rx, http_rx, task)
@@ -379,19 +392,9 @@ mod tests {
         let (http_tx, http_rx) = mpsc::channel(16);
 
         let task = tokio::spawn(async move {
-            let (http_stream, _) = listener.accept().await.unwrap();
-            let capture = read_http_json_request_with_response(
-                http_stream,
-                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\nFAIL",
-            )
-            .await
-            .unwrap();
-            http_tx.send(capture).await.unwrap();
-
-            let (ws_stream, _) = listener.accept().await.unwrap();
-            let ws_task = tokio::spawn(handle_komari_ws_connection(ws_stream, ws_tx));
-
-            let _ = ws_task.await;
+            accept_komari_mock_connections(listener, ws_tx, http_tx, KOMARI_HTTP_FAILURE_RESPONSE)
+                .await
+                .unwrap();
         });
 
         (url, ws_rx, http_rx, task)
@@ -411,6 +414,79 @@ mod tests {
         });
 
         (url, http_rx, task)
+    }
+
+    /// 接收 Komari mock 的 HTTP 和 WebSocket 连接。
+    ///
+    /// export supervisor 会并发启动 Komari WebSocket report 和 HTTP basic info，测试服务端
+    /// 不能假设哪一个连接先到；这里按请求方法把连接分发到对应 mock 处理器。
+    async fn accept_komari_mock_connections(
+        listener: TcpListener,
+        ws_tx: mpsc::Sender<String>,
+        http_tx: mpsc::Sender<HttpCapture>,
+        http_response: &'static [u8],
+    ) -> anyhow::Result<()> {
+        let mut handlers = JoinSet::new();
+
+        for _ in 0..KOMARI_MOCK_EXPECTED_CONNECTIONS {
+            let (stream, _) = listener.accept().await?;
+            let ws_tx = ws_tx.clone();
+            let http_tx = http_tx.clone();
+            handlers.spawn(async move {
+                route_komari_mock_connection(stream, ws_tx, http_tx, http_response).await
+            });
+        }
+
+        while let Some(result) = handlers.join_next().await {
+            result??;
+        }
+
+        Ok(())
+    }
+
+    /// 按请求开头区分 Komari WebSocket handshake 和 HTTP JSON 请求。
+    async fn route_komari_mock_connection(
+        stream: TcpStream,
+        ws_tx: mpsc::Sender<String>,
+        http_tx: mpsc::Sender<HttpCapture>,
+        http_response: &'static [u8],
+    ) -> anyhow::Result<()> {
+        match detect_komari_mock_connection_kind(&stream).await? {
+            KomariMockConnectionKind::WebSocket => {
+                handle_komari_ws_connection(stream, ws_tx).await;
+            }
+            KomariMockConnectionKind::HttpJson => {
+                let capture = read_http_json_request_with_response(stream, http_response).await?;
+                http_tx.send(capture).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 按请求首字节识别 Komari mock 连接类型。
+    async fn detect_komari_mock_connection_kind(
+        stream: &TcpStream,
+    ) -> anyhow::Result<KomariMockConnectionKind> {
+        match peek_komari_request_start(stream).await? {
+            b'G' => Ok(KomariMockConnectionKind::WebSocket),
+            b'P' => Ok(KomariMockConnectionKind::HttpJson),
+            request_start => anyhow::bail!(
+                "unsupported komari mock request start: {}",
+                char::from(request_start)
+            ),
+        }
+    }
+
+    /// 查看请求首字节但不消费数据，避免破坏 WebSocket handshake。
+    async fn peek_komari_request_start(stream: &TcpStream) -> anyhow::Result<u8> {
+        let mut prefix = [0_u8; 1];
+        let read = stream.peek(&mut prefix).await?;
+        if read == 0 {
+            anyhow::bail!("komari mock connection closed before request started");
+        }
+
+        Ok(prefix[0])
     }
 
     /// 处理 Komari WebSocket report 连接。
@@ -436,11 +512,7 @@ mod tests {
 
     /// 读取一个 HTTP JSON 请求并返回 200。
     async fn read_http_json_request(stream: TcpStream) -> anyhow::Result<HttpCapture> {
-        read_http_json_request_with_response(
-            stream,
-            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK",
-        )
-        .await
+        read_http_json_request_with_response(stream, KOMARI_HTTP_OK_RESPONSE).await
     }
 
     /// 读取一个 HTTP JSON 请求并返回指定响应。
@@ -578,8 +650,8 @@ mod tests {
         manager: crate::config::ConfigManager,
         outbound_tx: super::outbound::OutboundSender,
         sequence: OutboundSequence,
-    ) -> super::probe::RemoteProbeManager {
-        super::probe::RemoteProbeManager::new(manager, outbound_tx, sequence)
+    ) -> RemoteProbeManager {
+        RemoteProbeManager::new(manager, outbound_tx, sequence)
     }
 
     /// 控制消息测试夹具。
@@ -631,7 +703,7 @@ mod tests {
             config_manager: manager.clone(),
             remote_shell: disabled_remote_shell_manager(),
             remote_task: remote_task_manager,
-            remote_probe: remote_probe_manager,
+            remote_job: RemoteJobManager::new(remote_probe_manager),
             collector_commands,
             reporter_commands,
             outbound_tx,
@@ -666,7 +738,7 @@ mod tests {
             config_manager: manager.clone(),
             remote_shell: disabled_remote_shell_manager(),
             remote_task: remote_task_manager,
-            remote_probe: remote_probe_manager,
+            remote_job: RemoteJobManager::new(remote_probe_manager),
             collector_commands,
             reporter_commands,
             outbound_tx,
@@ -952,9 +1024,9 @@ mod tests {
         assert_eq!(capture.body["exit_code"], 0);
     }
 
-    /// 验证 Komari 模式会把 remote probe result 发送为 WebSocket ping_result。
+    /// 验证 Komari 模式会把 probe job result 发送为 WebSocket ping_result。
     #[tokio::test]
-    async fn service_export_sends_komari_remote_probe_result() {
+    async fn service_export_sends_komari_probe_job_result() {
         let (base_url, mut ws_rx, server_task) = spawn_collecting_ws_server().await;
         let config = crate::config::AgentConfig {
             agent_id: "agent-service".to_string(),
@@ -977,12 +1049,12 @@ mod tests {
         ));
 
         outbound_tx
-            .send(OutboundEvent::RemoteProbeResult(
-                RemoteProbeResultEnvelope {
-                    agent_id: "agent-service".to_string(),
-                    sequence: 1,
-                    created_at: 100,
-                    result: smalux_protocol::RemoteProbeResult {
+            .send(OutboundEvent::RemoteJobResult(RemoteJobResultEnvelope {
+                agent_id: "agent-service".to_string(),
+                sequence: 1,
+                created_at: 100,
+                result: smalux_protocol::RemoteJobResult::probe(
+                    smalux_protocol::RemoteProbeResult {
                         run_id: "probe-run-1".to_string(),
                         source: smalux_protocol::RemoteProbeResultSource::Once,
                         point_id: Some(smalux_protocol::RemoteProbeId::from("point-123")),
@@ -997,8 +1069,8 @@ mod tests {
                         duration_ms: 13,
                         error: None,
                     },
-                },
-            ))
+                ),
+            }))
             .await
             .unwrap();
 
@@ -1457,11 +1529,11 @@ mod tests {
                 outbound_tx.clone(),
                 sequence.clone(),
             ),
-            remote_probe: make_remote_probe_manager(
+            remote_job: RemoteJobManager::new(make_remote_probe_manager(
                 manager.clone(),
                 outbound_tx.clone(),
                 sequence.clone(),
-            ),
+            )),
             collector_commands,
             reporter_commands,
             outbound_tx,
@@ -1525,20 +1597,20 @@ mod tests {
         );
     }
 
-    /// 验证远程探测默认关闭时不会发包，只回传 value=-1。
+    /// 验证 probe job 默认关闭时不会发包，只回传 rejected 结果。
     #[tokio::test]
-    async fn smalux_control_handler_rejects_remote_probe_when_disabled() {
+    async fn smalux_control_handler_rejects_probe_job_when_disabled() {
         let manager =
             crate::config::ConfigManager::new(crate::config::AgentConfig::default()).unwrap();
         let mut harness = service_control_harness(manager);
 
-        let message = encode_server_frame(&ServerFrame::remote_probe_apply(
+        let message = encode_server_frame(&ServerFrame::job_apply(
             92,
             100,
-            smalux_protocol::RemoteProbeApplyRequest {
-                operation: smalux_protocol::RemoteProbeOperation::Once,
+            smalux_protocol::RemoteJobApplyRequest {
+                operation: smalux_protocol::RemoteJobOperation::Once,
                 generation: None,
-                runs: vec![smalux_protocol::RemoteProbeOnceRequest {
+                runs: vec![smalux_protocol::RemoteJobRunRequest::Probe {
                     request_id: smalux_protocol::RemoteProbeId::from(123),
                     point_id: Some(smalux_protocol::RemoteProbeId::from("point-123")),
                     probe_type: RemoteProbeType::Tcp,
@@ -1555,24 +1627,27 @@ mod tests {
         harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::RemoteProbeResult(result) = event else {
-            panic!("expected remote probe result");
+        let OutboundEvent::RemoteJobResult(result) = event else {
+            panic!("expected remote job result");
+        };
+        let Some(result) = result.result.as_probe() else {
+            panic!("expected probe job result");
         };
 
         assert_eq!(
-            result.result.point_id,
+            result.point_id,
             Some(smalux_protocol::RemoteProbeId::from("point-123"))
         );
         assert_eq!(
-            result.result.request_id,
+            result.request_id,
             Some(smalux_protocol::RemoteProbeId::from(123))
         );
         assert_eq!(
-            result.result.status,
+            result.status,
             smalux_protocol::RemoteProbeResultStatus::Rejected
         );
-        assert_eq!(result.result.latency_ms, None);
-        assert!(result.result.error.as_deref().unwrap().contains("disabled"));
+        assert_eq!(result.latency_ms, None);
+        assert!(result.error.as_deref().unwrap().contains("disabled"));
     }
 
     /// 验证过小采样间隔会被动态配置校验拒绝。

@@ -5,7 +5,7 @@
 
 use crate::collect::unix_timestamp_secs;
 use smalux_core::model::info::AgentReport;
-use smalux_protocol::{Ack, OutboundReport, ProtocolError, RemoteProbeResult, RemoteTaskResult};
+use smalux_protocol::{Ack, OutboundReport, ProtocolError, RemoteJobResult, RemoteTaskResult};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -262,22 +262,22 @@ impl RemoteTaskResultEnvelope {
     }
 }
 
-/// 待导出的远程探测结果。
+/// 待导出的通用远程 job 结果。
 #[derive(Debug, Clone)]
-pub(crate) struct RemoteProbeResultEnvelope {
+pub(crate) struct RemoteJobResultEnvelope {
     /// agent 实例 ID。
     pub(crate) agent_id: String,
     /// 出站 frame 序号。
     pub(crate) sequence: u64,
     /// 结果生成时间，Unix 时间戳，单位秒。
     pub(crate) created_at: u64,
-    /// 探测执行结果。
-    pub(crate) result: RemoteProbeResult,
+    /// job 执行结果。
+    pub(crate) result: RemoteJobResult,
 }
 
-impl RemoteProbeResultEnvelope {
-    /// 创建远程探测结果 envelope。
-    pub(crate) fn new(agent_id: String, sequence: u64, result: RemoteProbeResult) -> Self {
+impl RemoteJobResultEnvelope {
+    /// 创建通用远程 job 结果 envelope。
+    pub(crate) fn new(agent_id: String, sequence: u64, result: RemoteJobResult) -> Self {
         Self {
             agent_id,
             sequence,
@@ -350,8 +350,8 @@ pub(crate) enum OutboundEvent {
     ControlError(ControlErrorEnvelope),
     /// 远程任务执行结果。
     RemoteTaskResult(RemoteTaskResultEnvelope),
-    /// 远程网络探测结果。
-    RemoteProbeResult(RemoteProbeResultEnvelope),
+    /// 通用远程 job 执行结果。
+    RemoteJobResult(RemoteJobResultEnvelope),
 }
 
 impl OutboundEvent {
@@ -362,7 +362,7 @@ impl OutboundEvent {
             Self::ControlAck(_)
                 | Self::ControlError(_)
                 | Self::RemoteTaskResult(_)
-                | Self::RemoteProbeResult(_)
+                | Self::RemoteJobResult(_)
         )
     }
 
@@ -374,7 +374,7 @@ impl OutboundEvent {
             Self::ControlAck(ack) => ack.sequence,
             Self::ControlError(error) => error.sequence,
             Self::RemoteTaskResult(result) => result.sequence,
-            Self::RemoteProbeResult(result) => result.sequence,
+            Self::RemoteJobResult(result) => result.sequence,
         }
     }
 
@@ -386,7 +386,7 @@ impl OutboundEvent {
             Self::ControlAck(ack) => ack.created_at,
             Self::ControlError(error) => error.created_at,
             Self::RemoteTaskResult(result) => result.created_at,
-            Self::RemoteProbeResult(result) => result.created_at,
+            Self::RemoteJobResult(result) => result.created_at,
         }
     }
 
@@ -398,7 +398,7 @@ impl OutboundEvent {
             Self::ControlAck(_ack) => "control_ack",
             Self::ControlError(_error) => "control_error",
             Self::RemoteTaskResult(_result) => "remote_task_result",
-            Self::RemoteProbeResult(_result) => "remote_probe_result",
+            Self::RemoteJobResult(_result) => "job_result",
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::export::{
     InboundProtocolHandler, TransportInboundMessage, inbound_message_into_string, komari::terminal,
 };
 use crate::service::{
-    InboundCommand, InboundCommandEnvelope, InboundCommandSender, RemoteProbeApply,
+    InboundCommand, InboundCommandEnvelope, InboundCommandSender, RemoteJobApply,
     RemoteProbeExecutionRequest, RemoteShellOpenRequest, RemoteTaskRunRequest, display_probe_id,
 };
 use serde::Deserialize;
@@ -104,8 +104,8 @@ impl InboundProtocolHandler for KomariInboundHandler {
                 let target = event.ping_target.clone();
                 commands
                     .send(InboundCommandEnvelope::without_response(
-                        InboundCommand::RemoteProbeApply {
-                            request: RemoteProbeApply::Once {
+                        InboundCommand::RemoteJobApply {
+                            request: RemoteJobApply::Once {
                                 runs: vec![event.into_remote_probe_request()],
                             },
                         },
@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    /// 验证 ping 消息会转换为内部远程探测命令。
+    /// 验证 ping 消息会转换为内部通用 job 命令。
     #[tokio::test]
     async fn inbound_handler_enqueues_ping_command() {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
@@ -434,11 +434,11 @@ mod tests {
             .unwrap();
 
         let command = command_rx.try_recv().unwrap().command;
-        let InboundCommand::RemoteProbeApply { request } = command else {
-            panic!("expected remote probe apply command");
+        let InboundCommand::RemoteJobApply { request } = command else {
+            panic!("expected remote job apply command");
         };
-        let RemoteProbeApply::Once { runs } = request else {
-            panic!("expected remote probe once command");
+        let RemoteJobApply::Once { runs } = request else {
+            panic!("expected remote job once command");
         };
         let request = runs.into_iter().next().unwrap();
 

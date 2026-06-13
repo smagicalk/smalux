@@ -49,7 +49,7 @@ use crate::config::ConfigManager;
 use crate::config::model::ExportConfig;
 use crate::service::InboundCommandSender;
 use crate::service::outbound::{
-    BasicInfoEnvelope, RemoteProbeResultEnvelope, RemoteTaskResultEnvelope,
+    BasicInfoEnvelope, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
 };
 use model::{BasicInfo, PingResult, Report, TaskResult};
 use smalux_protocol::{OutboundReport, OutboundReportKind};
@@ -142,7 +142,7 @@ impl ProtocolAdapter for KomariProtocolAdapter {
             }
             ExportDeliveryId::BasicInfo => Ok(vec![]),
             ExportDeliveryId::RemoteTaskResult
-            | ExportDeliveryId::RemoteProbeResult
+            | ExportDeliveryId::JobResult
             | ExportDeliveryId::ControlAck
             | ExportDeliveryId::ControlError => Ok(vec![]),
         }
@@ -202,19 +202,27 @@ impl ProtocolAdapter for KomariProtocolAdapter {
         }])
     }
 
-    /// 将内部 remote probe result 映射为 Komari WebSocket ping_result。
-    fn encode_remote_probe_result(
+    /// 将内部 job result 映射为 Komari 兼容结果。
+    fn encode_remote_job_result(
         &mut self,
-        result: &RemoteProbeResultEnvelope,
+        result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let body = serde_json::to_string(&PingResult::from_remote_probe_result(&result.result))?;
+        let Some(probe_result) = result.result.as_probe() else {
+            tracing::debug!(
+                sequence = result.sequence,
+                job_kind = result.result.kind().as_str(),
+                "komari skipped unsupported job result"
+            );
+            return Ok(vec![]);
+        };
+        let body = serde_json::to_string(&PingResult::from_probe_job_result(probe_result))?;
         tracing::info!(
             sequence = result.sequence,
-            probe_id = %result.result.display_id(),
-            probe_type = result.result.probe_type.as_str(),
-            target = %result.result.target,
-            status = ?result.result.status,
-            latency_ms = result.result.latency_ms,
+            probe_id = %probe_result.display_id(),
+            probe_type = probe_result.probe_type.as_str(),
+            target = %probe_result.target,
+            status = ?probe_result.status,
+            latency_ms = probe_result.latency_ms,
             body_bytes = body.len(),
             "komari ping result encoded"
         );
@@ -247,7 +255,7 @@ mod tests {
     use super::*;
     use crate::config::model::ExportAuthMode;
     use crate::export::ExportDeliveryTrigger;
-    use crate::service::outbound::{RemoteProbeResultEnvelope, RemoteTaskResultEnvelope};
+    use crate::service::outbound::{RemoteJobResultEnvelope, RemoteTaskResultEnvelope};
     use smalux_core::model::info::AgentReport;
     use smalux_protocol::{
         RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus,
@@ -457,18 +465,18 @@ mod tests {
         assert_eq!(body["exit_code"], 0);
     }
 
-    /// 验证 Komari 会把 remote probe result 编码为 WebSocket ping_result。
+    /// 验证 Komari 会把 probe job result 编码为 WebSocket ping_result。
     #[test]
-    fn komari_adapter_encodes_remote_probe_result() {
+    fn komari_adapter_encodes_probe_job_result() {
         let mut adapter = KomariProtocolAdapter::default();
         adapter
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
-        let result = RemoteProbeResultEnvelope {
+        let result = RemoteJobResultEnvelope {
             agent_id: "agent-1".to_string(),
             sequence: 11,
             created_at: 100,
-            result: RemoteProbeResult {
+            result: smalux_protocol::RemoteJobResult::probe(RemoteProbeResult {
                 run_id: "probe-run-1".to_string(),
                 source: RemoteProbeResultSource::Once,
                 point_id: Some(RemoteProbeId::from("point-123")),
@@ -482,10 +490,10 @@ mod tests {
                 finished_at: 100,
                 duration_ms: 13,
                 error: None,
-            },
+            }),
         };
 
-        let requests = adapter.encode_remote_probe_result(&result).unwrap();
+        let requests = adapter.encode_remote_job_result(&result).unwrap();
 
         assert_eq!(requests.len(), 1);
         let TransportRequest::WebSocketText { body, .. } = &requests[0] else {

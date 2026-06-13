@@ -344,7 +344,7 @@ agent connects /agent/v1/connect
      -> heartbeat: 更新业务在线时间
      -> ack/error: 关联 server 下发的 ServerFrame.sequence
      -> remote_task_result: 更新任务结果
-     -> remote_probe_result: 更新探测结果
+     -> job_result: 按 kind 分发；当前 kind=probe 时更新探测结果
   -> server 需要控制 agent 时，按当前 wire_mode 发送 ServerFrame
 ```
 
@@ -372,15 +372,15 @@ server 第一版要按 agent 当前运行时语义处理数据，不要把所有
 - `reporter_loop` 收到 telemetry update 后立即尝试生成 `snapshot`、`delta` 或 `heartbeat`；`report.interval` 只是兜底 tick，用于长时间没有采集变化时检查 snapshot/heartbeat 策略，不是唯一上报频率。
 - `snapshot` 是完整最新状态；`delta` 只包含变化的顶层采集组；无变化且未到 heartbeat 间隔时，agent 会跳过发送。
 - agent 的 report 是 latest-only 语义：export supervisor 只保留最新 report，慢连接或重连时可能跳过中间 report，因此 `ClientFrame.sequence` 允许跳号。
-- 出站事件分普通队列和高优先级队列。`ack`、`error`、`remote_task_result`、`remote_probe_result` 会优先于普通 report 投递，所以 server 可能先收到 `sequence=11` 的控制响应，再收到 `sequence=10` 的 report。
+- 出站事件分普通队列和高优先级队列。`ack`、`error`、`remote_task_result`、`job_result` 会优先于普通 report 投递，所以 server 可能先收到 `sequence=11` 的控制响应，再收到 `sequence=10` 的 report。
 - `ClientFrame.sequence` 是 agent 进程内全局出站序号，不是每种消息各自递增，也不是网络到达顺序保证。server 可以记录它用于排查跳号和乱序，但不能只因为小于等于最大已见序号就丢弃 frame。
 - `delta.base_sequence` 才是合并 delta 的强约束。server 只用它判断当前 latest state 是否能应用该 delta；不匹配时请求 snapshot。
-- `ack` / `error` 只表示 agent 已接收并调度带 `ServerFrame.sequence` 的控制命令，不代表 snapshot 已发送、远程 task 已完成或 remote probe 已完成。
+- `ack` / `error` 只表示 agent 已接收并调度带 `ServerFrame.sequence` 的控制命令，不代表 snapshot 已发送、远程 task 已完成或 remote job 已完成。
 - `remote_task_result` 在发送成功前会被 agent pending，重连后可能重投；server 必须按 `task_id` 幂等。
-- `remote_probe_result` 在发送成功前会被 agent pending，重连后可能重投；server 必须按 `run_id` 幂等，并优先用 `point_id` 关联业务探测点，用 `request_id` 或 `job_id` 关联本次请求或持续任务。
+- `job_result(kind=probe)` 在发送成功前会被 agent pending，重连后可能重投；server 必须按内部 `result.run_id` 幂等，并优先用 `point_id` 关联业务探测点，用 `request_id` 或 `job_id` 关联本次请求或持续任务。
 - `remote_shell_open` 的 ack 比普通控制命令更严格：agent 会等独立 shell stream WebSocket 连接成功、PTY 启动、`opened` 事件发送成功后才回 ack。失败时会回 `remote_shell_open_failed`。
 - `basic_info` 不是 Smalux 自有 `ClientFrame` 的核心类型；当前主要用于 Komari 兼容，由 reporter 低频生成后交给 Komari adapter 发送 HTTP `uploadBasicInfo`。
-- Komari 兼容模式是 agent 侧 adapter：出站把内部 report/task/probe 映射为 Komari report/basic_info/task_result/ping_result；入站把 Komari terminal/exec/ping 转换为内部 remote shell/task/probe。server 自有协议实现不要依赖 Komari 字段。
+- Komari 兼容模式是 agent 侧 adapter：出站把内部 report/task/job_result(kind=probe) 映射为 Komari report/basic_info/task_result/ping_result；入站把 Komari terminal/exec/ping 转换为内部 remote shell/task/job_apply(kind=probe)。server 自有协议实现不要依赖 Komari 字段。
 
 ### Server 收包处理顺序
 
@@ -409,7 +409,7 @@ server 收到一条 agent 业务 frame 后，建议固定按下面顺序处理�
    -> heartbeat: 只更新时间，不改 latest report 和 delta_base_sequence
    -> ack/error: 按 payload.sequence 关联 pending command
    -> remote_task_result: 按 result.task_id 幂等写入
-   -> remote_probe_result: 按 result.run_id 幂等写入
+   -> job_result(kind=probe): 按 result.result.run_id 幂等写入
 
 5. 响应动作
    -> delta base 不匹配: 下发 snapshot_request
@@ -429,7 +429,7 @@ server 收到一条 agent 业务 frame 后，建议固定按下面顺序处理�
 | `ack` | 可以 | `ack.sequence`，也就是 server 下发的 `ServerFrame.sequence` | 查 pending command；已处理过则当重复 ack 记录 |
 | `error` | 可以 | `error.sequence`，也就是 server 下发的 `ServerFrame.sequence` | 查 pending command；已处理过则当重复 error 记录 |
 | `remote_task_result` | 可以，会重投 | `result.task_id` | 幂等 upsert；同一 `task_id` 的最终状态不要重复创建 |
-| `remote_probe_result` | 可以，会重投 | `result.run_id` | 幂等 upsert；用 `point_id` 做业务探测点归属，用 `request_id/job_id` 做执行关联 |
+| `job_result(kind=probe)` | 可以，会重投 | `result.result.run_id` | 幂等 upsert；用内部 probe result 的 `point_id` 做业务探测点归属，用 `request_id/job_id` 做执行关联 |
 
 首版建议不要为了“严格顺序”牺牲 agent 的高优先级响应能力。server 只要做到上面这些幂等规则，就能同时兼容实时 report、控制响应和重连重投。
 
@@ -564,7 +564,7 @@ server 不应该把所有 payload 都当成完整指标：
 - `heartbeat`：只说明 agent 业务上仍在线，不修改 CPU、磁盘、网络等指标。
 - `ack` / `error`：只关联 server 之前下发的 `ServerFrame.sequence`，不代表远程任务或探测已经完成。
 - `remote_task_result`：通过 `result.task_id` 关联非交互任务。
-- `remote_probe_result`：通过 `result.run_id` 幂等保存单次探测运行；`result.point_id` 是 server 下发的业务探测点 ID，用它关联 UI 里的固定探测点；`source=once` 时用 `result.request_id` 关联一次性请求，`source=job` 时用 `result.job_id` 关联持续探测任务。`status=rejected` 表示 agent 未发包，例如未启用或限频。
+- `job_result(kind=probe)`：通过内部 `result.run_id` 幂等保存单次探测运行；`result.point_id` 是 server 下发的业务探测点 ID，用它关联 UI 里的固定探测点；`source=once` 时用 `result.request_id` 关联一次性请求，`source=job` 时用 `result.job_id` 关联持续探测任务。`status=rejected` 表示 agent 未发包，例如未启用或限频。
 
 ### Delta 合并伪代码
 
@@ -644,6 +644,40 @@ error_code
 error_message
 ```
 
+REST API 建议统一错误响应：
+
+```jsonc
+{
+  "error": {
+    "code": "invalid_payload",
+    "message": "field `command.type` is required",
+    "request_id": "req_01hxyz...",
+    "details": {
+      "field": "command.type"
+    }
+  }
+}
+```
+
+建议规则：
+
+- `code` 用稳定 `snake_case`，供前端或 CLI 逻辑判断。
+- `message` 面向人类排查，可以后续微调，但不要让调用方依赖整句文本。
+- `request_id` 用于串联日志、trace 和用户报错。
+- `details` 只放可公开的结构化字段，不放 token、header、secret 或原始 body。
+
+推荐状态码：
+
+| HTTP 状态码 | 场景 | `error.code` 建议 |
+| --- | --- | --- |
+| `400` | JSON 非法、字段缺失、字段类型错误 | `invalid_payload` |
+| `401` | 未认证或 token/key 不匹配 | `unauthorized` |
+| `403` | 已认证但权限不足 | `permission_denied` |
+| `404` | agent/command/task/probe 不存在 | `not_found` |
+| `409` | 并发状态冲突、重复创建、旧 generation | `conflict` |
+| `422` | 结构合法但业务校验失败 | `validation_failed` |
+| `500` | 内部错误 | `internal_error` |
+
 ### 控制消息
 
 server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当前只保留这一种控制入口，避免不同命令有的回 ack、有的不回 ack，导致 server 状态难以维护。
@@ -656,7 +690,7 @@ server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当�
 - `collect_sockets_once`
 - `remote_shell_open`
 - `remote_task_run`
-- `remote_probe_apply`
+- `job_apply`
 
 第一版 server 建议先实现：
 
@@ -670,16 +704,16 @@ server 通过同一条 Smalux WebSocket 控制通道下发 `ServerFrame`。当�
 - `collect_sockets_once`：请求 agent 立即采样一次 socket 信息，结果进入下一次 snapshot/delta。
 - `remote_shell_open`：打开远程交互式 shell，前提是 agent 启动时显式开启。
 - `remote_task_run`：执行一次非交互命令，前提是 agent 启动时显式开启。
-- `remote_probe_apply`：执行一次 TCP/HTTP 探测，或同步持续探测任务；默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
+- `job_apply`：执行一次通用远程 job，或同步持续 job 表；当前稳定 `kind=probe`，用于 TCP/HTTP 探测。probe 默认关闭，但可以通过 `config_patch.remote_probe.enabled=true` 动态开启。
 
 server 如果要远程打开 `processes.level=details` 或 `sockets.level=details`，agent 必须启动时带对应 CLI-only 授权：`--allow-process-level details` 或 `--allow-socket-level details`。一次性 details 采集同样受这个限制。
 
 控制消息发送规则：
 
 - 发送 `ServerFrame` 前先分配 server 侧递增 `sequence`，保存一条 pending command。
-- 收到 `ack.sequence` 后，只能把该 command 标记为“已调度”；不能把远程 task/probe 标记为完成。
+- 收到 `ack.sequence` 后，只能把该 command 标记为“已调度”；不能把远程 task/job 标记为完成。
 - 收到 `error.sequence` 后，把该 command 标记为失败，并记录 `error.code` 和 `error.message`。
-- 重连后不要盲目重发所有有副作用命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重；`remote_probe_apply(operation=once)` 靠 `request_id` 关联一次性请求，`replace/patch` 靠 `generation` 防止旧任务表覆盖新任务表。
+- 重连后不要盲目重发所有有副作用命令。`config_patch` 可以按当前 desired config 重发；`remote_task_run` 这类有副作用的命令必须靠 `task_id` 去重；`job_apply(operation=once, kind=probe)` 靠 `request_id` 关联一次性请求，`replace/patch` 靠 `generation` 防止旧任务表覆盖新任务表。
 
 ### 控制命令生命周期
 
@@ -705,10 +739,28 @@ business result arrives later
   -> collect_processes_once: later report contains processes group update
   -> collect_sockets_once: later report contains sockets group update
   -> remote_task_run: later remote_task_result arrives with task_id
-  -> remote_probe_apply once: later remote_probe_result arrives with point_id/request_id/run_id
-  -> remote_probe_apply replace/patch: later job results arrive with point_id/job_id/run_id
-  -> remote_shell_open: ack already means stream ready; session output goes through shell stream
+  -> job_apply once kind=probe: later job_result arrives with point_id/request_id/run_id
+  -> job_apply replace/patch kind=probe: later job_result arrives with point_id/job_id/run_id
+ -> remote_shell_open: ack already means stream ready; session output goes through shell stream
 ```
+
+建议把 command 状态收敛成固定集合：
+
+| 状态 | 含义 | 是否终态 |
+| --- | --- | --- |
+| `queued` | REST 已创建，等待路由到连接 | 否 |
+| `sent` | 已编码并写入 agent 连接发送队列 | 否 |
+| `acked` | agent 已接收并调度 | 否 |
+| `failed` | agent 返回 `error` 或 server 自己判定失败 | 是 |
+| `finished` | 业务结果已到达，例如 task result 或 once probe result | 是 |
+| `expired` | 超过有效期仍未 ack/result | 是 |
+
+建议规则：
+
+- `config_patch`、`snapshot_request`、`collect_*` 通常最多走到 `acked`，它们的业务完成更多由后续 report 体现。
+- `remote_task_run` 在收到 `remote_task_result` 后进入 `finished`。
+- `job_apply(operation=once, kind=probe)` 在收到对应 `job_result(kind=probe)` 后进入 `finished`。
+- `job_apply(operation=replace/patch, kind=probe)` 更接近“配置同步命令”，通常在 `acked` 即视为命令链路完成，持续 job 的业务结果走独立结果流。
 
 各命令的 server 状态建议：
 
@@ -719,8 +771,8 @@ business result arrives later
 | `collect_processes_once` | agent 已把一次性采集命令投递给 collector | 后续 report 的 `processes` 分组 | `ServerFrame.sequence` | 不建议自动重发，避免高成本扫描 |
 | `collect_sockets_once` | agent 已把一次性采集命令投递给 collector | 后续 report 的 `sockets` 分组 | `ServerFrame.sequence` | 不建议自动重发，避免高成本扫描 |
 | `remote_task_run` | agent 已接收或启动任务 | `remote_task_result.result.task_id` | `task_id` | 默认不自动重发，除非确认未执行 |
-| `remote_probe_apply once` | agent 已接收一次性探测请求 | `remote_probe_result.point_id/request_id/run_id` | `point_id` / `request_id` / `run_id` | 可按业务需求重发，但要限频 |
-| `remote_probe_apply replace/patch` | agent 已应用持续任务表变更 | 后续 `source=job` 的结果 | `generation` / `point_id` / `job_id` / `run_id` | 推荐重连后用新 `generation` replace 同步 |
+| `job_apply once kind=probe` | agent 已接收一次性探测请求 | `job_result(kind=probe).result.point_id/request_id/run_id` | `point_id` / `request_id` / `run_id` | 可按业务需求重发，但要限频 |
+| `job_apply replace/patch kind=probe` | agent 已应用持续任务表变更 | 后续 `source=job` 的结果 | `generation` / `point_id` / `job_id` / `run_id` | 推荐重连后用新 `generation` replace 同步 |
 | `remote_shell_open` | 独立 shell stream 已连接、PTY 已启动、opened 已发送 | shell stream 的 output/exit/error | `session_id` | 不自动重发，由用户重新打开 |
 
 pending command 超时只说明没有收到 `ack/error`。对于 `remote_task_run`、`remote_shell_open` 这类有副作用命令，server 不能仅凭 pending 超时就假定 agent 没执行；需要结合业务结果、连接断开时间和人工操作决定。
@@ -758,6 +810,8 @@ pending command 超时只说明没有收到 `ack/error`。对于 `remote_task_ru
 
 开启远程 probe 并请求 TCP 探测：
 
+自有协议字段定义、稳定 `type` 列表和 wire/secure_psk 细节，统一以 [crates/smalux-protocol/README.md](/abs/path/F:/code/rust/smalux/crates/smalux-protocol/README.md) 为准；本节重点描述 server 侧如何使用这些 payload。
+
 ```jsonc
 { "type": "config_patch", "patch": { "remote_probe": { "enabled": true } } }
 ```
@@ -767,11 +821,12 @@ pending command 超时只说明没有收到 `ack/error`。对于 `remote_task_ru
   "protocol_version": 1,
   "sequence": 202,
   "sent_at": 1710001001,
-  "type": "remote_probe_apply",
+  "type": "job_apply",
   "request": {
     "operation": "once",
     "runs": [
       {
+        "kind": "probe",
         "request_id": "probe-1",
         "point_id": "point-main-api",
         "probe_type": "tcp",
@@ -837,15 +892,15 @@ PendingRemoteProbe
   result
 ```
 
-这样拆分后，WebSocket 重连不会影响最新监控状态；server 下发命令的 ack/error 也不会和 remote task/probe 的最终结果混在一起。
+这样拆分后，WebSocket 重连不会影响最新监控状态；server 下发命令的 ack/error 也不会和 remote task/job 的最终结果混在一起。
 
 ### 幂等和重连策略
 
 server 需要把三类数据分开处理：
 
 - 最新状态：`snapshot` / `delta` / `heartbeat`。只保存最新状态，旧 report 不排队，防止高频 agent 把 server 内存打满。
-- 一次性结果：`ack` / `error` / `remote_task_result` / `remote_probe_result`。`ack/error` 用 `sequence` 关联 pending command，remote task 用 `task_id` 幂等，remote probe 用 `run_id` 幂等并优先用 `point_id` 做业务探测点关联。
-- 控制命令：server 主动发送给 agent。`config_patch` 可以在重连后按 desired config 重新下发；`remote_task_run` 这类有副作用的命令不要自动重发，除非 server 能根据 `task_id` 确认 agent 没有执行过。持续探测任务建议保存 desired jobs，重连后用 `remote_probe_apply(operation=replace)` 带新 `generation` 同步。
+- 一次性结果：`ack` / `error` / `remote_task_result` / `job_result`。`ack/error` 用 `sequence` 关联 pending command，remote task 用 `task_id` 幂等，`job_result(kind=probe)` 用 `run_id` 幂等并优先用 `point_id` 做业务探测点关联。
+- 控制命令：server 主动发送给 agent。`config_patch` 可以在重连后按 desired config 重新下发；`remote_task_run` 这类有副作用的命令不要自动重发，除非 server 能根据 `task_id` 确认 agent 没有执行过。持续探测任务建议保存 desired jobs，重连后用 `job_apply(operation=replace, kind=probe)` 带新 `generation` 同步。
 
 建议规则：
 
@@ -867,7 +922,7 @@ server 需要把三类数据分开处理：
 - `key_id` 只能用于查 secret，不是认证成功本身；认证成功发生在 Noise 握手能完成时。
 - `remote_task_run` / `remote_shell_open` 默认不要在 UI 中暴露，必须确认 agent 启动时显式开启。
 - server 下发 details 采集前，先确认 agent 启动时开启了 `--allow-process-level details` 或 `--allow-socket-level details`。
-- 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`remote_probe_apply(operation=once)` 和未来的 remote task。
+- 对单 agent 和单连接做基础频率限制，尤其是 `snapshot_request`、`job_apply(operation=once, kind=probe)` 和未来的 remote task。
 
 ### 测试清单
 
@@ -895,7 +950,7 @@ server 第一版建议至少覆盖这些测试：
 | control | `snapshot_request` ack | pending command 标记为 acked |
 | control | `snapshot_request` error | pending command 标记失败并保存错误 |
 | task | 重复 `remote_task_result.task_id` | 幂等覆盖，不创建重复记录 |
-| probe | 重复 `remote_probe_result.run_id` | 幂等覆盖，不创建重复记录 |
+| probe | 重复 `job_result(kind=probe).result.run_id` | 幂等覆盖，不创建重复记录 |
 | reconnect | agent 断开重连后发 snapshot | connection state 更新，latest state 正常覆盖 |
 
 ### 存储策略
@@ -975,9 +1030,10 @@ remote_task_results
   result_json TEXT NOT NULL
   updated_at INTEGER NOT NULL
 
-remote_probe_results
+remote_job_results
   run_id TEXT PRIMARY KEY
   agent_id TEXT NOT NULL
+  kind TEXT NOT NULL
   source TEXT NOT NULL
   point_id TEXT NULL
   request_id TEXT NULL
@@ -1000,7 +1056,7 @@ remote_probe_results
 - `heartbeat`：只更新 `last_seen_at`，不改 `report_json` 和 `delta_base_sequence`。
 - `ack/error`：只更新 `pending_commands`，不要修改 latest report。
 - `remote_task_result`：按 `task_id` upsert，重复结果覆盖同一行，保证幂等。
-- `remote_probe_result`：按 `run_id` upsert，重复结果覆盖同一行；额外保存 `source`、`point_id`、`request_id`、`job_id`，方便查询业务探测点、一次性请求和持续任务历史。
+- `job_result(kind=probe)`：按内部 `run_id` upsert，重复结果覆盖同一行；额外保存 `kind`、`source`、`point_id`、`request_id`、`job_id`，方便查询业务探测点、一次性请求和持续任务历史。
 
 ### 查询接口
 
@@ -1013,6 +1069,219 @@ GET /api/v1/agents
 GET /api/v1/agents/{agent_id}
   -> 返回该 agent 的 latest_report
 ```
+
+建议从第一版开始就把响应 JSON 形状固定下来，避免前端或 CLI 接口先随手拼一版，后面再大面积改动。
+
+`GET /api/v1/agents` 建议响应：
+
+```jsonc
+{
+  "items": [
+    {
+      "agent_id": "agent-1",
+      "hostname": "node-1",
+      "online": true,
+      "last_seen_at": 1710000100,
+      "last_frame_sequence": 31,
+      "public_ip_status": "ready",
+      "public_ip": "1.2.3.4",
+      "system": {
+        "os": "linux",
+        "platform": "ubuntu",
+        "arch": "x86_64"
+      }
+    }
+  ],
+  "total": 1
+}
+```
+
+字段建议：
+
+- `agent_id`：稳定主键，直接对应 `ClientFrame.agent_id`。
+- `online`：只表达当前连接是否在线，不代表最近一次任务一定成功。
+- `last_seen_at`：server 收到任意 agent 上报的时间，Unix 秒。
+- `last_frame_sequence`：最后一条已处理 `ClientFrame.sequence`。
+- `public_ip_status`：直接透传 latest report 里的状态，前端不要自己猜。
+
+`GET /api/v1/agents/{agent_id}` 建议响应：
+
+```jsonc
+{
+  "agent_id": "agent-1",
+  "online": true,
+  "connected_at": 1710000000,
+  "last_seen_at": 1710000100,
+  "last_frame_sequence": 31,
+  "delta_base_sequence": 30,
+  "latest_report": {
+    "meta": {
+      "schema_version": 5,
+      "agent_version": "0.1.0",
+      "report_at": 1710000099
+    },
+    "identity": {},
+    "system": {},
+    "core": {},
+    "disk": {},
+    "network": {},
+    "processes": {},
+    "sockets": {}
+  }
+}
+```
+
+建议规则：
+
+- 这个接口直接返回当前 latest state，不要额外做字段裁剪版和完整版两种形态。
+- `latest_report` 不存在时返回 `null`，但整体接口仍可返回 200，用于区分“agent 已登记但尚未上报”和“agent 不存在”。
+- `404` 只用于 `agent_id` 根本不存在。
+
+### 控制命令接口 JSON
+
+`POST /api/v1/agents/{agent_id}/commands` 建议请求体使用统一 envelope，而不是不同命令各开一个 REST 路径：
+
+```jsonc
+{
+  "command": {
+    "type": "snapshot_request",
+    "request": {
+      "reason": "manual_refresh"
+    }
+  }
+}
+```
+
+```jsonc
+{
+  "command": {
+    "type": "config_patch",
+    "patch": {
+      "core": { "interval": "2s" },
+      "report": { "interval": "10s" }
+    }
+  }
+}
+```
+
+```jsonc
+{
+  "command": {
+    "type": "job_apply",
+    "request": {
+      "operation": "once",
+      "runs": [
+        {
+          "kind": "probe",
+          "request_id": "probe-1",
+          "point_id": "point-main-api",
+          "probe_type": "tcp",
+          "target": "example.com:443",
+          "timeout": "5s"
+        }
+      ]
+    }
+  }
+}
+```
+
+建议响应：
+
+```jsonc
+{
+  "command_id": "cmd_01hxyz...",
+  "agent_id": "agent-1",
+  "status": "queued", // queued | sent | acked | failed | finished | expired
+  "server_sequence": 205,
+  "command_type": "job_apply",
+  "created_at": 1710000200
+}
+```
+
+建议规则：
+
+- `command_id` 是 server 侧主键；`server_sequence` 只是当前连接上的协议序号。
+- `config_patch`、`snapshot_request`、`collect_*` 的最终完成更多依赖后续 report 行为，不要把 `acked` 误解成业务完成。
+- `remote_task_run` 和 `job_apply(kind=probe)` 的业务结果分别通过 `task_id`、`request_id/job_id/run_id` 再继续关联。
+
+`GET /api/v1/commands/{command_id}` 建议响应：
+
+```jsonc
+{
+  "command_id": "cmd_01hxyz...",
+  "agent_id": "agent-1",
+  "command_type": "job_apply",
+  "status": "acked",
+  "server_sequence": 205,
+  "request_json": {},
+  "response_json": {
+    "type": "ack",
+    "sequence": 205
+  },
+  "created_at": 1710000200,
+  "updated_at": 1710000201
+}
+```
+
+### 结果查询接口 JSON
+
+`GET /api/v1/agents/{agent_id}/tasks/{task_id}` 建议响应：
+
+```jsonc
+{
+  "agent_id": "agent-1",
+  "task_id": "task-1",
+  "status": "success",
+  "exit_code": 0,
+  "stdout": "2026-05-29T12:00:00Z",
+  "stderr": "",
+  "started_at": 1710000099,
+  "finished_at": 1710000100,
+  "duration_ms": 1000,
+  "timed_out": false,
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "error": null
+}
+```
+
+`GET /api/v1/agents/{agent_id}/probes/{run_id}` 建议响应：
+
+```jsonc
+{
+  "agent_id": "agent-1",
+  "kind": "probe",
+  "run_id": "4c21e6f8-8ef3-4ee5-9c91-8f630f650b92",
+  "source": "once",
+  "point_id": "point-main-api",
+  "request_id": "probe-1",
+  "job_id": null,
+  "probe_type": "tcp",
+  "target": "example.com:443",
+  "status": "success",
+  "latency_ms": 13,
+  "started_at": 1710000100,
+  "finished_at": 1710000101,
+  "duration_ms": 13,
+  "error": null
+}
+```
+
+### 实时订阅 JSON
+
+如果后面做 `/live/v1/dashboard`，建议事件统一用 `event + data` envelope：
+
+```jsonc
+{ "event": "agent.updated", "data": { "agent_id": "agent-1", "online": true, "last_seen_at": 1710000100 } }
+{ "event": "command.updated", "data": { "command_id": "cmd_01hxyz...", "status": "acked" } }
+{ "event": "task.updated", "data": { "agent_id": "agent-1", "task_id": "task-1", "status": "success" } }
+{ "event": "probe.updated", "data": { "agent_id": "agent-1", "run_id": "4c21...", "status": "success" } }
+```
+
+建议规则：
+
+- 实时事件只用于刷新 UI，不承担唯一真实来源；前端随时可以退回 REST 拉取 latest。
+- `event` 名保持稳定，`data` 允许未来增加字段。
 
 等 Web UI 需求明确后，再补：
 
@@ -1029,7 +1298,7 @@ GET /api/v1/agents/{agent_id}
 | `/agent/v1/connect` | `GET` upgrade | Smalux agent 主 WebSocket，接收 `ClientFrame` 和下发控制消息 | 必须 |
 | `/api/v1/agents` | `GET` | 查询 agent 列表、在线状态和摘要字段 | 必须 |
 | `/api/v1/agents/{agent_id}` | `GET` | 查询单个 agent 的 latest report | 必须 |
-| `/api/v1/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`remote_probe_apply` | 可后做 |
+| `/api/v1/agents/{agent_id}/commands` | `POST` | 创建 server 控制命令，例如 `snapshot_request`、`job_apply` | 可后做 |
 | `/api/v1/commands/{command_id}` | `GET` | 查询 pending command 的 ack/error 状态 | 可后做 |
 | `/api/v1/agents/{agent_id}/tasks/{task_id}` | `GET` | 查询 remote task 结果 | 可后做 |
 | `/api/v1/agents/{agent_id}/probes/{run_id}` | `GET` | 查询 remote probe 单次运行结果 | 可后做 |
@@ -1079,8 +1348,9 @@ handle_client_json(connection, json_bytes):
     remote_task_result:
       storage.upsert_remote_task_result(frame.agent_id, frame.result)
 
-    remote_probe_result:
-      storage.upsert_remote_probe_result(frame.agent_id, frame.result)
+    job_result:
+      if frame.result.kind == probe:
+        storage.upsert_remote_job_result(frame.agent_id, frame.result)
 
     unknown:
       log and ignore

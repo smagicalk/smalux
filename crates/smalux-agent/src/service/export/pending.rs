@@ -1,7 +1,7 @@
 //! export pending 事件缓存和重发。
 
 use super::super::outbound::{
-    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteProbeResultEnvelope,
+    BasicInfoEnvelope, ControlAckEnvelope, ControlErrorEnvelope, RemoteJobResultEnvelope,
     RemoteTaskResultEnvelope, ReportEnvelope,
 };
 use super::delivery::{DeliveryState, send_ready_deliveries};
@@ -15,7 +15,7 @@ pub(super) fn handle_transport_event(
     event: TransportEvent,
     deliveries: &mut [DeliveryState],
     pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
-    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+    pending_remote_job_results: &mut BTreeMap<u64, RemoteJobResultEnvelope>,
     pending_control_acks: &mut BTreeMap<u64, ControlAckEnvelope>,
     pending_control_errors: &mut BTreeMap<u64, ControlErrorEnvelope>,
 ) -> anyhow::Result<()> {
@@ -28,8 +28,8 @@ pub(super) fn handle_transport_event(
             if delivery == ExportDeliveryId::RemoteTaskResult {
                 pending_remote_task_results.remove(&sequence);
             }
-            if delivery == ExportDeliveryId::RemoteProbeResult {
-                pending_remote_probe_results.remove(&sequence);
+            if delivery == ExportDeliveryId::JobResult {
+                pending_remote_job_results.remove(&sequence);
             }
             if delivery == ExportDeliveryId::ControlAck {
                 pending_control_acks.remove(&sequence);
@@ -61,7 +61,7 @@ pub(super) fn handle_transport_event(
             let policy = if matches!(
                 delivery,
                 ExportDeliveryId::RemoteTaskResult
-                    | ExportDeliveryId::RemoteProbeResult
+                    | ExportDeliveryId::JobResult
                     | ExportDeliveryId::ControlAck
                     | ExportDeliveryId::ControlError
             ) {
@@ -125,8 +125,8 @@ pub(super) async fn queue_basic_info(
 pub(super) struct PendingResumeEvents<'a> {
     /// 等待重新发送的远程任务结果。
     pub(super) remote_task_results: &'a mut BTreeMap<u64, RemoteTaskResultEnvelope>,
-    /// 等待重新发送的远程探测结果。
-    pub(super) remote_probe_results: &'a mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+    /// 等待重新发送的通用远程 job 结果。
+    pub(super) remote_job_results: &'a mut BTreeMap<u64, RemoteJobResultEnvelope>,
     /// 等待重新发送的控制确认。
     pub(super) control_acks: &'a mut BTreeMap<u64, ControlAckEnvelope>,
     /// 等待重新发送的控制错误。
@@ -153,7 +153,7 @@ pub(super) async fn send_resume_events(
         transport_hub,
         router,
         pending.remote_task_results,
-        pending.remote_probe_results,
+        pending.remote_job_results,
     )
     .await?;
     Ok(())
@@ -185,10 +185,10 @@ async fn resume_remote_results(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
     pending_remote_task_results: &mut BTreeMap<u64, RemoteTaskResultEnvelope>,
-    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+    pending_remote_job_results: &mut BTreeMap<u64, RemoteJobResultEnvelope>,
 ) -> anyhow::Result<()> {
     send_pending_remote_task_results(transport_hub, router, pending_remote_task_results).await?;
-    send_pending_remote_probe_results(transport_hub, router, pending_remote_probe_results).await
+    send_pending_remote_job_results(transport_hub, router, pending_remote_job_results).await
 }
 
 /// 投递远程任务结果，并在等待发送确认期间保留一份副本。
@@ -222,34 +222,36 @@ pub(super) async fn queue_remote_task_result(
     Ok(())
 }
 
-/// 投递远程探测结果，并在等待发送确认期间保留一份副本。
-pub(super) async fn queue_remote_probe_result(
+/// 投递通用远程 job 结果，并在等待发送确认期间保留一份副本。
+pub(super) async fn queue_remote_job_result(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
-    result: RemoteProbeResultEnvelope,
+    pending_remote_job_results: &mut BTreeMap<u64, RemoteJobResultEnvelope>,
+    result: RemoteJobResultEnvelope,
 ) -> anyhow::Result<()> {
     let request_count = router
-        .send_remote_probe_result(transport_hub, &result)
+        .send_remote_job_result(transport_hub, &result)
         .await?;
     if request_count == 0 {
-        pending_remote_probe_results.remove(&result.sequence);
+        pending_remote_job_results.remove(&result.sequence);
         tracing::debug!(
-            probe_id = %result.result.display_id(),
+            job_id = %result.result.display_id(),
+            job_kind = result.result.kind().as_str(),
             sequence = result.sequence,
             format_skipped = true,
-            "remote probe result skipped by adapter"
+            "remote job result skipped by adapter"
         );
         return Ok(());
     }
 
     tracing::debug!(
-        probe_id = %result.result.display_id(),
+        job_id = %result.result.display_id(),
+        job_kind = result.result.kind().as_str(),
         sequence = result.sequence,
         request_count,
-        "remote probe result queued"
+        "remote job result queued"
     );
-    pending_remote_probe_results.insert(result.sequence, result);
+    pending_remote_job_results.insert(result.sequence, result);
     Ok(())
 }
 
@@ -349,36 +351,38 @@ pub(super) async fn send_pending_remote_task_results(
     Ok(())
 }
 
-/// 重连后重投尚未确认发送成功的远程探测结果。
-pub(super) async fn send_pending_remote_probe_results(
+/// 重连后重投尚未确认发送成功的通用远程 job 结果。
+pub(super) async fn send_pending_remote_job_results(
     transport_hub: &mut TransportHub,
     router: &mut ExportRouter,
-    pending_remote_probe_results: &mut BTreeMap<u64, RemoteProbeResultEnvelope>,
+    pending_remote_job_results: &mut BTreeMap<u64, RemoteJobResultEnvelope>,
 ) -> anyhow::Result<()> {
-    let pending = pending_remote_probe_results
+    let pending = pending_remote_job_results
         .values()
         .cloned()
         .collect::<Vec<_>>();
     for result in pending {
         let sequence = result.sequence;
         let request_count = router
-            .send_remote_probe_result(transport_hub, &result)
+            .send_remote_job_result(transport_hub, &result)
             .await?;
         if request_count == 0 {
-            pending_remote_probe_results.remove(&sequence);
+            pending_remote_job_results.remove(&sequence);
             tracing::debug!(
-                probe_id = %result.result.display_id(),
+                job_id = %result.result.display_id(),
+                job_kind = result.result.kind().as_str(),
                 sequence,
                 format_skipped = true,
-                "pending remote probe result skipped by adapter"
+                "pending remote job result skipped by adapter"
             );
             continue;
         }
         tracing::debug!(
-            probe_id = %result.result.display_id(),
+            job_id = %result.result.display_id(),
+            job_kind = result.result.kind().as_str(),
             sequence,
             request_count,
-            "pending remote probe result requeued"
+            "pending remote job result requeued"
         );
     }
 

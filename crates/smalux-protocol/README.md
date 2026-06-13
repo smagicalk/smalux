@@ -6,7 +6,7 @@
 
 - 定义传输无关的 frame，例如 `ClientFrame` 和 `ServerFrame`。
 - 定义 agent 内部上报语义，例如 `OutboundReport`。
-- 定义首版上报 payload，例如 `snapshot`、`delta`、`heartbeat`、`ack`、`error`、`remote_task_result` 和 `remote_probe_result`。
+- 定义首版上报 payload，例如 `snapshot`、`delta`、`heartbeat`、`ack`、`error`、`remote_task_result` 和 `job_result`。
 - 提供 JSON codec，供 WebSocket、HTTP 或后续 gRPC adapter 复用。
 - 提供 Smalux binary wire packet codec，也就是 `PlainData`、`Hello`、`Handshake`、`SecureData` 这些外层二进制包。
 - 提供 `secure_psk` 共享安全通道工具，包括 token 解析、HKDF-SHA256 PSK 派生、Noise initiator/responder 和 payload 加解密。
@@ -34,6 +34,27 @@
    - server 发往 agent 的最终 JSON frame。
    - 当前只放少量稳定控制消息，主要是需要协议级 `sequence` 的命令。
 
+## 消息矩阵
+
+协议层当前稳定消息如下：
+
+| 方向 | 顶层 `type` | 作用 | 是否带业务结果 |
+| --- | --- | --- | --- |
+| agent -> server | `snapshot` | 完整状态快照 | 是 |
+| agent -> server | `delta` | 顶层采集组增量替换 | 是 |
+| agent -> server | `heartbeat` | 业务在线信号 | 否 |
+| agent -> server | `ack` | 控制命令已接收并调度 | 否 |
+| agent -> server | `error` | 控制命令调度失败 | 否 |
+| agent -> server | `remote_task_result` | 非交互任务执行结果 | 是 |
+| agent -> server | `job_result` | 通用远程 job 结果 | 是 |
+| server -> agent | `snapshot_request` | 请求完整快照 | 否 |
+| server -> agent | `config_patch` | 动态配置更新 | 否 |
+| server -> agent | `collect_processes_once` | 一次性进程采样 | 否 |
+| server -> agent | `collect_sockets_once` | 一次性 socket 采样 | 否 |
+| server -> agent | `remote_task_run` | 一次性非交互命令 | 否 |
+| server -> agent | `job_apply` | 通用远程 job 同步/运行 | 否 |
+| server -> agent | `remote_shell_open` | 打开临时 shell stream | 否 |
+
 ## 当前 frame 约定
 
 ### ClientFrame
@@ -50,7 +71,7 @@
 - `sent_at`
   - agent 发送 frame 的 Unix 秒时间戳。
 - `type`
-  - 当前稳定值包括 `snapshot`、`delta`、`heartbeat`、`ack`、`error`、`remote_task_result`、`remote_probe_result`。
+  - 当前稳定值包括 `snapshot`、`delta`、`heartbeat`、`ack`、`error`、`remote_task_result`、`job_result`。
 
 ### ServerFrame
 
@@ -66,7 +87,7 @@
   - 为空时表示当前连接上的 agent；不为空且和当前 agent 不匹配时，agent 会直接丢弃该命令。
   - 该字段只做路由保护，不做认证。
 - `type`
-  - 当前稳定值包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply` 和 `remote_shell_open`。
+  - 当前稳定值包括 `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`job_apply` 和 `remote_shell_open`。
 
 ## Frame JSON 示例
 
@@ -116,6 +137,90 @@ server 下发稳定命令时也是同样的顶层 `type`：
   }
 }
 ```
+
+通用远程 job 的一次性运行请求：
+
+```jsonc
+{
+  "protocol_version": 1,
+  "sequence": 203,
+  "sent_at": 1710000003,
+  "type": "job_apply",
+  "request": {
+    "operation": "once",
+    "runs": [
+      {
+        "kind": "probe",
+        "request_id": "probe-once-1",
+        "point_id": "point-main-api",
+        "probe_type": "tcp",
+        "target": "example.com:443",
+        "timeout": "5s"
+      }
+    ]
+  }
+}
+```
+
+通用远程 job 的持续任务同步请求：
+
+```jsonc
+{
+  "protocol_version": 1,
+  "sequence": 204,
+  "sent_at": 1710000004,
+  "type": "job_apply",
+  "request": {
+    "operation": "replace",
+    "generation": 12,
+    "jobs": [
+      {
+        "kind": "probe",
+        "job_id": "main-api",
+        "point_id": "point-main-api",
+        "enabled": true,
+        "probe_type": "tcp",
+        "target": "example.com:443",
+        "interval": "30s",
+        "timeout": "5s"
+      }
+    ]
+  }
+}
+```
+
+通用远程 job 结果当前通过 `job_result(kind=probe)` 回传：
+
+```jsonc
+{
+  "protocol_version": 1,
+  "agent_id": "agent-1",
+  "sequence": 13,
+  "sent_at": 1710000005,
+  "type": "job_result",
+  "result": {
+    "kind": "probe",
+    "result": {
+      "run_id": "4c21e6f8-8ef3-4ee5-9c91-8f630f650b92",
+      "source": "once",
+      "point_id": "point-main-api",
+      "request_id": "probe-once-1",
+      "probe_type": "tcp",
+      "target": "example.com:443",
+      "status": "success",
+      "latency_ms": 13,
+      "started_at": 1710000004,
+      "finished_at": 1710000005,
+      "duration_ms": 13
+    }
+  }
+}
+```
+
+当前自有协议里：
+
+- `job_apply(kind=probe)` 只接受 `request_id`，不接受 `task_id` 这类第三方字段别名。
+- `job_result.kind` 是后续扩展点；server 应先按 `type=job_result` 再按 `kind` 分发。
 
 远程 shell stream 的业务 JSON 也定义在本 crate 中，agent 通过
 `decode_remote_shell_stream_command()` 解析 server 发来的 command，通过
@@ -188,6 +293,31 @@ agent 回传 `ack/error` 时，`ack.sequence` 或 `error.sequence` 指向 server
 
 `network: null` 表示该采集组被关闭；`core` 出现对象表示整体替换 server 保存的 `core` 组。server 不需要理解每个嵌套字段才能正确合并 delta，但必须按顶层采集组替换。
 
+## 连接状态
+
+本 crate 不保存连接状态，但协议语义默认外层 transport 至少经历下面几个阶段：
+
+```text
+binary_plain
+  connecting
+    -> ready
+    -> closing
+
+secure_psk
+  connecting
+    -> hello_sent / hello_received
+    -> handshake_sent / handshake_received
+    -> ready
+    -> closing
+```
+
+建议规则：
+
+- `binary_plain` 的 ready 条件：能稳定收发 `WirePacket(kind=PlainData)`。
+- `secure_psk` 的 ready 条件：Hello 和 Noise 握手都成功，已经拿到 `TransportState`。
+- 未进入 ready 前，不要把业务 JSON 直接交给 `decode_client_frame()` / `decode_server_frame()`。
+- `secure_psk` 任意一步失败，都应按连接级错误处理，不要尝试降级到明文。
+
 ## Server 对接流程
 
 server 按下面顺序实现，最容易先跑通闭环：
@@ -211,11 +341,11 @@ server 按下面顺序实现，最容易先跑通闭环：
    -> delta: 按顶层采集组整体覆盖
    -> heartbeat: 只刷新在线时间
    -> ack/error: 关联 server 下发命令
-   -> remote_task_result / remote_probe_result: 关联任务结果
+   -> remote_task_result / job_result: 关联任务结果
 
 5. 下发控制命令
    -> 自有协议命令统一构造 ServerFrame，可选 target_agent_id 做路由保护
-   -> snapshot_request / config_patch / collect_* / remote_task_run / remote_probe_apply / remote_shell_open 都可收到 ack/error
+   -> snapshot_request / config_patch / collect_* / remote_task_run / job_apply / remote_shell_open 都可收到 ack/error
    -> 按当前 wire_mode 封成 PlainData 或 SecureData
 ```
 
@@ -255,7 +385,7 @@ transport adapter
 
 ## 兼容边界
 
-- `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`remote_probe_apply`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
+- `snapshot_request`、`config_patch`、`collect_processes_once`、`collect_sockets_once`、`remote_task_run`、`job_apply`、`remote_shell_open` 现在都属于稳定 `ServerFrame`。
 - `ack/error` 只对带 `sequence` 的 `ServerFrame` 有意义。
 - `target_agent_id` 不匹配时 agent 会丢弃命令，不回 `ack/error`。
 - 第三方兼容消息不进入本 crate 的稳定协议面，应在对应 adapter/handler 中转换成 agent 内部命令。
@@ -296,7 +426,7 @@ JSON 解析建议：
 | `busy` | 并发已满，例如 remote shell session 已达到上限 | 稍后重试或让用户关闭旧会话 |
 | `internal_error` | agent 内部不可预期错误 | 记录上下文，避免无限重试 |
 
-错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。当前 agent 对 `ServerFrame` 调度失败时会按 `{server_frame_type}_failed` 生成错误码，例如 `snapshot_request_failed`、`remote_probe_apply_failed` 和 `remote_shell_open_failed`。
+错误消息 `message` 面向日志和排查，不建议让 server 依赖其中的自然语言做逻辑判断；逻辑判断只看 `code` 和 `sequence`。当前 agent 对 `ServerFrame` 调度失败时会按 `{server_frame_type}_failed` 生成错误码，例如 `snapshot_request_failed`、`job_apply_failed` 和 `remote_shell_open_failed`。
 
 server 自己的 ingest 错误可以使用另一套内部错误码，不必通过 `ClientFrame(type=error)` 回给 agent。agent 当前没有等待 server 对上报 frame 做协议级 ack，因此 server 收到非法 `snapshot` / `delta` 时优先记录、丢弃或发送 `snapshot_request`。
 
@@ -306,19 +436,20 @@ server 自己的 ingest 错误可以使用另一套内部错误码，不必通�
 
 | 字段 | 生成方 | 作用 |
 | --- | --- | --- |
-| `ClientFrame.sequence` | agent | agent 全局出站序号，snapshot、delta、heartbeat、ack/error、remote task/probe result 共用 |
+| `ClientFrame.sequence` | agent | agent 全局出站序号，snapshot、delta、heartbeat、ack/error、remote task/job result 共用 |
 | `ServerFrame.sequence` | server | server 下发稳定控制命令的序号，agent 的 `ack.sequence` / `error.sequence` 会引用它 |
-| `task_id` | server 或第三方兼容层 | remote task 的业务结果关联 ID；Komari ping_result 兼容输出也使用该字段 |
-| `run_id` | agent | remote probe 每次实际运行或拒绝运行的唯一结果 ID，可作为探测结果表主键或幂等键 |
-| `point_id` | server | remote probe 的业务探测点 ID；一次性探测和持续任务都可以携带，结果会原样带回 |
-| `request_id` / `job_id` | server | remote probe 的执行关联 ID；一次性探测使用 `request_id`，持续任务使用 `job_id` |
+| `task_id` | server 或第三方兼容层 | remote task 的业务结果关联 ID |
+| `job_result.kind` | agent | 通用远程 job 结果类型；首版稳定值是 `probe` |
+| `run_id` | agent | `job_result(kind=probe)` 每次实际运行或拒绝运行的唯一结果 ID，可作为探测结果表主键或幂等键 |
+| `point_id` | server | `kind=probe` 的业务探测点 ID；一次性探测和持续任务都可以携带，结果会原样带回 |
+| `request_id` / `job_id` | server | `kind=probe` 的执行关联 ID；一次性探测使用 `request_id`，持续任务使用 `job_id` |
 
 server 处理建议：
 
 - `ClientFrame.sequence` 可以用于记录 last seen 和发现明显乱序，但不要把缺号直接当成协议错误。agent 导出 job 可能只发送最新 report，中间 report 被最新状态覆盖时会出现序号跳跃。
 - `delta.base_sequence` 才是合并增量的强约束；它不匹配时必须请求 snapshot，而不是靠 `ClientFrame.sequence` 猜测。
 - `ack/error` 的业务关联字段是内部 payload 里的 `ack.sequence` / `error.sequence`，不是外层 `ClientFrame.sequence`。
-- `remote_task_result` 以 `task_id` 幂等。`remote_probe_result` 以 `run_id` 幂等；`point_id` 用于关联 server 业务探测点；`source=once` 额外用 `request_id` 关联一次性请求，`source=job` 额外用 `job_id` 关联持续探测任务。
+- `remote_task_result` 以 `task_id` 幂等。`job_result(kind=probe)` 以内部 `result.run_id` 幂等；`point_id` 用于关联 server 业务探测点；`source=once` 额外用 `request_id` 关联一次性请求，`source=job` 额外用 `job_id` 关联持续探测任务。
 - 重连后 agent 的 `ClientFrame.sequence` 会从当前进程内的出站序号继续增长；如果 agent 进程重启，序号可能重新从 `1` 开始。server 不能只靠 sequence 判断 agent 是否是同一个进程，应该结合连接时间、agent version、latest snapshot 和后续认证信息。
 
 server 发送建议：
@@ -334,7 +465,7 @@ server 发送建议：
 
 - 需要 agent/server 双方长期稳定理解、需要 `ack/error`、需要跨 transport 复用的命令，放入 `ServerPayload`。
 - 只属于某个第三方协议的字段、路径、事件名或文本格式，留在第三方兼容 adapter 中。
-- adapter 可以复用内部 remote task、remote probe、remote shell manager，但不应把第三方 raw 消息暴露成自有协议格式。
+- adapter 可以复用内部 remote task、remote job、remote shell manager，但不应把第三方 raw 消息暴露成自有协议格式。
 
 ## 扩展原则
 
