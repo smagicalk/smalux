@@ -981,69 +981,14 @@ server 侧 secure_psk 最小实现步骤：
 4. 任意 magic/version/session/pattern/PSK/AEAD 校验失败都关闭连接，不进入 ready 状态
 ```
 
-### Server 自实现对接流程
+### Server 对接索引
 
-自己写 server 时，先按最小闭环实现，不需要一次做完全部功能：
+自己写 server 时，完整字段定义和最小闭环要求以 [crates/smalux-server/README.md](/abs/path/F:/code/rust/smalux/crates/smalux-server/README.md) 和 [crates/smalux-server/plan.md](/abs/path/F:/code/rust/smalux/crates/smalux-server/plan.md) 为准。
 
-```text
-1. WebSocket /agent/v1/connect 接入
-   -> binary_plain 按 export.auth_mode 校验 none/query/bearer
-   -> secure_psk 要求 export.auth_mode=none，后续 Noise 握手成功才算认证通过
-   -> 如果 export.wire_mode=binary_plain，只接收 WebSocket binary frame
-   -> 如果 export.wire_mode=secure_psk，先完成 Hello + Noise responder 握手
+agent 这边只保留两个最关键的对接事实：
 
-2. 解包为 JSON bytes
-   -> binary_plain: WirePacket(kind=PlainData).payload
-   -> secure_psk: WirePacket(kind=SecureData).payload 解密后得到 JSON bytes
-   -> 开发期 WebSocket text 只建议用于 binary_plain 调试 ServerFrame，本项目自己的 server 不建议依赖 text
-
-3. 解析 ClientFrame
-   -> type=snapshot: 用 payload.report 整体替换 server 保存的最新状态
-   -> type=delta: 校验 base_sequence 是否等于 server 当前基准 sequence
-   -> type=heartbeat: 更新业务在线时间，不修改指标状态
-   -> type=ack/error: 关联 server 下发命令的 sequence
-   -> type=remote_task_result: 关联 task_id，记录非交互任务结果
-   -> type=job_result + kind=probe: 关联 point_id 和 request_id/job_id，记录网络探测结果
-
-4. 维护每个 agent 的状态
-   -> agent_id 来自 ClientFrame.agent_id，也会出现在 snapshot payload.report.agent_id
-   -> 保存 last_sequence、latest_snapshot、last_seen_at、transport_state
-   -> delta 合并失败或 base_sequence 不匹配时，下发 snapshot_request
-
-5. 下发控制命令
-   -> 自有协议命令统一构造 ServerFrame，必须带 protocol_version、server sequence、sent_at、type
-   -> 可选 target_agent_id；为空表示当前连接上的 agent，不匹配时 agent 丢弃且不回 ack/error
-   -> 按当前 wire_mode 把 JSON bytes 封成 PlainData 或 SecureData
-   -> ServerFrame 的 ack 只代表命令已被调度，不代表后续结果已经产生
-```
-
-建议 server 第一版只实现 `snapshot`、`heartbeat`、`ServerFrame(type=snapshot_request)` 和 `ServerFrame(type=config_patch)`，确认 agent 能稳定连接、上报、请求完整快照和调整采样频率后，再接 `remote_task_result`、`job_result`、一次性诊断采集和 `ServerFrame(type=remote_shell_open)`。
-
-delta 合并规则要简单：server 不做字段级深度合并。`snapshot` 覆盖完整状态；`delta` 出现哪个顶层采样组，就整体覆盖该采样组；采样组为 `null` 时清空该组。server 如果没有对应 `base_sequence`，直接发 `snapshot_request`，不要尝试猜测补齐。
-
-server patch 只处理动态配置。`log_file`、`log_retention_files`、`log_max_size_mb`、`log_payload`、`log_payload_max_bytes`、`diagnostics.*`、`remote_shell.enabled` 和 `remote_task.enabled` 都不是 server 可动态打开的字段；`remote_probe.enabled` 可以动态开启，但 agent 本地仍会用 `global_min_interval` 和 `target_min_interval` 做频率保护。
-
-### Server 最小实现 Checklist
-
-第一版 server 只要完成下面这些，就能和当前 agent 跑通自有协议闭环：
-
-- `WebSocket /agent/v1/connect`：接受 agent 主连接；`binary_plain` 按 `export.auth_mode` 校验 `none` / query token / bearer token，`secure_psk` 要求 `auth_mode=none` 并通过 Noise 握手认证。
-- `WirePacket`：读取固定头，校验 magic、version、kind、sequence、payload_len；开发期至少实现 `PlainData`，正式加密模式实现 `Hello`、`Handshake` 和 `SecureData`。
-- `secure_psk`：保存 `key_id -> secret`；收到 Hello 后按 `key_id` 查 secret，用同样 HKDF-SHA256 派生 PSK，并作为 Noise responder 返回 handshake message。
-- `ClientFrame` 解析：payload JSON 先按 `protocol_version` 和 `type` 分发；不认识的 `type` 记录日志并忽略，不要断开主连接。
-- `agent 状态`：按 `agent_id` 保存 `last_seen_at`、`last_sequence`、`latest_snapshot`、`wire_mode`、`connection_state`。
-- `snapshot`：把 `payload.report` 作为完整最新状态保存，并把该 frame 的 `sequence` 作为后续 delta 基准。
-- `delta`：先校验 `base_sequence` 是否等于 server 保存的基准；匹配时按顶层采样组整体覆盖，不匹配时下发 `snapshot_request`。
-- `heartbeat`：只更新业务在线时间和最后通信时间，不修改指标快照。
-- `ack/error`：用 `ack.sequence` 或 `error.sequence` 关联 server 之前下发的控制命令。
-- `remote_task_result`：用 `result.task_id` 关联任务记录，保存 status、exit_code、stdout/stderr、error 和 finished_at。
-- `job_result(kind=probe)`：用 `result.run_id` 作为单次探测运行唯一键；`point_id` 是 server 下发的业务探测点 ID，会随结果原样带回；`source=once` 时用 `request_id` 关联一次性请求，`source=job` 时用 `job_id` 关联持续任务。server 保存 point_id、probe_type、target、status、latency_ms、duration_ms、error 和 finished_at。
-- `ServerFrame 下发`：自有协议命令生成 server 侧递增 `sequence`，填 `protocol_version=1`、`sent_at`、`type`，可选填 `target_agent_id`，再按当前 wire mode 封包发送。
-- `config_patch`：只下发动态字段；不要下发日志字段、`diagnostics`、`remote_shell.enabled` 或 `remote_task.enabled`。
-- `snapshot_request`：当 server 缺完整状态、delta 基准不匹配或需要主动刷新时下发；短时间重复请求可以合并。
-- `第一版验收`：agent 能连接、server 能保存 snapshot、server 能下发 `ServerFrame(type=config_patch)` 调整频率并收到 `ack`，server 能下发 `ServerFrame(type=snapshot_request)` 并收到 agent 的 `ack` 和新的 snapshot。
-
-可以后做的功能：历史指标落库、Web UI、Komari server 兼容、真实 ICMP probe。
+- 主连接入口是 `/agent/v1/connect`，业务流围绕 `snapshot` / `delta` / `heartbeat` / `ack` / `error` / `remote_task_result` / `job_result` 展开。
+- 远程能力通过 `ServerFrame` 下发，`job_apply(kind=probe)` 是远程网络探测的统一入口，`remote_shell_open` 和 `remote_task_run` 仍然是独立能力。
 
 ### Server 对接注意事项
 
