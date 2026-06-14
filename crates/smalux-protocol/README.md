@@ -223,8 +223,8 @@ server 下发稳定命令时也是同样的顶层 `type`：
 - `job_result.kind` 是后续扩展点；server 应先按 `type=job_result` 再按 `kind` 分发。
 
 远程 shell stream 的业务 JSON 也定义在本 crate 中，agent 通过
-`decode_remote_shell_stream_command()` 解析 server 发来的 command，通过
-`encode_remote_shell_stream_event()` 编码 agent 发回的 event。transport 仍由外层决定：
+`decode_shell_stream_command()` 解析 server 发来的 command，通过
+`encode_shell_stream_event()` 编码 agent 发回的 event。transport 仍由外层决定：
 `binary_plain` 时它们是 `WirePacket(kind=PlainData)` 的 payload，`secure_psk` 时它们是解密后的
 `WirePacket(kind=SecureData)` payload，只有本地调试才建议直接走 WebSocket text。
 
@@ -382,6 +382,15 @@ transport adapter
   -> ingest::handle_client_frame()
   -> storage / query
 ```
+
+Rust server 实际最常用的四个 codec 入口就是：
+
+- `decode_client_frame_bytes()`
+- `encode_server_frame_bytes()`
+- `decode_shell_stream_command()`
+- `encode_shell_stream_event()`
+
+可以把它们理解为“业务 JSON 层”的入口；再往外一层才是 `secure` 和 `wire`。
 
 ## 兼容边界
 

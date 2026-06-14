@@ -510,6 +510,38 @@ on_binary(bytes):
 
 `binary_plain` 开发期可以允许 WebSocket text frame 直接进入 `route_json()`；`secure_psk` 不允许 text frame，因为 text 会绕过业务加密。
 
+如果按当前 Rust 实现直接落代码，secure 路径的调用顺序应固定为：
+
+```text
+server 收包
+  -> wire::decode_wire_packet()
+  -> if Hello:
+       secure::decode_secure_hello()
+       lookup secret by key_id
+       secure::build_noise_responder()
+  -> if Handshake:
+       secure::read_handshake_message()
+       secure::write_handshake_message()
+  -> if SecureData:
+       secure::decrypt_payload()
+       codec::decode_client_frame_bytes()
+
+server 发包
+  -> codec::encode_server_frame_bytes()
+  -> if secure_psk:
+       secure::encrypt_payload()
+       WirePacket::secure_data(...)
+     else:
+       WirePacket::plain_data(...)
+  -> wire::encode_wire_packet()
+```
+
+注意：
+
+- `codec` 不处理 wire，也不处理加密。
+- `secure` 只处理 payload bytes，不直接理解 `ClientFrame` / `ServerFrame`。
+- `wire` 只处理 packet header 和 payload 承载，不做认证判断。
+
 WirePacket 固定头和 agent 一致，所有整数都是 big-endian：
 
 ```text

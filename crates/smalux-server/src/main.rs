@@ -8,6 +8,7 @@ mod service;
 mod state;
 mod storage;
 
-fn main() -> anyhow::Result<()> {
-    bootstrap::run()
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    bootstrap::run().await
 }

@@ -10,97 +10,8 @@ use crate::frame::{
     ServerFrame,
 };
 
-/// 将内部上报语义编码为 smalux 默认 JSON frame。
-pub fn encode_outbound_report_as_smalux_json(
-    outbound: &OutboundReport,
-) -> serde_json::Result<String> {
-    let frame = outbound_report_to_client_frame(outbound);
-    encode_client_frame(&frame)
-}
-
-/// 将内部上报语义编码为 smalux 默认 JSON bytes。
-///
-/// WebSocket binary wire 使用这个 bytes 版本：transport 会把返回值继续封装成
-/// `PlainData` 或 `SecureData`，而不是再做一次字符串转换。
-pub fn encode_outbound_report_as_smalux_json_bytes(
-    outbound: &OutboundReport,
-) -> serde_json::Result<Vec<u8>> {
-    let frame = outbound_report_to_client_frame(outbound);
-    serde_json::to_vec(&frame)
-}
-
-/// 将远程任务结果编码为 smalux 默认 JSON bytes。
-pub fn encode_remote_task_result_as_smalux_json_bytes(
-    agent_id: &str,
-    sequence: u64,
-    sent_at: u64,
-    result: &RemoteTaskResult,
-) -> serde_json::Result<Vec<u8>> {
-    let frame = ClientFrame::new(
-        agent_id.to_string(),
-        sequence,
-        sent_at,
-        ClientPayload::RemoteTaskResult {
-            result: result.clone(),
-        },
-    );
-    serde_json::to_vec(&frame)
-}
-
-/// 将通用远程 job 结果编码为 smalux 默认 JSON bytes。
-pub fn encode_remote_job_result_as_smalux_json_bytes(
-    agent_id: &str,
-    sequence: u64,
-    sent_at: u64,
-    result: &RemoteJobResult,
-) -> serde_json::Result<Vec<u8>> {
-    let frame = ClientFrame::new(
-        agent_id.to_string(),
-        sequence,
-        sent_at,
-        ClientPayload::JobResult {
-            result: result.clone(),
-        },
-    );
-    serde_json::to_vec(&frame)
-}
-
-/// 将控制命令确认编码为 smalux 默认 JSON bytes。
-pub fn encode_ack_as_smalux_json_bytes(
-    agent_id: &str,
-    sequence: u64,
-    sent_at: u64,
-    ack: &Ack,
-) -> serde_json::Result<Vec<u8>> {
-    let frame = ClientFrame::new(
-        agent_id.to_string(),
-        sequence,
-        sent_at,
-        ClientPayload::Ack { ack: ack.clone() },
-    );
-    serde_json::to_vec(&frame)
-}
-
-/// 将协议错误编码为 smalux 默认 JSON bytes。
-pub fn encode_protocol_error_as_smalux_json_bytes(
-    agent_id: &str,
-    sequence: u64,
-    sent_at: u64,
-    error: &ProtocolError,
-) -> serde_json::Result<Vec<u8>> {
-    let frame = ClientFrame::new(
-        agent_id.to_string(),
-        sequence,
-        sent_at,
-        ClientPayload::Error {
-            error: error.clone(),
-        },
-    );
-    serde_json::to_vec(&frame)
-}
-
 /// 将内部上报语义转换为 client frame。
-fn outbound_report_to_client_frame(outbound: &OutboundReport) -> ClientFrame {
+pub fn client_frame_from_outbound_report(outbound: &OutboundReport) -> ClientFrame {
     ClientFrame::new(
         outbound.agent_id.clone(),
         outbound.sequence,
@@ -114,9 +25,80 @@ fn outbound_report_to_client_frame(outbound: &OutboundReport) -> ClientFrame {
     )
 }
 
+/// 从远程任务结果构造 client frame。
+pub fn client_frame_from_remote_task_result(
+    agent_id: &str,
+    sequence: u64,
+    sent_at: u64,
+    result: &RemoteTaskResult,
+) -> ClientFrame {
+    ClientFrame::new(
+        agent_id.to_string(),
+        sequence,
+        sent_at,
+        ClientPayload::RemoteTaskResult {
+            result: result.clone(),
+        },
+    )
+}
+
+/// 从通用远程 job 结果构造 client frame。
+pub fn client_frame_from_remote_job_result(
+    agent_id: &str,
+    sequence: u64,
+    sent_at: u64,
+    result: &RemoteJobResult,
+) -> ClientFrame {
+    ClientFrame::new(
+        agent_id.to_string(),
+        sequence,
+        sent_at,
+        ClientPayload::JobResult {
+            result: result.clone(),
+        },
+    )
+}
+
+/// 从控制确认构造 client frame。
+pub fn client_frame_from_ack(
+    agent_id: &str,
+    sequence: u64,
+    sent_at: u64,
+    ack: &Ack,
+) -> ClientFrame {
+    ClientFrame::new(
+        agent_id.to_string(),
+        sequence,
+        sent_at,
+        ClientPayload::Ack { ack: ack.clone() },
+    )
+}
+
+/// 从协议错误构造 client frame。
+pub fn client_frame_from_protocol_error(
+    agent_id: &str,
+    sequence: u64,
+    sent_at: u64,
+    error: &ProtocolError,
+) -> ClientFrame {
+    ClientFrame::new(
+        agent_id.to_string(),
+        sequence,
+        sent_at,
+        ClientPayload::Error {
+            error: error.clone(),
+        },
+    )
+}
+
 /// 编码 agent 发往 server 的 frame。
 pub fn encode_client_frame(frame: &ClientFrame) -> serde_json::Result<String> {
     serde_json::to_string(frame)
+}
+
+/// 编码 agent 发往 server 的 frame bytes。
+pub fn encode_client_frame_bytes(frame: &ClientFrame) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(frame)
 }
 
 /// 解码 agent 发往 server 的 frame。
@@ -124,9 +106,19 @@ pub fn decode_client_frame(input: &str) -> serde_json::Result<ClientFrame> {
     serde_json::from_str(input)
 }
 
+/// 解码 agent 发往 server 的 frame bytes。
+pub fn decode_client_frame_bytes(input: &[u8]) -> serde_json::Result<ClientFrame> {
+    serde_json::from_slice(input)
+}
+
 /// 编码 server 发往 agent 的 frame。
 pub fn encode_server_frame(frame: &ServerFrame) -> serde_json::Result<String> {
     serde_json::to_string(frame)
+}
+
+/// 编码 server 发往 agent 的 frame bytes。
+pub fn encode_server_frame_bytes(frame: &ServerFrame) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(frame)
 }
 
 /// 解码 server 发往 agent 的 frame。
@@ -136,21 +128,22 @@ pub fn decode_server_frame(input: &str) -> serde_json::Result<ServerFrame> {
     serde_json::from_str(input)
 }
 
+/// 解码 server 发往 agent 的 frame bytes。
+pub fn decode_server_frame_bytes(input: &[u8]) -> serde_json::Result<ServerFrame> {
+    serde_json::from_slice(input)
+}
+
 /// 编码远程 shell stream 事件。
 ///
 /// 这里仅生成业务 JSON；WebSocket transport 会继续按当前 wire mode 封装或加密。
-pub fn encode_remote_shell_stream_event(
-    event: &RemoteShellStreamEvent,
-) -> serde_json::Result<String> {
+pub fn encode_shell_stream_event(event: &RemoteShellStreamEvent) -> serde_json::Result<String> {
     serde_json::to_string(event)
 }
 
 /// 解码远程 shell stream 命令。
 ///
 /// server 发给 agent 的临时 shell stream payload 应先按 wire mode 解包，再交给本函数解析。
-pub fn decode_remote_shell_stream_command(
-    input: &str,
-) -> serde_json::Result<RemoteShellStreamCommand> {
+pub fn decode_shell_stream_command(input: &str) -> serde_json::Result<RemoteShellStreamCommand> {
     serde_json::from_str(input)
 }
 
@@ -182,7 +175,8 @@ mod tests {
             },
         );
 
-        let json = encode_outbound_report_as_smalux_json(&outbound).unwrap();
+        let frame = client_frame_from_outbound_report(&outbound);
+        let json = encode_client_frame(&frame).unwrap();
         let decoded = decode_client_frame(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
@@ -210,7 +204,8 @@ mod tests {
             },
         );
 
-        let json = encode_outbound_report_as_smalux_json(&outbound).unwrap();
+        let frame = client_frame_from_outbound_report(&outbound);
+        let json = encode_client_frame(&frame).unwrap();
         let decoded = decode_client_frame(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
@@ -401,7 +396,7 @@ mod tests {
     /// 验证 shell stream command 可以通过 protocol codec 解码。
     #[test]
     fn remote_shell_stream_command_decodes_json() {
-        let decoded = decode_remote_shell_stream_command(
+        let decoded = decode_shell_stream_command(
             r#"{ "type": "input", "data": "echo ok\n", "encoding": "utf8" }"#,
         )
         .unwrap();
@@ -418,7 +413,7 @@ mod tests {
     /// 验证 shell stream event 可以通过 protocol codec 编码。
     #[test]
     fn remote_shell_stream_event_encodes_json() {
-        let encoded = encode_remote_shell_stream_event(&RemoteShellStreamEvent::Exit {
+        let encoded = encode_shell_stream_event(&RemoteShellStreamEvent::Exit {
             session_id: "shell-1".to_string(),
             code: None,
         })
@@ -446,9 +441,9 @@ mod tests {
             error: None,
         };
 
-        let json =
-            encode_remote_task_result_as_smalux_json_bytes("agent-1", 7, 101, &result).unwrap();
-        let decoded = decode_client_frame(std::str::from_utf8(&json).unwrap()).unwrap();
+        let frame = client_frame_from_remote_task_result("agent-1", 7, 101, &result);
+        let json = encode_client_frame_bytes(&frame).unwrap();
+        let decoded = decode_client_frame_bytes(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.sequence, 7);
@@ -480,14 +475,10 @@ mod tests {
             error: None,
         };
 
-        let json = encode_remote_job_result_as_smalux_json_bytes(
-            "agent-1",
-            8,
-            101,
-            &RemoteJobResult::probe(result),
-        )
-        .unwrap();
-        let decoded = decode_client_frame(std::str::from_utf8(&json).unwrap()).unwrap();
+        let frame =
+            client_frame_from_remote_job_result("agent-1", 8, 101, &RemoteJobResult::probe(result));
+        let json = encode_client_frame_bytes(&frame).unwrap();
+        let decoded = decode_client_frame_bytes(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.sequence, 8);
@@ -512,9 +503,9 @@ mod tests {
     /// 验证控制命令确认可以编码为 client frame。
     #[test]
     fn ack_encodes_as_client_frame() {
-        let json =
-            encode_ack_as_smalux_json_bytes("agent-1", 8, 102, &Ack { sequence: 7 }).unwrap();
-        let decoded = decode_client_frame(std::str::from_utf8(&json).unwrap()).unwrap();
+        let frame = client_frame_from_ack("agent-1", 8, 102, &Ack { sequence: 7 });
+        let json = encode_client_frame_bytes(&frame).unwrap();
+        let decoded = decode_client_frame_bytes(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.sequence, 8);
@@ -533,8 +524,9 @@ mod tests {
             message: "telemetry state is not ready".to_string(),
         };
 
-        let json = encode_protocol_error_as_smalux_json_bytes("agent-1", 9, 103, &error).unwrap();
-        let decoded = decode_client_frame(std::str::from_utf8(&json).unwrap()).unwrap();
+        let frame = client_frame_from_protocol_error("agent-1", 9, 103, &error);
+        let json = encode_client_frame_bytes(&frame).unwrap();
+        let decoded = decode_client_frame_bytes(&json).unwrap();
 
         assert_eq!(decoded.agent_id, "agent-1");
         assert_eq!(decoded.sequence, 9);

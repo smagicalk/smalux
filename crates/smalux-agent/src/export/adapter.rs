@@ -10,9 +10,9 @@ use crate::service::outbound::{
     RemoteTaskResultEnvelope,
 };
 use smalux_protocol::{
-    OutboundReport, encode_ack_as_smalux_json_bytes, encode_outbound_report_as_smalux_json_bytes,
-    encode_protocol_error_as_smalux_json_bytes, encode_remote_job_result_as_smalux_json_bytes,
-    encode_remote_task_result_as_smalux_json_bytes,
+    OutboundReport, client_frame_from_ack, client_frame_from_outbound_report,
+    client_frame_from_protocol_error, client_frame_from_remote_job_result,
+    client_frame_from_remote_task_result, encode_client_frame_bytes,
 };
 
 /// Smalux 自有协议主连接路径。
@@ -108,7 +108,8 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
             );
         }
 
-        let json = encode_outbound_report_as_smalux_json_bytes(outbound)?;
+        let frame = client_frame_from_outbound_report(outbound);
+        let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = outbound.sequence,
             body_bytes = json.len(),
@@ -127,12 +128,13 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         result: &RemoteTaskResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let json = encode_remote_task_result_as_smalux_json_bytes(
+        let frame = client_frame_from_remote_task_result(
             &result.agent_id,
             result.sequence,
             result.created_at,
             &result.result,
-        )?;
+        );
+        let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = result.sequence,
             task_id = %result.result.task_id,
@@ -152,12 +154,13 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let json = encode_remote_job_result_as_smalux_json_bytes(
+        let frame = client_frame_from_remote_job_result(
             &result.agent_id,
             result.sequence,
             result.created_at,
             &result.result,
-        )?;
+        );
+        let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = result.sequence,
             job_kind = result.result.kind().as_str(),
@@ -178,8 +181,8 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         ack: &ControlAckEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let json =
-            encode_ack_as_smalux_json_bytes(&ack.agent_id, ack.sequence, ack.created_at, &ack.ack)?;
+        let frame = client_frame_from_ack(&ack.agent_id, ack.sequence, ack.created_at, &ack.ack);
+        let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = ack.sequence,
             server_sequence = ack.ack.sequence,
@@ -199,12 +202,13 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         error: &ControlErrorEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let json = encode_protocol_error_as_smalux_json_bytes(
+        let frame = client_frame_from_protocol_error(
             &error.agent_id,
             error.sequence,
             error.created_at,
             &error.error,
-        )?;
+        );
+        let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = error.sequence,
             server_sequence = error.error.sequence,

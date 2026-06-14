@@ -1,6 +1,8 @@
 //! server 启动编排模块，负责串联日志、CLI、配置、数据库、HTTP server 和后台任务。
 
 use clap::Parser;
+use sea_orm::Database;
+use sea_orm_migration::MigratorTrait;
 
 use crate::cli::args::ServerArgs;
 use crate::config::validation::validate_server_config;
@@ -9,10 +11,13 @@ use crate::config::validation::validate_server_config;
 ///
 /// 当前只接入 CLI 解析，确保 `--help` 和启动参数结构可用；后续在这里继续串联
 /// 配置校验、日志初始化、数据库连接和 HTTP server。
-pub fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let config = ServerArgs::parse().into_config()?;
     validate_server_config(&config)?;
     log_startup_config(&config)?;
+    let database = Database::connect(config.database.connection_url()?).await?;
+    crate::storage::migration::Migrator::up(&database, None).await?;
+    tracing::info!("server bootstrap finished");
     Ok(())
 }
 

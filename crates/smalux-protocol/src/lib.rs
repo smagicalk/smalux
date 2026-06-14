@@ -13,11 +13,11 @@ pub mod secure;
 pub mod wire;
 
 pub use codec::{
-    decode_client_frame, decode_remote_shell_stream_command, decode_server_frame,
-    encode_ack_as_smalux_json_bytes, encode_client_frame, encode_outbound_report_as_smalux_json,
-    encode_outbound_report_as_smalux_json_bytes, encode_protocol_error_as_smalux_json_bytes,
-    encode_remote_job_result_as_smalux_json_bytes, encode_remote_shell_stream_event,
-    encode_remote_task_result_as_smalux_json_bytes, encode_server_frame,
+    client_frame_from_ack, client_frame_from_outbound_report, client_frame_from_protocol_error,
+    client_frame_from_remote_job_result, client_frame_from_remote_task_result, decode_client_frame,
+    decode_client_frame_bytes, decode_server_frame, decode_server_frame_bytes,
+    decode_shell_stream_command, encode_client_frame, encode_client_frame_bytes,
+    encode_server_frame, encode_server_frame_bytes, encode_shell_stream_event,
 };
 pub use frame::{
     Ack, ClientFrame, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest,

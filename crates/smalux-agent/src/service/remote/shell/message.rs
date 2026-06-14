@@ -40,7 +40,7 @@ pub(crate) fn open_request_initial_size(request: &RemoteShellOpenRequest) -> (u1
 
 /// 解析 shell stream command。
 pub(crate) fn parse_stream_command(text: &str) -> anyhow::Result<RemoteShellStreamCommand> {
-    Ok(smalux_protocol::decode_remote_shell_stream_command(text)?)
+    Ok(smalux_protocol::decode_shell_stream_command(text)?)
 }
 
 /// 把输入 command 解码成 PTY 字节。
@@ -59,7 +59,7 @@ pub(crate) fn decode_input_bytes(command: RemoteShellStreamCommand) -> anyhow::R
 
 /// 编码 shell stream event。
 pub(crate) fn encode_stream_event(event: &RemoteShellStreamEvent) -> anyhow::Result<String> {
-    Ok(smalux_protocol::encode_remote_shell_stream_event(event)?)
+    Ok(smalux_protocol::encode_shell_stream_event(event)?)
 }
 
 /// 把 PTY 输出编码成 stream event。
