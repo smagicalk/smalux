@@ -4,13 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# 协议编解码边界的通用错误封装。
 anyhow = { version = "1.0.100", features = ["default"] }
+# 二进制字段的文本表示，用于 JSON 和兼容协议。
 base64 = "0.22.1"
+# HKDF 密钥派生，用于从 token 或 PSK 派生 secure key。
 hkdf = "0.12.4"
+# SHA-256 摘要算法，配合 HKDF 完成密钥派生。
 sha2 = "0.10.9"
+# Noise Protocol 实现，负责 secure PSK 握手与传输加密。
 snow = "0.9.6"
+# 协议 frame 和配置模型的序列化能力。
 serde = { version = "1.0.228", features = ["derive"] }
+# 自有协议 JSON frame 的编解码。
 serde_json = "1.0.145"
+# 定义稳定、可匹配的协议错误类型。
 thiserror = { version = "2.0.18", features = ["default"] }
+# 协议配置中人类可读时长字段的 serde 支持。
 humantime-serde = "1.1.1"
+# 复用公共类型、错误辅助和基础工具。
 smalux-core = { path = "../smalux-core" }

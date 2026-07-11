@@ -4,33 +4,61 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Agent 异步运行时，负责采集任务、调度、网络连接和后台服务。
 tokio = { version = "1.49.0", features = ["full"] }
+# Future、Stream 和 Sink 扩展工具，用于组合异步消息流。
 futures-util = { version = "0.3.31", features = ["default", "tokio-io"] }
+# Tokio WebSocket 客户端，用于连接 Smalux 或兼容服务端。
 tokio-tungstenite = { version = "0.28.0", features = ["default", "tokio-rustls", "rustls", "rustls-tls-webpki-roots"] }
+# TLS 协议实现，为 WebSocket 和其他网络传输提供加密连接。
 rustls = { version = "0.23.36", default-features = true }
+# URL 查询参数编解码，用于构造 token 等连接参数。
 form_urlencoded = "1.2.2"
+# Base64 编解码，用于二进制日志预览、终端数据和兼容协议。
 base64 = "0.22.1"
+# 跨平台 PTY 实现，用于远程交互式 shell。
 portable-pty = "0.9.0"
+# Noise Protocol 实现，用于自有协议的 secure PSK 握手和数据加密。
 snow = "0.9.6"
+# 高效字节缓冲区，用于 WebSocket、wire frame 和流式数据。
 bytes = { version = "1.11.1", features = ["default"] }
+# 命令行参数解析，用于 Agent 启动配置。
 clap = { version = "4.5.53", features = ["derive"] }
+# 人类可读时长解析，例如 5s、10m。
 humantime = "2.3.0"
+# 让 serde 支持人类可读时长字段。
 humantime-serde = "1.1.1"
+# 序列化基础能力，用于配置、采集数据和协议模型。
 serde = { version = "1.0.228", features = ["derive"] }
+# JSON 编解码，用于上报、控制消息和兼容协议。
 serde_json = "1.0.149"
+# JSONPath 查询，用于结构化数据筛选和兼容格式处理。
 serde_json_path = { version = "0.7.2", features = ["default"] }
+# 结构化日志 API，记录 Agent 运行状态和诊断信息。
 tracing = { version = "0.1.44", features = ["log", "std"] }
+# tracing 日志订阅器，提供 RUST_LOG、JSON 和本地时间格式支持。
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json", "local-time"] }
+# 应用边界的通用错误封装，用于附加错误上下文。
 anyhow = { version = "1.0.100", features = ["default"] }
+# 定义稳定的模块错误类型。
 thiserror = { version = "2.0.18", features = ["default"] }
+# 跨平台系统信息采集，用于 CPU、内存、磁盘、网络和进程指标。
 sysinfo = { version = "0.38.0", features = ["default", "multithread"] }
+# 跨平台 socket 统计，用于连接数量和详细连接信息采集。
 netstat2 = "0.11.2"
+# HTTP 客户端，用于公网 IP、HTTP 上报、探测和兼容端点。
 reqwest = { version = "0.13.1", features = ["multipart", "hickory-dns", "json"] }
+# UUID 生成，用于 Agent 标识、任务和会话 ID。
 uuid = { version = "1.20.0", features = ["v4"] }
+# gRPC 客户端与服务基础能力，为后续 gRPC 传输预留。
 tonic = { version = "0.14.2", features = ["default"] }
+# Protocol Buffers 消息编解码，与 tonic 配合使用。
 prost = { version = "0.14.3", features = ["default"] }
+# 项目公共基础库，复用日志、工具和跨 crate 类型。
 smalux-core = { path = "../smalux-core" }
+# 项目自有协议库，复用 frame、codec 和 secure 能力。
 smalux-protocol = { path = "../smalux-protocol" }
 
 [dev-dependencies]
+# 测试进程初始化钩子，用于测试环境的全局准备工作。
 ctor = "0.6.3"
