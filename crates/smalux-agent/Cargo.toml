@@ -4,3 +4,33 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+futures-util = { version = "0.3.31", features = ["default", "tokio-io"] }
+tokio-tungstenite = { version = "0.28.0", features = ["default", "tokio-rustls", "rustls", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.36", default-features = true }
+form_urlencoded = "1.2.2"
+base64 = "0.22.1"
+portable-pty = "0.9.0"
+snow = "0.9.6"
+bytes = { version = "1.11.1", features = ["default"] }
+clap = { version = "4.5.53", features = ["derive"] }
+humantime = "2.3.0"
+humantime-serde = "1.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_json_path = { version = "0.7.2", features = ["default"] }
+tracing = { version = "0.1.44", features = ["log", "std"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json", "local-time"] }
+anyhow = { version = "1.0.100", features = ["default"] }
+thiserror = { version = "2.0.18", features = ["default"] }
+sysinfo = { version = "0.38.0", features = ["default", "multithread"] }
+netstat2 = "0.11.2"
+reqwest = { version = "0.13.1", features = ["multipart", "hickory-dns", "json"] }
+uuid = { version = "1.20.0", features = ["v4"] }
+tonic = { version = "0.14.2", features = ["default"] }
+prost = { version = "0.14.3", features = ["default"] }
+smalux-core = { path = "../smalux-core" }
+smalux-protocol = { path = "../smalux-protocol" }
+
+[dev-dependencies]
+ctor = "0.6.3"
