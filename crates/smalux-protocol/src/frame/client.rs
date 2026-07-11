@@ -1,8 +1,8 @@
 //! agent 发往 server 的 frame。
 
 use super::{
-    Ack, DeltaReport, Heartbeat, ProtocolError, RemoteJobResult, RemoteTaskResult,
-    SMALUX_PROTOCOL_VERSION,
+    Ack, ClientEvent, ClientEventKind, DeltaReport, Heartbeat, ProtocolError, RemoteJobResult,
+    RemoteTaskResult, SMALUX_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use smalux_core::model::info::AgentReport;
@@ -38,6 +38,21 @@ impl ClientFrame {
             sent_at,
             payload,
         }
+    }
+
+    /// 从 client 侧内部事件构造 smalux JSON frame。
+    pub fn from_event(event: &ClientEvent) -> Self {
+        Self::new(
+            event.agent_id.clone(),
+            event.sequence,
+            event.created_at,
+            match event.kind.clone() {
+                ClientEventKind::Snapshot { report } => ClientPayload::Snapshot { report },
+                ClientEventKind::Heartbeat { heartbeat } => ClientPayload::Heartbeat { heartbeat },
+                ClientEventKind::Delta { delta } => ClientPayload::Delta { delta },
+                ClientEventKind::Ack { ack } => ClientPayload::Ack { ack },
+            },
+        )
     }
 }
 

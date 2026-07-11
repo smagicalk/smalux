@@ -1,14 +1,15 @@
-//! 远程非交互任务静态能力开关。
+//! 远程非交互任务执行。
 //!
-//! 远程任务用于后续备份、更新、一次性动作等非交互能力。它和交互式 shell
-//! 分开建模，默认关闭，且只能由 CLI 启动参数开启。任务并发数放在动态
+//! 远程任务用于后续备份、更新、一次性动作等非交互能力。静态启用位和
+//! 交互式 shell 共享同一个远程命令能力开关；任务并发数放在动态
 //! `AgentConfig.remote_task` 中，server patch 可以在能力已开启后调整。
 
 use crate::collect::unix_timestamp_secs;
 use crate::config::ConfigManager;
 use crate::service::message::outbound::{
-    OutboundEvent, OutboundSender, OutboundSequence, RemoteTaskResultEnvelope,
+    ExportEvent, OutboundSender, OutboundSequence, RemoteTaskResultEnvelope,
 };
+use crate::service::remote::RemoteCommandOptions;
 use serde::Deserialize;
 use smalux_core::utils::validate::ensure_non_empty;
 use smalux_protocol::{RemoteTaskRequest, RemoteTaskResult, RemoteTaskStatus};
@@ -18,27 +19,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-
-/// 远程非交互任务运行选项。
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct RemoteTaskOptions {
-    /// 是否启用远程任务；只能由 CLI 启动参数开启。
-    pub enabled: bool,
-}
-
-impl Default for RemoteTaskOptions {
-    /// 默认关闭远程任务。
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
-
-impl RemoteTaskOptions {
-    /// 校验远程任务静态选项。
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
 
 /// server 下发的远程非交互任务请求。
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
@@ -80,7 +60,7 @@ impl From<RemoteTaskRequest> for RemoteTaskRunRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteTaskManager {
     /// CLI-only 静态开关。
-    options: RemoteTaskOptions,
+    options: RemoteCommandOptions,
     /// 动态配置管理器。
     config_manager: ConfigManager,
     /// 出站事件发送端。
@@ -94,7 +74,7 @@ pub(crate) struct RemoteTaskManager {
 impl RemoteTaskManager {
     /// 创建远程任务管理器。
     pub(crate) fn new(
-        options: RemoteTaskOptions,
+        options: RemoteCommandOptions,
         config_manager: ConfigManager,
         outbound_tx: OutboundSender,
         sequence: OutboundSequence,
@@ -221,9 +201,9 @@ impl RemoteTaskManager {
     }
 
     /// 把协议结果包装成出站事件。
-    fn result_event(&self, agent_id: String, result: RemoteTaskResult) -> OutboundEvent {
+    fn result_event(&self, agent_id: String, result: RemoteTaskResult) -> ExportEvent {
         let sequence = self.sequence.next();
-        OutboundEvent::RemoteTaskResult(RemoteTaskResultEnvelope::new(agent_id, sequence, result))
+        ExportEvent::RemoteTaskResult(RemoteTaskResultEnvelope::new(agent_id, sequence, result))
     }
 }
 
@@ -434,12 +414,12 @@ mod tests {
 
     use super::*;
     use crate::config::{AgentConfig, ConfigManager};
-    use crate::service::message::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
+    use crate::service::message::outbound::{ExportEvent, OutboundSequence, outbound_channel};
 
     /// 验证默认远程任务关闭。
     #[test]
     fn remote_task_is_disabled_by_default() {
-        let options = RemoteTaskOptions::default();
+        let options = RemoteCommandOptions::default();
 
         assert!(!options.enabled);
         options.validate().unwrap();
@@ -455,7 +435,7 @@ mod tests {
         let manager = ConfigManager::new(AgentConfig::default()).unwrap();
         let (outbound_tx, outbound_rx) = outbound_channel();
         let task_manager = RemoteTaskManager::new(
-            RemoteTaskOptions { enabled },
+            RemoteCommandOptions { enabled },
             manager,
             outbound_tx,
             OutboundSequence::default(),
@@ -480,7 +460,7 @@ mod tests {
             .unwrap();
 
         let event = outbound_rx.recv().await.unwrap();
-        let OutboundEvent::RemoteTaskResult(result) = event else {
+        let ExportEvent::RemoteTaskResult(result) = event else {
             panic!("expected remote task result");
         };
 
@@ -507,7 +487,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let OutboundEvent::RemoteTaskResult(result) = event else {
+        let ExportEvent::RemoteTaskResult(result) = event else {
             panic!("expected remote task result");
         };
 

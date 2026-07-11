@@ -2,205 +2,102 @@
 
 ## 恢复目标
 
-用于在新电脑或新会话中快速恢复当前开发上下文。项目路径：`F:/code/rust/smalux`。当前分支：`dev`。
+用于在其他电脑或新会话中快速恢复当前开发上下文。
 
-## 当前工作区状态
+- 项目路径：`F:/code/rust/smalux`
+- 当前分支：`dev`
+- 当前重点：继续推进 `smalux-server`
 
-本次会话开始时工作区已有未提交改动，主要集中在 `crates/smalux-server`：
+## 当前工作区
 
-- `Cargo.lock`
-- `crates/smalux-server/Cargo.toml`
-- `crates/smalux-server/README.md`
-- `crates/smalux-server/plan.md`
-- `crates/smalux-server/src/bootstrap.rs`
-- `crates/smalux-server/src/cli/args.rs`
-- `crates/smalux-server/src/config/defaults.rs`
-- `crates/smalux-server/src/config/model.rs`
-- `crates/smalux-server/src/config/validation.rs`
+工作区当前有未提交改动，主要集中在 `crates/smalux-server`，同时也有文档更新。
 
-本轮又补了非 server 模块修复，涉及：
+最近一轮文档整理已经把长篇 README 收敛为：
 
-- `crates/smalux-core/src/utils.rs`
-- `crates/smalux-protocol/src/lib.rs`
-- `crates/smalux-protocol/src/secure.rs`
-- `crates/smalux-protocol/src/frame.rs`
-- `crates/smalux-protocol/src/frame/remote.rs`
-- `crates/smalux-protocol/src/frame/remote/probe.rs`
-- `crates/smalux-protocol/src/codec.rs`
-- `crates/smalux-agent/src/service/message/inbound.rs`
-- `crates/smalux-agent/src/service/remote/task.rs`
-- `crates/smalux-agent/src/service/remote/probe.rs`
-- `crates/smalux-agent/src/service/export.rs`
-- `crates/smalux-agent/src/service/export/pending.rs`
-- `crates/smalux-agent/src/service.rs`
-- `crates/smalux-agent/src/export.rs`
-- `crates/smalux-agent/src/export/komari.rs`
-- `crates/smalux-agent/src/export/komari/message.rs`
-- `crates/smalux-agent/src/export/komari/model.rs`
-- 根目录 `README.md`
-- 本文件 `session.md`
+- 根 README：workspace 总览。
+- crate README：各 crate 职责、入口和扩展边界。
+- `crates/smalux-server/plan.md`：server 实现协议和参数速查。
+- `session.md`：恢复上下文。
 
-恢复时先执行：
+恢复后先执行：
 
 ```powershell
 git status --short
 cargo fmt --all --check
+cargo check --workspace
 cargo test -p smalux-core
 cargo test -p smalux-protocol
 cargo test -p smalux-agent
-cargo check -p smalux-server
+cargo test -p smalux-server
 ```
 
-如果 `git status --short` 里除了上述文件之外还有别的改动，先确认来源，不要直接回滚。
+如果 `git status --short` 里出现你不认识的文件，不要直接回滚，先确认来源。
 
 ## 当前项目状态
 
-- `smalux-agent`：监控 agent，已有采集、动态配置、导出、Komari 兼容、remote task/job/shell。
-- `smalux-core`：共享模型、日志、脱敏工具和公共工具。
-- `smalux-protocol`：共享 `ClientFrame`、`ServerFrame`、wire、secure_psk、remote payload。
-- `smalux-server`：当前还是骨架，但目录、依赖、README 和详细实现计划已经建立，CLI/config 已经落了一部分。
-
-## 当前核心变更
-
-当前自有协议已经统一到通用远程 job 模型：
-
-- `ServerFrame(type=job_apply)`
-- `ClientFrame(type=job_result)`
-- 当前稳定 job 类型：`kind=probe`
-
-当前状态要点：
-
-- 自有协议不再使用 `remote_probe_apply` / `remote_probe_result`。
-- `ClientPayload::RemoteProbeResult` 兼容分支已删除。
-- `job_apply(kind=probe)` 只接受 `request_id`，不再接受 `task_id` alias。
-- Komari 兼容仍保留，但只在 adapter/handler 内转换，不污染自有协议模型。
-- 身份低频刷新文件已从 `service/collector/public_ip.rs` 调整为 `service/collector/identity.rs`。
-
-关键入口：
-
-- `crates/smalux-protocol/src/frame/remote/job.rs`
-- `crates/smalux-agent/src/service/remote/job.rs`
-- `crates/smalux-agent/src/service/collector/identity.rs`
-
-当前交互矩阵：
-
-| 方向 | 通道 | 主要消息 |
-| --- | --- | --- |
-| agent -> server | 主 WebSocket | `snapshot` / `delta` / `heartbeat` / `ack` / `error` / `remote_task_result` / `job_result` |
-| server -> agent | 主 WebSocket | `snapshot_request` / `config_patch` / `collect_processes_once` / `collect_sockets_once` / `remote_task_run` / `job_apply` / `remote_shell_open` |
-| shell 双向 | 临时 shell stream | `input` / `resize` / `close` / `heartbeat` / `opened` / `output` / `exit` / `error` |
-| Komari -> agent | WebSocket 文本 | `terminal` / `exec` / `ping` |
-| agent -> Komari | WebSocket / HTTP | report / `uploadBasicInfo` / `task/result` / `ping_result` |
-
-## 当前验证状态
-
-已通过：
-
-```powershell
-cargo fmt --all --check
-cargo check --workspace
-cargo test -p smalux-protocol
-cargo test -p smalux-agent
-cargo clippy --workspace --all-targets -- -D warnings
-```
+| crate | 状态 |
+| --- | --- |
+| `smalux-agent` | 主体已实现：采集、导出、动态配置、Komari、remote task/job/shell |
+| `smalux-core` | 共享模型、日志和脱敏工具已可复用 |
+| `smalux-protocol` | frame、codec、wire、secure_psk 已集中 |
+| `smalux-server` | 正在开发：CLI/config/bootstrap/DB/最小 axum 已有，业务闭环未完成 |
 
 ## 关键设计结论
 
-### 1. 项目当前真实完成度
+- 自有协议主连接路径：`/agent/v1/connect`。
+- 自有协议远程探测统一到通用 `job_apply(kind=probe)` / `job_result(kind=probe)`。
+- 第三方兼容只放 adapter，不污染自有协议模型。
+- agent 上报由采集事件驱动，不再用单一 reporter interval 决定所有数据发送。
+- remote shell / remote task 的启用开关是 agent CLI-only，server 运行时不能动态打开。
+- 日志级别统一使用 `RUST_LOG`，日志内容用英文，代码注释用中文。
+- server token/key 后续由添加 agent 流程生成并存数据库，不放 server CLI。
+- server 前端槽位分为 `site` 和 `admin`，支持 `embedded`、`directory`、`external`。
 
-不是四个 crate 都已经完整：
-
-- `smalux-agent` / `smalux-core` / `smalux-protocol` 已较完整。
-- `smalux-server` 仍在搭骨架和推进实现计划。
-
-阅读项目时应先看：
-
-1. `crates/smalux-agent/README.md`
-2. `crates/smalux-protocol/README.md`
-3. `crates/smalux-agent/src/main.rs`
-4. `crates/smalux-agent/src/service.rs`
-5. `crates/smalux-agent/src/service/reporter.rs`
-6. `crates/smalux-agent/src/service/export.rs`
-7. `crates/smalux-server/README.md`
-8. `crates/smalux-server/plan.md`
-
-### 2. server 主连接路径已经统一
-
-自有协议 agent 主连接路径已经统一为：
+## 当前 server 结构
 
 ```text
-/agent/v1/connect
+src/
+  bootstrap.rs       # 启动编排
+  state.rs           # AppState
+  cli/args.rs        # ServerArgs
+  config/            # defaults/model/validation
+  http/              # router/middleware/agent/web
+  service/           # agent/web/event
+  storage/           # database URL/init/migration/repository
 ```
 
-旧的 `/api/agents/connect` 已不再使用。
+当前真实路由：
 
-### 3. server 删除 query 模块
+- `GET /agent/v1/connect`
+- `GET /api/v1/health`
+- `GET /api/v1/realtime/*`
+- `/`
+- `/admin`
+- `/assets/site/*`
+- `/assets/admin/*`
 
-`crates/smalux-server/src/query.rs` 和 `query/` 已删除，前端读模型职责改为：
+## 文档入口
 
-- agent 列表、latest、在线状态：`service/agent.rs`
-- dashboard 聚合：`service/dashboard.rs`
-- REST handler：`http/rest.rs`
-- 数据库存取：`storage/repository.rs`
-
-### 4. React 前端托管规则
-
-server 当前方向是：
-
-```text
-frontend enabled + 编译了 frontend-embed
-  -> 使用内置前端
-
-frontend enabled + 未编译 frontend-embed
-  -> 使用 frontend-dir
-
-frontend disabled
-  -> server 只提供 agent/api/live，不托管前端
-```
-
-不再推荐运行时 `frontend-mode disabled|dir|embedded`。
-
-## 当前验证结果
-
-本轮已通过：
-
-```powershell
-cargo fmt --all --check
-cargo check --workspace
-cargo test -p smalux-protocol
-cargo test -p smalux-agent
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-`cargo test -p smalux-agent` 当前结果：
-
-```text
-297 passed, 4 ignored
-```
-
-恢复后如果要先确认协议/交互没有漂移，优先执行：
-
-```powershell
-cargo test -p smalux-protocol
-cargo test -p smalux-agent export::komari::message::tests::inbound_handler_enqueues_ping_command
-cargo test -p smalux-agent service::remote::job
-```
+- 项目总览：[README.md](README.md)
+- agent：[crates/smalux-agent/README.md](crates/smalux-agent/README.md)
+- core：[crates/smalux-core/README.md](crates/smalux-core/README.md)
+- protocol：[crates/smalux-protocol/README.md](crates/smalux-protocol/README.md)
+- server：[crates/smalux-server/README.md](crates/smalux-server/README.md)
+- server 协议字段速查：[crates/smalux-server/plan.md](crates/smalux-server/plan.md)
 
 ## 下一步建议
 
-下一步继续推进 `smalux-server`：
+1. 完成 server agent 认证和 `secure_psk` responder。
+2. 完成 `/agent/v1/connect` wire/frame 读写循环。
+3. 接收 `snapshot` / `heartbeat` 并写入 latest state。
+4. 增加 REST 查询。
+5. 增加命令下发和 ack/result 回收。
+6. 再补 dashboard realtime、session、权限和审计。
 
-1. 把 `bootstrap::run()` 从“解析 CLI + 校验配置”推进到真正启动最小 HTTP server。
-2. 加 `GET /api/v1/health`。
-3. 先接 `MemoryRepository`。
-4. 跑通 `/agent/v1/connect` + `snapshot/heartbeat` -> latest state。
-5. 再接 REST 查询和命令下发。
+## 协作约定
 
-## 协作注意
-
-- 始终使用简体中文沟通；代码标识符、命令、日志、报错保持原文。
+- 始终用简体中文沟通。
+- 代码标识符、命令、日志、报错保留原文。
 - 代码注释用中文，日志内容用英文。
-- 修改现有文件优先用 `apply_patch`。
-- 不要回滚用户未明确要求回滚的改动。
-- 后续继续修改非 server 模块时，优先维护已有测试覆盖。
-- 如果再改协议字段，必须同步 `smalux-agent` 和 `smalux-protocol` 两侧测试与 README。
+- 修改文件优先使用 `apply_patch`。
+- 不回滚用户未明确要求回滚的改动。

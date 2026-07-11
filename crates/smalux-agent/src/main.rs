@@ -44,9 +44,8 @@ async fn main() -> anyhow::Result<()> {
             .basic_info
             .refresh_interval
             .as_millis(),
-        remote_shell_enabled = service_options.remote_shell.enabled,
+        remote_command_enabled = service_options.remote_command_enabled(),
         remote_shell_max_sessions = current_config.remote_shell.max_sessions,
-        remote_task_enabled = service_options.remote_task.enabled,
         remote_task_max_concurrent = current_config.remote_task.max_concurrent,
         "smalux-agent starting"
     );

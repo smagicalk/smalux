@@ -190,23 +190,6 @@ impl RemoteProbeResult {
         }
         self.job_id.clone().unwrap_or_default()
     }
-
-    /// 返回 Komari ping_result 需要的 task_id。
-    pub fn komari_task_id(&self) -> RemoteProbeId {
-        // 正常结果必须携带 request_id 或 job_id；空字符串只作为异常数据的兼容兜底，
-        // 避免第三方适配层在处理脏数据时 panic。
-        self.request_id
-            .clone()
-            .or_else(|| self.job_id.clone().map(RemoteProbeId::from))
-            .unwrap_or_else(|| RemoteProbeId::from(""))
-    }
-
-    /// 返回 Komari ping_result 的 value 语义，成功为延迟，失败或拒绝为 -1。
-    pub fn komari_value(&self) -> i64 {
-        self.latency_ms
-            .map(|value| value.min(i64::MAX as u64) as i64)
-            .unwrap_or(-1)
-    }
 }
 
 #[cfg(test)]

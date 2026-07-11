@@ -5,7 +5,6 @@
 
 mod manager;
 mod message;
-mod options;
 mod pty;
 mod session;
 mod stream;
@@ -14,7 +13,6 @@ pub(crate) use self::manager::RemoteShellManager;
 pub(crate) use self::message::{
     RemoteShellOpenRequest, RemoteShellStreamEvent, parse_stream_command,
 };
-pub(crate) use self::options::RemoteShellOptions;
 pub(crate) use self::stream::{
     RemoteShellFrame, RemoteShellInput, RemoteShellStreamCodec, RemoteShellStreamCodecRef,
     SmaluxShellCodec, command_to_shell_input,

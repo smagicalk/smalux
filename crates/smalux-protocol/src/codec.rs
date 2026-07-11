@@ -5,28 +5,12 @@
 //! 同一套 decode 逻辑接入不同 transport。
 
 use crate::frame::{
-    Ack, ClientFrame, ClientPayload, OutboundReport, OutboundReportKind, ProtocolError,
-    RemoteJobResult, RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskResult,
-    ServerFrame,
+    Ack, ClientFrame, ClientPayload, ProtocolError, RemoteJobResult, RemoteShellStreamCommand,
+    RemoteShellStreamEvent, RemoteTaskResult, ServerFrame,
 };
 
-/// 将内部上报语义转换为 client frame。
-pub fn client_frame_from_outbound_report(outbound: &OutboundReport) -> ClientFrame {
-    ClientFrame::new(
-        outbound.agent_id.clone(),
-        outbound.sequence,
-        outbound.created_at,
-        match outbound.kind.clone() {
-            OutboundReportKind::Snapshot { report } => ClientPayload::Snapshot { report },
-            OutboundReportKind::Heartbeat { heartbeat } => ClientPayload::Heartbeat { heartbeat },
-            OutboundReportKind::Delta { delta } => ClientPayload::Delta { delta },
-            OutboundReportKind::Ack { ack } => ClientPayload::Ack { ack },
-        },
-    )
-}
-
 /// 从远程任务结果构造 client frame。
-pub fn client_frame_from_remote_task_result(
+pub fn build_client_frame_from_remote_task_result(
     agent_id: &str,
     sequence: u64,
     sent_at: u64,
@@ -43,7 +27,7 @@ pub fn client_frame_from_remote_task_result(
 }
 
 /// 从通用远程 job 结果构造 client frame。
-pub fn client_frame_from_remote_job_result(
+pub fn build_client_frame_from_remote_job_result(
     agent_id: &str,
     sequence: u64,
     sent_at: u64,
@@ -60,7 +44,7 @@ pub fn client_frame_from_remote_job_result(
 }
 
 /// 从控制确认构造 client frame。
-pub fn client_frame_from_ack(
+pub fn build_client_frame_from_ack(
     agent_id: &str,
     sequence: u64,
     sent_at: u64,
@@ -75,7 +59,7 @@ pub fn client_frame_from_ack(
 }
 
 /// 从协议错误构造 client frame。
-pub fn client_frame_from_protocol_error(
+pub fn build_client_frame_from_protocol_error(
     agent_id: &str,
     sequence: u64,
     sent_at: u64,
@@ -153,7 +137,7 @@ mod tests {
 
     use super::*;
     use crate::frame::{
-        Ack, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest, OutboundReport,
+        Ack, ClientEvent, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest,
         ProtocolError, RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource,
         RemoteProbeResultStatus, RemoteProbeType, RemoteShellDataEncoding, RemoteShellOpenRequest,
         RemoteShellStreamCommand, RemoteShellStreamEvent, RemoteTaskRequest, RemoteTaskResult,
@@ -165,7 +149,7 @@ mod tests {
     /// 验证 client heartbeat frame 可以往返 JSON。
     #[test]
     fn client_heartbeat_frame_roundtrips_json() {
-        let outbound = OutboundReport::heartbeat(
+        let event = ClientEvent::heartbeat(
             "agent-1",
             1,
             100,
@@ -175,7 +159,7 @@ mod tests {
             },
         );
 
-        let frame = client_frame_from_outbound_report(&outbound);
+        let frame = ClientFrame::from_event(&event);
         let json = encode_client_frame(&frame).unwrap();
         let decoded = decode_client_frame(&json).unwrap();
 
@@ -193,7 +177,7 @@ mod tests {
     /// 验证 client delta frame 可以往返 JSON。
     #[test]
     fn client_delta_frame_roundtrips_json() {
-        let outbound = OutboundReport::delta(
+        let event = ClientEvent::delta(
             "agent-1",
             2,
             110,
@@ -204,7 +188,7 @@ mod tests {
             },
         );
 
-        let frame = client_frame_from_outbound_report(&outbound);
+        let frame = ClientFrame::from_event(&event);
         let json = encode_client_frame(&frame).unwrap();
         let decoded = decode_client_frame(&json).unwrap();
 
@@ -441,7 +425,7 @@ mod tests {
             error: None,
         };
 
-        let frame = client_frame_from_remote_task_result("agent-1", 7, 101, &result);
+        let frame = build_client_frame_from_remote_task_result("agent-1", 7, 101, &result);
         let json = encode_client_frame_bytes(&frame).unwrap();
         let decoded = decode_client_frame_bytes(&json).unwrap();
 
@@ -475,8 +459,12 @@ mod tests {
             error: None,
         };
 
-        let frame =
-            client_frame_from_remote_job_result("agent-1", 8, 101, &RemoteJobResult::probe(result));
+        let frame = build_client_frame_from_remote_job_result(
+            "agent-1",
+            8,
+            101,
+            &RemoteJobResult::probe(result),
+        );
         let json = encode_client_frame_bytes(&frame).unwrap();
         let decoded = decode_client_frame_bytes(&json).unwrap();
 
@@ -503,7 +491,7 @@ mod tests {
     /// 验证控制命令确认可以编码为 client frame。
     #[test]
     fn ack_encodes_as_client_frame() {
-        let frame = client_frame_from_ack("agent-1", 8, 102, &Ack { sequence: 7 });
+        let frame = build_client_frame_from_ack("agent-1", 8, 102, &Ack { sequence: 7 });
         let json = encode_client_frame_bytes(&frame).unwrap();
         let decoded = decode_client_frame_bytes(&json).unwrap();
 
@@ -524,7 +512,7 @@ mod tests {
             message: "telemetry state is not ready".to_string(),
         };
 
-        let frame = client_frame_from_protocol_error("agent-1", 9, 103, &error);
+        let frame = build_client_frame_from_protocol_error("agent-1", 9, 103, &error);
         let json = encode_client_frame_bytes(&frame).unwrap();
         let decoded = decode_client_frame_bytes(&json).unwrap();
 

@@ -3,29 +3,29 @@
 use super::{Ack, DeltaReport, Heartbeat};
 use smalux_core::model::info::AgentReport;
 
-/// agent 内部待导出的上报语义。
+/// agent 内部待导出的 client 事件。
 ///
 /// 该结构不是最终 wire JSON；不同导出格式可以把它编码成不同外层。
 #[derive(Debug, Clone)]
-pub struct OutboundReport {
+pub struct ClientEvent {
     /// agent 实例 ID。
     pub agent_id: String,
     /// agent 本连接或本进程内递增的消息序号。
     pub sequence: u64,
     /// 上报创建时间，Unix 时间戳，单位秒。
     pub created_at: u64,
-    /// 上报语义。
-    pub kind: OutboundReportKind,
+    /// client 事件语义。
+    pub kind: ClientEventKind,
 }
 
-impl OutboundReport {
+impl ClientEvent {
     /// 构造完整快照上报。
     pub fn snapshot(sequence: u64, created_at: u64, report: AgentReport) -> Self {
         Self {
             agent_id: report.identity.agent_id.clone(),
             sequence,
             created_at,
-            kind: OutboundReportKind::Snapshot {
+            kind: ClientEventKind::Snapshot {
                 report: Box::new(report),
             },
         }
@@ -42,7 +42,7 @@ impl OutboundReport {
             agent_id: agent_id.into(),
             sequence,
             created_at,
-            kind: OutboundReportKind::Heartbeat { heartbeat },
+            kind: ClientEventKind::Heartbeat { heartbeat },
         }
     }
 
@@ -57,16 +57,16 @@ impl OutboundReport {
             agent_id: agent_id.into(),
             sequence,
             created_at,
-            kind: OutboundReportKind::Delta {
+            kind: ClientEventKind::Delta {
                 delta: Box::new(delta),
             },
         }
     }
 }
 
-/// agent 内部待导出的上报类型。
+/// agent 内部待导出的 client 事件类型。
 #[derive(Debug, Clone)]
-pub enum OutboundReportKind {
+pub enum ClientEventKind {
     /// 完整监控快照。
     Snapshot {
         /// 完整 `AgentReport`。

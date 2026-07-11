@@ -220,9 +220,9 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     pub basic_info_send_on_start: Option<bool>,
 
-    /// 是否启用远程交互式 shell；只能启动时设置，server patch 不能修改。
-    #[arg(short = 'S', long)]
-    pub remote_shell_enabled: Option<bool>,
+    /// 是否启用远程命令能力；同时开启 remote shell 和 remote task，只能启动时设置。
+    #[arg(short = 'x', long)]
+    pub remote_command_enabled: Option<bool>,
     /// 最大远程 shell 并发会话数。
     #[arg(short = 'M', long)]
     pub remote_shell_max_sessions: Option<usize>,
@@ -236,10 +236,7 @@ pub(crate) struct CliArgs {
     #[arg(short = 'P', long)]
     pub remote_shell_program: Option<String>,
 
-    /// 是否启用远程非交互任务；只能启动时设置，server patch 不能修改。
-    #[arg(short = 'T', long)]
-    pub remote_task_enabled: Option<bool>,
-    /// 最大远程任务并发数。
+    /// 最大远程任务并发数；启用位复用 `remote_command_enabled`。
     #[arg(short = 'C', long)]
     pub remote_task_max_concurrent: Option<usize>,
     /// 远程任务默认最大运行时间，例如 `30s`。

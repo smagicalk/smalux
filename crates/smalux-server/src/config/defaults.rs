@@ -27,6 +27,9 @@ pub const DEFAULT_MYSQL_PORT: u16 = 3306;
 /// 默认前端构建产物目录，未启用内置前端资源时使用。
 pub const DEFAULT_FRONTEND_DIR: &str = "apps/smalux-web/dist";
 
+/// 默认前端槽位模式，优先使用内置资源。
+pub const DEFAULT_FRONTEND_SLOT_MODE: &str = "embedded";
+
 /// 默认不由 server 托管前端静态资源。
 pub const DEFAULT_SERVE_FRONTEND: bool = false;
 

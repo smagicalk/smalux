@@ -4,10 +4,10 @@
 //! PTY 阻塞线程分别放在 `session` / `pty` 模块中，避免入口模块承担过多细节。
 
 use super::message::{RemoteShellOpenRequest, validate_open_request};
-use super::options::RemoteShellOptions;
 use super::session::{RemoteShellSession, RemoteShellSessionPermit, RemoteShellSessionReady};
 use super::stream::RemoteShellStreamCodecRef;
 use crate::config::model::{ExportConfig, RemoteShellConfig};
+use crate::service::remote::RemoteCommandOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,14 +15,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteShellManager {
     /// CLI-only 静态选项。
-    options: RemoteShellOptions,
+    options: RemoteCommandOptions,
     /// 当前活跃会话数。
     active_sessions: Arc<AtomicUsize>,
 }
 
 impl RemoteShellManager {
     /// 使用指定静态选项创建 manager。
-    pub(crate) fn new(options: RemoteShellOptions) -> Self {
+    pub(crate) fn new(options: RemoteCommandOptions) -> Self {
         Self {
             options,
             active_sessions: Arc::new(AtomicUsize::new(0)),
@@ -198,7 +198,7 @@ mod tests {
     /// 验证默认关闭时拒绝打开 shell。
     #[tokio::test]
     async fn manager_rejects_open_when_disabled() {
-        let manager = RemoteShellManager::new(RemoteShellOptions::default());
+        let manager = RemoteShellManager::new(RemoteCommandOptions::default());
         let error = manager
             .open(
                 open_request(),
@@ -215,7 +215,7 @@ mod tests {
     /// 验证会话上限会拒绝新的打开请求。
     #[tokio::test]
     async fn manager_rejects_open_when_session_limit_is_reached() {
-        let manager = RemoteShellManager::new(RemoteShellOptions { enabled: true });
+        let manager = RemoteShellManager::new(RemoteCommandOptions { enabled: true });
         let _permit = manager.acquire_session_permit(1).unwrap();
 
         let error = manager
@@ -312,7 +312,7 @@ mod tests {
             (input_sent, output_seen, output_text)
         });
 
-        let manager = RemoteShellManager::new(RemoteShellOptions { enabled: true });
+        let manager = RemoteShellManager::new(RemoteCommandOptions { enabled: true });
 
         let export = ExportConfig::default();
 

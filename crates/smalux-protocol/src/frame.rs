@@ -5,10 +5,10 @@
 
 /// agent 发往 server 的 frame。
 mod client;
+/// agent 内部待导出的上报语义。
+mod client_event;
 /// 协议确认和错误模型。
 mod control;
-/// agent 内部待导出的上报语义。
-mod outbound;
 /// 远程任务、网络探测和交互 shell 协议模型。
 mod remote;
 /// 监控上报和采集控制模型。
@@ -19,8 +19,8 @@ mod server;
 mod version;
 
 pub use self::client::{ClientFrame, ClientPayload};
+pub use self::client_event::{ClientEvent, ClientEventKind};
 pub use self::control::{Ack, ProtocolError};
-pub use self::outbound::{OutboundReport, OutboundReportKind};
 pub use self::remote::{
     RemoteJobApplyRequest, RemoteJobKind, RemoteJobOperation, RemoteJobResult, RemoteJobRunRequest,
     RemoteJobSpec, RemoteProbeId, RemoteProbeResult, RemoteProbeResultSource,
@@ -41,15 +41,15 @@ mod tests {
 
     /// 验证 snapshot 上报会从 report 中复制 agent_id。
     #[test]
-    fn outbound_snapshot_uses_report_agent_id() {
+    fn client_event_snapshot_uses_report_agent_id() {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
 
-        let outbound = OutboundReport::snapshot(7, 100, report);
+        let event = ClientEvent::snapshot(7, 100, report);
 
-        assert_eq!(outbound.agent_id, "agent-1");
-        assert_eq!(outbound.sequence, 7);
-        assert_eq!(outbound.created_at, 100);
+        assert_eq!(event.agent_id, "agent-1");
+        assert_eq!(event.sequence, 7);
+        assert_eq!(event.created_at, 100);
     }
 
     /// 验证 server snapshot request frame 会带协议版本。
@@ -166,19 +166,19 @@ mod tests {
 
     /// 验证 delta 上报会保留 agent_id 和基准序号。
     #[test]
-    fn outbound_delta_uses_given_agent_id_and_base_sequence() {
+    fn client_event_delta_uses_given_agent_id_and_base_sequence() {
         let delta = DeltaReport {
             base_sequence: 7,
             report_at: 100,
             ..DeltaReport::default()
         };
 
-        let outbound = OutboundReport::delta("agent-1", 8, 101, delta);
+        let event = ClientEvent::delta("agent-1", 8, 101, delta);
 
-        assert_eq!(outbound.agent_id, "agent-1");
-        assert_eq!(outbound.sequence, 8);
-        match outbound.kind {
-            OutboundReportKind::Delta { delta } => {
+        assert_eq!(event.agent_id, "agent-1");
+        assert_eq!(event.sequence, 8);
+        match event.kind {
+            ClientEventKind::Delta { delta } => {
                 assert_eq!(delta.base_sequence, 7);
             }
             _ => panic!("expected delta report"),

@@ -3,7 +3,7 @@
 //! 协议 handler 只负责把 server 消息转换为内部命令，本模块负责校验和执行业务动作。
 
 use super::outbound::{
-    ControlAckEnvelope, ControlErrorEnvelope, OutboundEvent, OutboundSender, OutboundSequence,
+    ControlAckEnvelope, ControlErrorEnvelope, ExportEvent, OutboundSender, OutboundSequence,
 };
 use crate::config::ConfigManager;
 use crate::config::manager::{validate_process_sampling_options, validate_socket_sampling_options};
@@ -344,7 +344,7 @@ impl ControlDispatcher {
         // ack/error 也走出站事件队列，而不是在控制线程里直接发 WebSocket。
         // 这样重连、pending 重投和 adapter 不支持时的跳过逻辑都由 export_supervisor 统一处理。
         let event = match error {
-            Some(error) => OutboundEvent::ControlError(ControlErrorEnvelope::new(
+            Some(error) => ExportEvent::ControlError(ControlErrorEnvelope::new(
                 config.agent_id,
                 sequence,
                 ProtocolError {
@@ -353,7 +353,7 @@ impl ControlDispatcher {
                     message: error.to_string(),
                 },
             )),
-            None => OutboundEvent::ControlAck(ControlAckEnvelope::new(
+            None => ExportEvent::ControlAck(ControlAckEnvelope::new(
                 config.agent_id,
                 sequence,
                 Ack {
@@ -441,12 +441,12 @@ impl ControlDispatcher {
 /// 格式化控制响应入队失败原因。
 fn control_response_queue_error(error: &super::outbound::OutboundSendError) -> String {
     let event_type = match error.event() {
-        OutboundEvent::Report(_) => "report",
-        OutboundEvent::BasicInfo(_) => "basic info",
-        OutboundEvent::ControlAck(_) => "control ack",
-        OutboundEvent::ControlError(_) => "control error",
-        OutboundEvent::RemoteTaskResult(_) => "remote task result",
-        OutboundEvent::RemoteJobResult(_) => "remote job result",
+        ExportEvent::Report(_) => "report",
+        ExportEvent::BasicInfo(_) => "basic info",
+        ExportEvent::ControlAck(_) => "control ack",
+        ExportEvent::ControlError(_) => "control error",
+        ExportEvent::RemoteTaskResult(_) => "remote task result",
+        ExportEvent::RemoteJobResult(_) => "remote job result",
     };
     let reason = match error.kind() {
         super::outbound::OutboundSendErrorKind::Closed => "closed",

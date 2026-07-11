@@ -7,3 +7,28 @@ pub(crate) mod job;
 pub(crate) mod probe;
 pub(crate) mod shell;
 pub(crate) mod task;
+
+/// 远程命令静态能力开关。
+///
+/// 这里统一控制所有“会在目标机上执行命令”的远程能力。当前包括：
+/// - 交互式 remote shell
+/// - 非交互 remote task
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RemoteCommandOptions {
+    /// 是否允许远程命令能力运行；只能由 CLI 启动参数开启。
+    pub enabled: bool,
+}
+
+impl Default for RemoteCommandOptions {
+    /// 默认关闭远程命令能力。
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl RemoteCommandOptions {
+    /// 校验远程命令静态选项。
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}

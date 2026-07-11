@@ -1,6 +1,6 @@
 //! Service 运行参数和运行状态。
 
-use super::{shell::RemoteShellOptions, task::RemoteTaskOptions};
+use super::remote::RemoteCommandOptions;
 use crate::telemetry::LatestTelemetry;
 use smalux_core::model::info::MetricLevel;
 
@@ -11,10 +11,8 @@ pub(crate) struct ServiceOptions {
     pub agent_version: &'static str,
     /// 诊断采集静态权限。
     pub diagnostics: DiagnosticOptions,
-    /// 远程交互式 shell 静态选项。
-    pub remote_shell: RemoteShellOptions,
-    /// 远程非交互任务静态选项。
-    pub remote_task: RemoteTaskOptions,
+    /// 所有远程命令能力共享的静态开关。
+    pub remote_command: RemoteCommandOptions,
 }
 
 impl Default for ServiceOptions {
@@ -23,8 +21,7 @@ impl Default for ServiceOptions {
         Self {
             agent_version: env!("CARGO_PKG_VERSION"),
             diagnostics: DiagnosticOptions::default(),
-            remote_shell: RemoteShellOptions::default(),
-            remote_task: RemoteTaskOptions::default(),
+            remote_command: RemoteCommandOptions::default(),
         }
     }
 }
@@ -33,9 +30,13 @@ impl ServiceOptions {
     /// 校验服务静态选项。
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.diagnostics.validate()?;
-        self.remote_shell.validate()?;
-        self.remote_task.validate()?;
+        self.remote_command.validate()?;
         Ok(())
+    }
+
+    /// 远程命令能力是否已启用。
+    pub(crate) fn remote_command_enabled(&self) -> bool {
+        self.remote_command.enabled
     }
 }
 
@@ -132,4 +133,30 @@ pub(crate) struct ServiceState {
     pub latest_telemetry: LatestTelemetry,
     /// 是否允许发送第一包上报。
     pub first_report_ready: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Service 选项测试。
+
+    use super::*;
+
+    /// 验证默认远程命令能力关闭。
+    #[test]
+    fn remote_command_is_disabled_by_default() {
+        let options = ServiceOptions::default();
+
+        assert!(!options.remote_command_enabled());
+        options.validate().unwrap();
+    }
+
+    /// 验证远程命令能力可以显式开启。
+    #[test]
+    fn remote_command_can_be_enabled() {
+        let mut options = ServiceOptions::default();
+        options.remote_command.enabled = true;
+
+        assert!(options.remote_command_enabled());
+        options.validate().unwrap();
+    }
 }

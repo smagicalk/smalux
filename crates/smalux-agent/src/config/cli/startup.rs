@@ -75,17 +75,14 @@ impl CliArgs {
     /// 从启动参数构造 CLI-only 服务静态选项。
     pub(crate) fn to_service_options(&self) -> anyhow::Result<ServiceOptions> {
         let mut options = ServiceOptions::default();
-        if let Some(enabled) = self.remote_shell_enabled {
-            options.remote_shell.enabled = enabled;
+        if let Some(enabled) = self.remote_command_enabled {
+            options.remote_command.enabled = enabled;
         }
         if let Some(permission) = self.allow_process_level {
             options.diagnostics.process_permission = permission.into();
         }
         if let Some(permission) = self.allow_socket_level {
             options.diagnostics.socket_permission = permission.into();
-        }
-        if let Some(enabled) = self.remote_task_enabled {
-            options.remote_task.enabled = enabled;
         }
 
         options.validate()?;

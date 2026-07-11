@@ -238,14 +238,14 @@ mod tests {
 
     use super::*;
     use crate::export::{ExportDeliveryId, ExportDeliverySpec};
-    use smalux_protocol::OutboundReport;
+    use smalux_protocol::ClientEvent;
 
     /// 构造只关心序号的测试 report。
     fn report(sequence: u64) -> ReportEnvelope {
         ReportEnvelope {
             sequence,
             created_at: 100,
-            outbound: OutboundReport::heartbeat(
+            outbound: ClientEvent::heartbeat(
                 "agent-test".to_string(),
                 sequence,
                 100,

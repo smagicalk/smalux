@@ -10,9 +10,9 @@ use crate::service::outbound::{
     RemoteTaskResultEnvelope,
 };
 use smalux_protocol::{
-    OutboundReport, client_frame_from_ack, client_frame_from_outbound_report,
-    client_frame_from_protocol_error, client_frame_from_remote_job_result,
-    client_frame_from_remote_task_result, encode_client_frame_bytes,
+    ClientEvent, ClientFrame, build_client_frame_from_ack, build_client_frame_from_protocol_error,
+    build_client_frame_from_remote_job_result, build_client_frame_from_remote_task_result,
+    encode_client_frame_bytes,
 };
 
 /// Smalux 自有协议主连接路径。
@@ -32,7 +32,7 @@ pub(crate) trait ProtocolAdapter {
     fn encode_report(
         &mut self,
         delivery_id: ExportDeliveryId,
-        outbound: &OutboundReport,
+        outbound: &ClientEvent,
     ) -> anyhow::Result<Vec<TransportRequest>>;
 
     /// 将低频基础信息编码成零到多条 transport 请求。
@@ -99,7 +99,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
     fn encode_report(
         &mut self,
         delivery_id: ExportDeliveryId,
-        outbound: &OutboundReport,
+        outbound: &ClientEvent,
     ) -> anyhow::Result<Vec<TransportRequest>> {
         if delivery_id != ExportDeliveryId::RealtimeReport {
             anyhow::bail!(
@@ -108,7 +108,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
             );
         }
 
-        let frame = client_frame_from_outbound_report(outbound);
+        let frame = ClientFrame::from_event(outbound);
         let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = outbound.sequence,
@@ -128,7 +128,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         result: &RemoteTaskResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let frame = client_frame_from_remote_task_result(
+        let frame = build_client_frame_from_remote_task_result(
             &result.agent_id,
             result.sequence,
             result.created_at,
@@ -154,7 +154,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         result: &RemoteJobResultEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let frame = client_frame_from_remote_job_result(
+        let frame = build_client_frame_from_remote_job_result(
             &result.agent_id,
             result.sequence,
             result.created_at,
@@ -181,7 +181,8 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         ack: &ControlAckEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let frame = client_frame_from_ack(&ack.agent_id, ack.sequence, ack.created_at, &ack.ack);
+        let frame =
+            build_client_frame_from_ack(&ack.agent_id, ack.sequence, ack.created_at, &ack.ack);
         let json = encode_client_frame_bytes(&frame)?;
         tracing::debug!(
             sequence = ack.sequence,
@@ -202,7 +203,7 @@ impl ProtocolAdapter for SmaluxJsonProtocolAdapter {
         &mut self,
         error: &ControlErrorEnvelope,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let frame = client_frame_from_protocol_error(
+        let frame = build_client_frame_from_protocol_error(
             &error.agent_id,
             error.sequence,
             error.created_at,

@@ -15,7 +15,7 @@ use smalux_core::log::{
     redact_sensitive_json, redact_sensitive_json_bytes, redact_sensitive_json_text,
     redact_sensitive_text,
 };
-use smalux_protocol::OutboundReport;
+use smalux_protocol::ClientEvent;
 
 /// 导出日志选项。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -68,7 +68,7 @@ impl ExportRouter {
     pub(crate) fn encode_report(
         &mut self,
         delivery_id: ExportDeliveryId,
-        outbound: &OutboundReport,
+        outbound: &ClientEvent,
     ) -> anyhow::Result<Vec<TransportRequest>> {
         self.adapter.encode_report(delivery_id, outbound)
     }
@@ -78,7 +78,7 @@ impl ExportRouter {
         &mut self,
         transport_hub: &mut TransportHub,
         delivery_id: ExportDeliveryId,
-        outbound: &OutboundReport,
+        outbound: &ClientEvent,
     ) -> anyhow::Result<usize> {
         let requests = self.encode_report(delivery_id, outbound)?;
         let request_count = requests.len();
@@ -448,7 +448,7 @@ mod tests {
     fn router_encodes_report_with_current_adapter() {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
+        let outbound = smalux_protocol::ClientEvent::snapshot(1, 100, report);
         let mut router = ExportRouter::new(
             build_protocol_adapter(ExportFormat::SmaluxJson),
             ExportLogOptions::new(false, 4096),

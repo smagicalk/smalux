@@ -5,7 +5,9 @@
 
 use crate::collect::unix_timestamp_secs;
 use smalux_core::model::info::AgentReport;
-use smalux_protocol::{Ack, OutboundReport, ProtocolError, RemoteJobResult, RemoteTaskResult};
+use smalux_protocol::{
+    Ack, ClientEvent as ProtocolClientEvent, ProtocolError, RemoteJobResult, RemoteTaskResult,
+};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,7 +40,7 @@ pub(crate) struct OutboundSendError {
     /// 失败原因。
     kind: OutboundSendErrorKind,
     /// 未能入队的事件。
-    event: OutboundEvent,
+    event: ExportEvent,
 }
 
 impl OutboundSendError {
@@ -48,7 +50,7 @@ impl OutboundSendError {
     }
 
     /// 返回未能入队的事件。
-    pub(crate) fn event(&self) -> &OutboundEvent {
+    pub(crate) fn event(&self) -> &ExportEvent {
         &self.event
     }
 }
@@ -70,18 +72,18 @@ impl std::error::Error for OutboundSendError {}
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundSender {
     /// 高优先级事件发送端。
-    priority_tx: mpsc::Sender<OutboundEvent>,
+    priority_tx: mpsc::Sender<ExportEvent>,
     /// 普通事件发送端。
-    normal_tx: mpsc::Sender<OutboundEvent>,
+    normal_tx: mpsc::Sender<ExportEvent>,
 }
 
 /// 出站事件接收端。
 #[derive(Debug)]
 pub(crate) struct OutboundReceiver {
     /// 高优先级事件接收端。
-    priority_rx: mpsc::Receiver<OutboundEvent>,
+    priority_rx: mpsc::Receiver<ExportEvent>,
     /// 普通事件接收端。
-    normal_rx: mpsc::Receiver<OutboundEvent>,
+    normal_rx: mpsc::Receiver<ExportEvent>,
     /// 高优先级通道是否已关闭。
     priority_closed: bool,
     /// 普通通道是否已关闭。
@@ -109,7 +111,7 @@ pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
 
 impl OutboundSender {
     /// 发送出站事件；控制响应和远程结果会进入高优先级通道。
-    pub(crate) async fn send(&self, event: OutboundEvent) -> Result<(), OutboundSendError> {
+    pub(crate) async fn send(&self, event: ExportEvent) -> Result<(), OutboundSendError> {
         if event.is_priority() {
             send_with_timeout(&self.priority_tx, event).await
         } else {
@@ -120,8 +122,8 @@ impl OutboundSender {
 
 /// 带超时地发送出站事件，避免队列满时无限等待。
 async fn send_with_timeout(
-    tx: &mpsc::Sender<OutboundEvent>,
-    event: OutboundEvent,
+    tx: &mpsc::Sender<ExportEvent>,
+    event: ExportEvent,
 ) -> Result<(), OutboundSendError> {
     match timeout(OUTBOUND_SEND_TIMEOUT, tx.reserve()).await {
         Ok(Ok(permit)) => {
@@ -141,7 +143,7 @@ async fn send_with_timeout(
 
 impl OutboundReceiver {
     /// 优先接收高优先级事件，其次才是普通 report/basic info。
-    pub(crate) async fn recv(&mut self) -> Option<OutboundEvent> {
+    pub(crate) async fn recv(&mut self) -> Option<ExportEvent> {
         loop {
             match self.priority_rx.try_recv() {
                 Ok(event) => return Some(event),
@@ -201,12 +203,12 @@ pub(crate) struct ReportEnvelope {
     /// report 构建时间，Unix 时间戳，单位秒。
     pub(crate) created_at: u64,
     /// 待导出的内部上报语义。
-    pub(crate) outbound: OutboundReport,
+    pub(crate) outbound: ProtocolClientEvent,
 }
 
 impl ReportEnvelope {
     /// 从协议上报构造 report envelope。
-    pub(crate) fn from_outbound(outbound: OutboundReport) -> Self {
+    pub(crate) fn from_outbound(outbound: ProtocolClientEvent) -> Self {
         Self {
             sequence: outbound.sequence,
             created_at: outbound.created_at,
@@ -339,7 +341,7 @@ impl ControlErrorEnvelope {
 
 /// 出站业务事件。
 #[derive(Debug, Clone)]
-pub(crate) enum OutboundEvent {
+pub(crate) enum ExportEvent {
     /// 监控上报事件。
     Report(ReportEnvelope),
     /// 低频基础信息事件。
@@ -354,7 +356,7 @@ pub(crate) enum OutboundEvent {
     RemoteJobResult(RemoteJobResultEnvelope),
 }
 
-impl OutboundEvent {
+impl ExportEvent {
     /// 是否属于高优先级事件。
     pub(crate) fn is_priority(&self) -> bool {
         matches!(
@@ -432,8 +434,8 @@ mod tests {
     #[tokio::test]
     async fn outbound_receiver_prioritizes_control_and_result_events() {
         let (tx, mut rx) = outbound_channel();
-        tx.send(OutboundEvent::Report(ReportEnvelope::from_outbound(
-            OutboundReport::heartbeat(
+        tx.send(ExportEvent::Report(ReportEnvelope::from_outbound(
+            ProtocolClientEvent::heartbeat(
                 "agent-test".to_string(),
                 1,
                 100,
@@ -442,7 +444,7 @@ mod tests {
         )))
         .await
         .unwrap();
-        tx.send(OutboundEvent::ControlAck(ControlAckEnvelope::new(
+        tx.send(ExportEvent::ControlAck(ControlAckEnvelope::new(
             "agent-test".to_string(),
             2,
             Ack { sequence: 7 },
@@ -453,8 +455,8 @@ mod tests {
         let first = rx.recv().await.unwrap();
         let second = rx.recv().await.unwrap();
 
-        assert!(matches!(first, OutboundEvent::ControlAck(_)));
-        assert!(matches!(second, OutboundEvent::Report(_)));
+        assert!(matches!(first, ExportEvent::ControlAck(_)));
+        assert!(matches!(second, ExportEvent::Report(_)));
     }
 
     /// 验证接收端关闭时发送端会返回明确的关闭错误，并保留未发送事件。
@@ -464,7 +466,7 @@ mod tests {
         drop(rx);
 
         let error = tx
-            .send(OutboundEvent::ControlAck(ControlAckEnvelope::new(
+            .send(ExportEvent::ControlAck(ControlAckEnvelope::new(
                 "agent-test".to_string(),
                 1,
                 Ack { sequence: 7 },
@@ -483,7 +485,7 @@ mod tests {
         let (tx, _rx) = outbound_channel();
 
         for sequence in 0..OUTBOUND_PRIORITY_QUEUE_CAPACITY {
-            tx.send(OutboundEvent::ControlAck(ControlAckEnvelope::new(
+            tx.send(ExportEvent::ControlAck(ControlAckEnvelope::new(
                 "agent-test".to_string(),
                 sequence as u64,
                 Ack {
@@ -495,7 +497,7 @@ mod tests {
         }
 
         let error = tx
-            .send(OutboundEvent::ControlAck(ControlAckEnvelope::new(
+            .send(ExportEvent::ControlAck(ControlAckEnvelope::new(
                 "agent-test".to_string(),
                 999,
                 Ack { sequence: 999 },

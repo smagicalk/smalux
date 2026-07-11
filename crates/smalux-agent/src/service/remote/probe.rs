@@ -6,7 +6,7 @@
 use crate::collect::unix_timestamp_secs;
 use crate::config::ConfigManager;
 use crate::service::message::outbound::{
-    OutboundEvent, OutboundSender, OutboundSequence, RemoteJobResultEnvelope,
+    ExportEvent, OutboundSender, OutboundSequence, RemoteJobResultEnvelope,
 };
 use serde::Deserialize;
 use smalux_core::utils::validate::ensure_non_empty;
@@ -627,9 +627,9 @@ impl RemoteProbeManager {
     }
 
     /// 把探测结果包装成出站事件。
-    fn result_event(&self, agent_id: String, result: RemoteProbeResult) -> OutboundEvent {
+    fn result_event(&self, agent_id: String, result: RemoteProbeResult) -> ExportEvent {
         let sequence = self.sequence.next();
-        OutboundEvent::RemoteJobResult(RemoteJobResultEnvelope::new(
+        ExportEvent::RemoteJobResult(RemoteJobResultEnvelope::new(
             agent_id,
             sequence,
             RemoteJobResult::probe(result),
@@ -857,13 +857,13 @@ mod tests {
 
     use super::*;
     use crate::config::{AgentConfig, ConfigManager};
-    use crate::service::message::outbound::{OutboundEvent, OutboundSequence, outbound_channel};
+    use crate::service::message::outbound::{ExportEvent, OutboundSequence, outbound_channel};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     /// 从通用 job 出站事件中取出 probe 结果。
-    fn unwrap_probe_result(event: OutboundEvent) -> (u64, RemoteProbeResult) {
-        let OutboundEvent::RemoteJobResult(envelope) = event else {
+    fn unwrap_probe_result(event: ExportEvent) -> (u64, RemoteProbeResult) {
+        let ExportEvent::RemoteJobResult(envelope) = event else {
             panic!("expected remote job result");
         };
         let Some(result) = envelope.result.as_probe() else {

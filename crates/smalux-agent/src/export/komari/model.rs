@@ -288,12 +288,31 @@ impl PingResult {
     pub fn from_probe_job_result(result: &RemoteProbeResult) -> Self {
         Self {
             message_type: "ping_result",
-            task_id: result.komari_task_id(),
+            task_id: komari_probe_task_id(result),
             ping_type: result.probe_type.as_str().to_string(),
-            value: result.komari_value(),
+            value: komari_probe_value(result),
             finished_at: unix_secs_to_rfc3339(result.finished_at),
         }
     }
+}
+
+/// 返回 Komari ping_result 需要的 task_id。
+fn komari_probe_task_id(result: &RemoteProbeResult) -> RemoteProbeId {
+    // 正常结果必须携带 request_id 或 job_id；空字符串只作为异常数据的兼容兜底，
+    // 避免第三方适配层在处理脏数据时 panic。
+    result
+        .request_id
+        .clone()
+        .or_else(|| result.job_id.clone().map(RemoteProbeId::from))
+        .unwrap_or_else(|| RemoteProbeId::from(""))
+}
+
+/// 返回 Komari ping_result 的 value 语义，成功为延迟，失败或拒绝为 -1。
+fn komari_probe_value(result: &RemoteProbeResult) -> i64 {
+    result
+        .latency_ms
+        .map(|value| value.min(i64::MAX as u64) as i64)
+        .unwrap_or(-1)
 }
 
 /// 合并 stdout、stderr 和错误信息，适配 Komari 单一 result 字段。

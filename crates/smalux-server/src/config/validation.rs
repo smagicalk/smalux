@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::model::{DatabaseConfig, ServerConfig};
+use crate::config::model::{DatabaseConfig, FrontendSlotConfig, FrontendSlotMode, ServerConfig};
 
 /// 校验 server 稳定配置。
 ///
@@ -81,8 +81,48 @@ fn validate_database_config(config: &ServerConfig) -> Result<()> {
 
 /// 校验前端静态资源托管配置。
 fn validate_frontend_config(config: &ServerConfig) -> Result<()> {
-    if config.frontend.serve_frontend && config.frontend.dir.as_os_str().is_empty() {
-        bail!("frontend dir cannot be empty when frontend hosting is enabled");
+    if !config.frontend.serve_frontend {
+        return Ok(());
+    }
+
+    validate_frontend_slot("site", &config.frontend.site)?;
+    validate_frontend_slot("admin", &config.frontend.admin)?;
+
+    Ok(())
+}
+
+fn validate_frontend_slot(slot_name: &str, slot: &FrontendSlotConfig) -> Result<()> {
+    match slot.mode {
+        FrontendSlotMode::Embedded => {
+            if slot.directory.is_some() {
+                bail!("{slot_name} frontend dir is not allowed in embedded mode");
+            }
+            if slot.external_url.is_some() {
+                bail!("{slot_name} frontend external url is not allowed in embedded mode");
+            }
+        }
+        FrontendSlotMode::Directory => {
+            let Some(directory) = slot.directory.as_ref() else {
+                bail!("{slot_name} frontend dir is required in directory mode");
+            };
+            if directory.as_os_str().is_empty() {
+                bail!("{slot_name} frontend dir cannot be empty in directory mode");
+            }
+            if slot.external_url.is_some() {
+                bail!("{slot_name} frontend external url is not allowed in directory mode");
+            }
+        }
+        FrontendSlotMode::External => {
+            if slot.directory.is_some() {
+                bail!("{slot_name} frontend dir is not allowed in external mode");
+            }
+            let Some(external_url) = slot.external_url.as_ref() else {
+                bail!("{slot_name} frontend external url is required in external mode");
+            };
+            if external_url.trim().is_empty() {
+                bail!("{slot_name} frontend external url cannot be empty in external mode");
+            }
+        }
     }
 
     Ok(())
@@ -111,7 +151,8 @@ mod tests {
 
     use super::*;
     use crate::config::model::{
-        DatabaseConfig, FrontendConfig, HttpConfig, LogConfig, ServerConfig,
+        DatabaseConfig, FrontendConfig, FrontendSlotConfig, FrontendSlotMode, HttpConfig,
+        LogConfig, ServerConfig,
     };
 
     fn base_config(database: DatabaseConfig) -> ServerConfig {
@@ -123,7 +164,16 @@ mod tests {
             database,
             frontend: FrontendConfig {
                 serve_frontend: false,
-                dir: PathBuf::from("apps/smalux-web/dist"),
+                site: FrontendSlotConfig {
+                    mode: FrontendSlotMode::Embedded,
+                    directory: Some(PathBuf::from("apps/smalux-web/dist")),
+                    external_url: None,
+                },
+                admin: FrontendSlotConfig {
+                    mode: FrontendSlotMode::Embedded,
+                    directory: Some(PathBuf::from("apps/smalux-web/dist")),
+                    external_url: None,
+                },
                 spa_fallback: true,
             },
             log: LogConfig {

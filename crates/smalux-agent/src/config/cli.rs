@@ -257,7 +257,8 @@ mod tests {
         let options = args.to_service_options().unwrap();
         let patch = args.into_patch();
 
-        assert!(!options.remote_shell.enabled);
+        assert!(!options.remote_command_enabled());
+        assert!(!options.remote_command.enabled);
         assert_eq!(
             options.diagnostics.process_permission,
             RemoteMetricPermission::Count
@@ -266,7 +267,6 @@ mod tests {
             options.diagnostics.socket_permission,
             RemoteMetricPermission::Count
         );
-        assert!(!options.remote_task.enabled);
         assert_eq!(patch, AgentConfigPatch::default());
     }
 
@@ -298,7 +298,7 @@ mod tests {
     fn remote_capability_args_build_service_options() {
         let args = CliArgs::try_parse_from([
             "smalux-agent",
-            "-S",
+            "-x",
             "true",
             "-M",
             "2",
@@ -312,8 +312,6 @@ mod tests {
             "details",
             "--allow-socket-level",
             "light",
-            "-T",
-            "true",
             "-C",
             "3",
             "--remote-task-timeout",
@@ -339,7 +337,8 @@ mod tests {
         let remote_task = patch.remote_task.unwrap();
         let remote_probe = patch.remote_probe.unwrap();
 
-        assert!(options.remote_shell.enabled);
+        assert!(options.remote_command_enabled());
+        assert!(options.remote_command.enabled);
         assert_eq!(
             remote_shell.program.as_ref().unwrap().as_deref(),
             Some("powershell.exe")
@@ -358,7 +357,6 @@ mod tests {
             options.diagnostics.socket_permission,
             RemoteMetricPermission::Light
         );
-        assert!(options.remote_task.enabled);
         assert_eq!(remote_task.max_concurrent, Some(3));
         assert_eq!(remote_task.timeout, Some(Duration::from_secs(45)));
         assert_eq!(remote_task.max_stdout_bytes, Some(1024));

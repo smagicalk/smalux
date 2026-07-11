@@ -7,7 +7,7 @@ use super::{LatestTelemetry, ReportEvent};
 use crate::collect::unix_timestamp_secs;
 use crate::config::AgentConfig;
 use smalux_core::model::info::AgentReport;
-use smalux_protocol::{DeltaReport, Heartbeat, OutboundReport};
+use smalux_protocol::{ClientEvent, DeltaReport, Heartbeat};
 use std::time::{Duration, Instant};
 
 /// 根据上次发送状态决定本次发 snapshot、delta、heartbeat 或跳过。
@@ -69,7 +69,7 @@ impl TelemetryAggregator {
         agent_version: &str,
         config: &AgentConfig,
         mut next_sequence: impl FnMut() -> u64,
-    ) -> anyhow::Result<Option<OutboundReport>> {
+    ) -> anyhow::Result<Option<ClientEvent>> {
         let report = state.build_report(agent_version)?;
         let now = unix_timestamp_secs();
         let now_instant = Instant::now();
@@ -169,14 +169,14 @@ impl TelemetryAggregator {
         now: u64,
         now_instant: Instant,
         sequence: u64,
-    ) -> OutboundReport {
+    ) -> ClientEvent {
         self.last_snapshot_at = Some(now);
         self.last_snapshot_instant = Some(now_instant);
         self.last_outbound_instant = Some(now_instant);
         self.last_snapshot_sequence = Some(sequence);
         self.last_report_sequence = Some(sequence);
         self.last_report = Some(report.clone());
-        OutboundReport::snapshot(sequence, now, report)
+        ClientEvent::snapshot(sequence, now, report)
     }
 
     /// 构造 delta，并更新策略状态。
@@ -187,12 +187,12 @@ impl TelemetryAggregator {
         now: u64,
         now_instant: Instant,
         sequence: u64,
-    ) -> OutboundReport {
+    ) -> ClientEvent {
         let agent_id = report.identity.agent_id.clone();
         self.last_report_sequence = Some(sequence);
         self.last_outbound_instant = Some(now_instant);
         self.last_report = Some(report);
-        OutboundReport::delta(agent_id, sequence, now, delta)
+        ClientEvent::delta(agent_id, sequence, now, delta)
     }
 
     /// 构造业务级 heartbeat。
@@ -202,9 +202,9 @@ impl TelemetryAggregator {
         now: u64,
         now_instant: Instant,
         sequence: u64,
-    ) -> OutboundReport {
+    ) -> ClientEvent {
         self.last_outbound_instant = Some(now_instant);
-        OutboundReport::heartbeat(
+        ClientEvent::heartbeat(
             report.identity.agent_id.clone(),
             sequence,
             now,
@@ -294,6 +294,7 @@ mod tests {
         CoreInfo, DiskInfo, IdentityInfo, MemoryInfo, NetworkInfo, ProcessInfo, SocketAccuracy,
         SocketInfo, SocketSource, SystemInfo,
     };
+    use smalux_protocol::ClientEventKind;
 
     /// 构造已经满足上报条件的状态。
     fn ready_state() -> LatestTelemetry {
@@ -336,7 +337,7 @@ mod tests {
         aggregator: &mut TelemetryAggregator,
         state: &LatestTelemetry,
         config: &AgentConfig,
-    ) -> Option<OutboundReport> {
+    ) -> Option<ClientEvent> {
         let mut next_sequence = aggregator.last_report_sequence.unwrap_or(0);
         aggregator
             .next_report_event(state, "0.1.0-test", config, || {
@@ -357,14 +358,8 @@ mod tests {
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config).unwrap();
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
-        assert!(matches!(
-            second.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
+        assert!(matches!(second.kind, ClientEventKind::Snapshot { .. }));
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
     }
@@ -390,12 +385,9 @@ mod tests {
         });
         let second = next_report(&mut aggregator, &state, &config).unwrap();
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         match second.kind {
-            smalux_protocol::OutboundReportKind::Delta { delta } => {
+            ClientEventKind::Delta { delta } => {
                 assert_eq!(delta.base_sequence, 1);
                 assert!(delta.identity.is_none());
                 assert!(delta.core.is_some());
@@ -432,12 +424,9 @@ mod tests {
         });
         let second = next_report(&mut aggregator, &state, &config).unwrap();
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         match second.kind {
-            smalux_protocol::OutboundReportKind::Delta { delta } => {
+            ClientEventKind::Delta { delta } => {
                 assert_eq!(delta.base_sequence, 1);
                 assert!(delta.identity.is_none());
                 assert!(delta.core.is_none());
@@ -462,10 +451,7 @@ mod tests {
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config);
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         assert!(second.is_none());
     }
 
@@ -480,10 +466,7 @@ mod tests {
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config);
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         assert!(second.is_none());
     }
 
@@ -499,10 +482,7 @@ mod tests {
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config);
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         assert!(second.is_none());
     }
 
@@ -518,12 +498,9 @@ mod tests {
         let first = next_report(&mut aggregator, &state, &config).unwrap();
         let second = next_report(&mut aggregator, &state, &config).unwrap();
 
-        assert!(matches!(
-            first.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
-        ));
+        assert!(matches!(first.kind, ClientEventKind::Snapshot { .. }));
         match second.kind {
-            smalux_protocol::OutboundReportKind::Heartbeat { heartbeat } => {
+            ClientEventKind::Heartbeat { heartbeat } => {
                 assert_eq!(heartbeat.last_report_sequence, Some(1));
             }
             _ => panic!("expected heartbeat report"),

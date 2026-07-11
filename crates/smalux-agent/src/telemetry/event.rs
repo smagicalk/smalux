@@ -2,7 +2,7 @@
 
 use crate::collect::{CoreSample, DiskSample, NetworkSample, ProcessSample, SocketSample};
 use smalux_core::model::info::IdentityInfo;
-use smalux_protocol::OutboundReport;
+use smalux_protocol::ClientEvent;
 
 /// 采集层提交给 reporter 的最新指标更新。
 ///
@@ -45,17 +45,17 @@ impl TelemetryUpdate {
 #[derive(Debug, Clone)]
 pub(crate) struct ReportEvent {
     /// 待导出的内部协议语义。
-    outbound: OutboundReport,
+    outbound: ClientEvent,
 }
 
 impl ReportEvent {
     /// 创建上报事件。
-    pub(crate) fn new(outbound: OutboundReport) -> Self {
+    pub(crate) fn new(outbound: ClientEvent) -> Self {
         Self { outbound }
     }
 
     /// 取出内部协议语义，交给 export adapter 编码。
-    pub(crate) fn into_outbound(self) -> OutboundReport {
+    pub(crate) fn into_outbound(self) -> ClientEvent {
         self.outbound
     }
 }

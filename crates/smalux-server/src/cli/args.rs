@@ -8,11 +8,12 @@ use secrecy::SecretString;
 
 use crate::config::defaults::{
     DEFAULT_BIND_ADDR, DEFAULT_BIND_PORT, DEFAULT_DATABASE_DRIVER, DEFAULT_DATABASE_HOST,
-    DEFAULT_FRONTEND_DIR, DEFAULT_FRONTEND_SPA_FALLBACK, DEFAULT_LOG_FILE, DEFAULT_LOG_MAX_SIZE_MB,
-    DEFAULT_LOG_RETENTION_FILES, DEFAULT_SERVE_FRONTEND,
+    DEFAULT_FRONTEND_DIR, DEFAULT_FRONTEND_SLOT_MODE, DEFAULT_FRONTEND_SPA_FALLBACK,
+    DEFAULT_LOG_FILE, DEFAULT_LOG_MAX_SIZE_MB, DEFAULT_LOG_RETENTION_FILES, DEFAULT_SERVE_FRONTEND,
 };
 use crate::config::model::{
-    DatabaseConfig, DatabaseDriver, FrontendConfig, HttpConfig, LogConfig, ServerConfig,
+    DatabaseConfig, DatabaseDriver, FrontendConfig, FrontendSlotConfig, FrontendSlotMode,
+    HttpConfig, LogConfig, ServerConfig,
 };
 
 /// CLI 支持的数据库驱动，避免用户输入不可识别的字符串。
@@ -24,6 +25,17 @@ pub enum DatabaseDriverArg {
     Postgres,
     /// MySQL 数据库，适合已有 MySQL 基础设施的部署场景。
     Mysql,
+}
+
+/// CLI 支持的前端槽位来源模式。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FrontendSlotModeArg {
+    /// 使用内置资源。
+    Embedded,
+    /// 使用本地目录。
+    Directory,
+    /// 使用外部部署前端。
+    External,
 }
 
 /// CLI 中的敏感字符串，Debug 输出时只显示是否已设置。
@@ -79,6 +91,16 @@ impl From<DatabaseDriverArg> for DatabaseDriver {
     }
 }
 
+impl From<FrontendSlotModeArg> for FrontendSlotMode {
+    fn from(mode: FrontendSlotModeArg) -> Self {
+        match mode {
+            FrontendSlotModeArg::Embedded => Self::Embedded,
+            FrontendSlotModeArg::Directory => Self::Directory,
+            FrontendSlotModeArg::External => Self::External,
+        }
+    }
+}
+
 /// server 启动参数，负责承接命令行和环境变量中的原始输入。
 ///
 /// CLI 只配置 server 进程启动所需的静态运行环境，不配置 agent token/key 或 agent 执行能力。
@@ -91,27 +113,27 @@ impl From<DatabaseDriverArg> for DatabaseDriver {
     long_about = "Smalux monitoring server for agent ingestion, REST API, dashboard realtime events, and optional frontend hosting."
 )]
 pub struct ServerArgs {
-    /// HTTP 监听 IP 地址，例如 127.0.0.1 或 0.0.0.0。
+    /// HTTP 监听 IP 地址，例如 127.0.0.1 或 0.0.0.0；默认 `127.0.0.1`。
     #[arg(long = "bind-addr", visible_aliases = ["host","addr"], env = "SMALUX_SERVER_BIND_ADDR", default_value = DEFAULT_BIND_ADDR)]
     pub bind_addr: String,
 
-    /// HTTP 监听端口。
+    /// HTTP 监听端口；默认 `3000`。
     #[arg(short = 'p', long = "bind-port", visible_aliases = ["port"], env = "SMALUX_SERVER_BIND_PORT", default_value_t = DEFAULT_BIND_PORT)]
     pub bind_port: u16,
 
-    /// 数据库驱动，可选 sqlite、postgres 或 mysql。
+    /// 数据库驱动，可选 sqlite、postgres 或 mysql；默认 `sqlite`。
     #[arg(long = "database-driver",visible_aliases = ["db-type","database-type","type"] ,env = "SMALUX_SERVER_DATABASE_DRIVER", default_value = DEFAULT_DATABASE_DRIVER)]
     pub database_driver: DatabaseDriverArg,
 
-    /// PostgreSQL/MySQL 数据库主机。
+    /// PostgreSQL/MySQL 数据库主机；未传时默认 `127.0.0.1`。
     #[arg(long = "database-host", visible_aliases = ["db-host"] ,env = "SMALUX_SERVER_DATABASE_HOST")]
     pub database_host: Option<String>,
 
-    /// PostgreSQL/MySQL 数据库端口。
+    /// PostgreSQL/MySQL 数据库端口；未传时 PostgreSQL 默认 `5432`，MySQL 默认 `3306`。
     #[arg(long = "database-port", visible_aliases = ["db-port"] , env = "SMALUX_SERVER_DATABASE_PORT")]
     pub database_port: Option<u16>,
 
-    /// 数据库目标；SQLite 时表示文件路径，未传默认 smalux-server.db；PostgreSQL/MySQL 时表示数据库名，未传默认 smalux。
+    /// 数据库目标；SQLite 时表示文件路径，默认 `smalux-server.db`；PostgreSQL/MySQL 时表示数据库名，默认 `smalux`。
     #[arg(long = "database-name",  visible_aliases = ["db-name"] ,env = "SMALUX_SERVER_DATABASE_NAME")]
     pub database_name: Option<String>,
 
@@ -123,11 +145,11 @@ pub struct ServerArgs {
     #[arg(long = "database-password",  visible_aliases = ["db-pass"] ,env = "SMALUX_SERVER_DATABASE_PASSWORD", value_parser = parse_secret_arg)]
     pub database_password: Option<SecretArg>,
 
-    /// 数据库连接 URL 的额外 query 参数，可重复传入，例如 `sslmode=require` 或 `charset=utf8mb4`。
+    /// 数据库连接 URL 的额外 query 参数，可重复传入，例如 `sslmode=require` 或 `charset=utf8mb4`；默认空。
     #[arg(long = "database-param",  visible_aliases = ["db-param"] ,value_name = "KEY=VALUE", value_parser = parse_database_param)]
     pub database_params: Vec<DatabaseParamArg>,
 
-    /// 是否由 server 托管前端静态资源；不传时默认只提供 API 和 agent 接入。
+    /// 是否由 server 托管前端静态资源；默认 `false`，不传时只提供 API 和 agent 接入。
     #[arg(
         long = "serve-frontend",
         visible_aliases = ["isfrontend"] ,
@@ -140,11 +162,31 @@ pub struct ServerArgs {
     )]
     pub serve_frontend: bool,
 
-    /// 未编译内置前端资源时，server 托管前端所使用的静态资源目录。
-    #[arg(long = "frontend-dir",  visible_aliases = ["frontend"] ,env = "SMALUX_SERVER_FRONTEND_DIR", default_value = DEFAULT_FRONTEND_DIR)]
-    pub frontend_dir: PathBuf,
+    /// 站点前端来源模式；默认 `embedded`。
+    #[arg(long = "site-mode", env = "SMALUX_SERVER_SITE_MODE", default_value = DEFAULT_FRONTEND_SLOT_MODE)]
+    pub site_mode: FrontendSlotModeArg,
 
-    /// 是否为 React/Vite 这类 SPA 启用 index.html fallback，需要显式传入 true 或 false。
+    /// 站点前端目录；仅在 `site-mode=directory` 时有效，默认 `apps/smalux-web/dist`。
+    #[arg(long = "site-dir", visible_aliases = ["frontend-dir", "theme-dir", "frontend"], env = "SMALUX_SERVER_SITE_DIR", default_value = DEFAULT_FRONTEND_DIR)]
+    pub site_dir: PathBuf,
+
+    /// 站点前端外部部署 URL；仅在 `site-mode=external` 时有效，默认空。
+    #[arg(long = "site-external-url", env = "SMALUX_SERVER_SITE_EXTERNAL_URL")]
+    pub site_external_url: Option<String>,
+
+    /// 管理后台前端来源模式；默认 `embedded`。
+    #[arg(long = "admin-mode", env = "SMALUX_SERVER_ADMIN_MODE", default_value = DEFAULT_FRONTEND_SLOT_MODE)]
+    pub admin_mode: FrontendSlotModeArg,
+
+    /// 管理后台前端目录；仅在 `admin-mode=directory` 时有效，默认 `apps/smalux-web/dist`。
+    #[arg(long = "admin-dir", env = "SMALUX_SERVER_ADMIN_DIR", default_value = DEFAULT_FRONTEND_DIR)]
+    pub admin_dir: PathBuf,
+
+    /// 管理后台前端外部部署 URL；仅在 `admin-mode=external` 时有效，默认空。
+    #[arg(long = "admin-external-url", env = "SMALUX_SERVER_ADMIN_EXTERNAL_URL")]
+    pub admin_external_url: Option<String>,
+
+    /// 是否为 React/Vite 这类 SPA 启用 index.html fallback，需要显式传入 true 或 false；默认 `true`。
     #[arg(
         long = "frontend-spa-fallback",
         env = "SMALUX_SERVER_FRONTEND_SPA_FALLBACK",
@@ -154,15 +196,15 @@ pub struct ServerArgs {
     )]
     pub frontend_spa_fallback: bool,
 
-    /// 滚动日志文件路径；日志级别仍然只读取 RUST_LOG。
+    /// 滚动日志文件路径；日志级别仍然只读取 RUST_LOG，默认 `logs/smalux-server.log`。
     #[arg(long = "log-file", env = "SMALUX_SERVER_LOG_FILE", default_value = DEFAULT_LOG_FILE)]
     pub log_file: PathBuf,
 
-    /// 滚动日志最多保留的文件数量。
+    /// 滚动日志最多保留的文件数量；默认 `14`。
     #[arg(short = 'L', long = "log-retention-files", env = "SMALUX_SERVER_LOG_RETENTION_FILES", default_value_t = DEFAULT_LOG_RETENTION_FILES)]
     pub log_retention_files: usize,
 
-    /// 单个滚动日志文件最大大小，单位 MB。
+    /// 单个滚动日志文件最大大小，单位 MB；默认 `64`。
     #[arg(long = "log-max-size-mb", env = "SMALUX_SERVER_LOG_MAX_SIZE_MB", default_value_t = DEFAULT_LOG_MAX_SIZE_MB)]
     pub log_max_size_mb: u64,
 }
@@ -184,7 +226,32 @@ impl ServerArgs {
             database,
             frontend: FrontendConfig {
                 serve_frontend: self.serve_frontend,
-                dir: self.frontend_dir,
+                site: FrontendSlotConfig {
+                    mode: FrontendSlotMode::from(self.site_mode),
+                    directory: if self.site_mode == FrontendSlotModeArg::Directory {
+                        Some(self.site_dir)
+                    } else {
+                        None
+                    },
+                    external_url: if self.site_mode == FrontendSlotModeArg::External {
+                        self.site_external_url
+                    } else {
+                        None
+                    },
+                },
+                admin: FrontendSlotConfig {
+                    mode: FrontendSlotMode::from(self.admin_mode),
+                    directory: if self.admin_mode == FrontendSlotModeArg::Directory {
+                        Some(self.admin_dir)
+                    } else {
+                        None
+                    },
+                    external_url: if self.admin_mode == FrontendSlotModeArg::External {
+                        self.admin_external_url
+                    } else {
+                        None
+                    },
+                },
                 spa_fallback: self.frontend_spa_fallback,
             },
             log: LogConfig {
@@ -320,6 +387,8 @@ mod tests {
         assert_eq!(config.http.bind_addr.to_string(), "127.0.0.1");
         assert_eq!(config.http.bind_port, 3000);
         assert_eq!(config.http.socket_addr().to_string(), "127.0.0.1:3000");
+        assert_eq!(config.frontend.site.mode, FrontendSlotMode::Embedded);
+        assert_eq!(config.frontend.admin.mode, FrontendSlotMode::Embedded);
         match &config.database {
             DatabaseConfig::Sqlite { name, .. } => {
                 assert_eq!(name, "smalux-server.db");
@@ -344,6 +413,34 @@ mod tests {
         assert_eq!(config.http.bind_addr.to_string(), "0.0.0.0");
         assert_eq!(config.http.bind_port, 8080);
         assert_eq!(config.http.socket_addr().to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn into_config_keeps_site_and_admin_dirs() {
+        let config = ServerArgs::try_parse_from([
+            "smalux-server",
+            "--serve-frontend",
+            "--site-mode",
+            "directory",
+            "--site-dir",
+            "data/frontend/site/current",
+            "--admin-mode",
+            "directory",
+            "--admin-dir",
+            "data/frontend/admin/current",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+
+        assert_eq!(
+            config.frontend.site.directory.as_deref(),
+            Some(std::path::Path::new("data/frontend/site/current"))
+        );
+        assert_eq!(
+            config.frontend.admin.directory.as_deref(),
+            Some(std::path::Path::new("data/frontend/admin/current"))
+        );
     }
 
     #[test]

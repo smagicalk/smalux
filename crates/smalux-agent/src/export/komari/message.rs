@@ -229,8 +229,8 @@ mod tests {
     use super::*;
     use crate::config::AgentConfig;
     use crate::config::model::{ExportAuthMode, RemoteShellConfig};
-    use crate::service::shell::{RemoteShellManager, RemoteShellOptions};
-    use crate::service::{InboundCommand, inbound_command_channel};
+    use crate::service::shell::RemoteShellManager;
+    use crate::service::{InboundCommand, RemoteCommandOptions, inbound_command_channel};
     use futures_util::{SinkExt, StreamExt};
     use smalux_protocol::{RemoteShellOpenRequest, ServerFrame, encode_server_frame};
     use tokio::net::TcpListener;
@@ -352,7 +352,7 @@ mod tests {
         assert!(request.stream_url.contains("id=term-e2e"));
         assert!(request.stream_url.contains("token=secret-token"));
 
-        RemoteShellManager::new(RemoteShellOptions { enabled: true })
+        RemoteShellManager::new(RemoteCommandOptions { enabled: true })
             .open(
                 request,
                 &stream_export_config.unwrap(),

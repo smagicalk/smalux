@@ -31,6 +31,7 @@ pub(crate) use message::inbound::{
 };
 pub(crate) use message::outbound;
 pub(crate) use options::{RemoteMetricPermission, ServiceOptions};
+pub(crate) use remote::RemoteCommandOptions;
 pub(crate) use remote::job::{RemoteJobApply, RemoteJobManager};
 pub(crate) use remote::probe::{RemoteProbeExecutionRequest, display_probe_id};
 pub(crate) use remote::shell;
@@ -62,9 +63,8 @@ pub(crate) async fn run(
         network_interval_ms = config.network.interval.as_millis(),
         report_interval_ms = config.report.interval.as_millis(),
         basic_info_refresh_interval_ms = config.outbound.basic_info.refresh_interval.as_millis(),
-        remote_shell_enabled = options.remote_shell.enabled,
+        remote_command_enabled = options.remote_command_enabled(),
         remote_shell_max_sessions = config.remote_shell.max_sessions,
-        remote_task_enabled = options.remote_task.enabled,
         remote_task_max_concurrent = config.remote_task.max_concurrent,
         remote_probe_enabled = config.remote_probe.enabled,
         remote_probe_timeout_ms = config.remote_probe.timeout.as_millis(),
@@ -81,9 +81,9 @@ pub(crate) async fn run(
     let (collector_command_tx, collector_command_rx) = collector_command_channel();
     // telemetry update 队列承载采集结果；reporter 是 latest 缓存的唯一拥有者。
     let (telemetry_tx, telemetry_rx) = telemetry_update_channel();
-    let remote_shell_manager = shell::RemoteShellManager::new(options.remote_shell.clone());
+    let remote_shell_manager = shell::RemoteShellManager::new(options.remote_command.clone());
     let remote_task_manager = RemoteTaskManager::new(
-        options.remote_task.clone(),
+        options.remote_command.clone(),
         config_manager.clone(),
         outbound_tx.clone(),
         outbound_sequence.clone(),
@@ -196,7 +196,7 @@ mod tests {
     };
     use super::message::{TelemetryUpdateSender, telemetry_update_channel};
     use super::outbound::{
-        OutboundEvent, OutboundSequence, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
+        ExportEvent, OutboundSequence, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
         outbound_channel,
     };
     use super::reporter::{ReporterLoopParts, reporter_command_channel, reporter_loop};
@@ -628,7 +628,7 @@ mod tests {
 
     /// 构造默认关闭的远程 shell manager。
     fn disabled_remote_shell_manager() -> super::shell::RemoteShellManager {
-        super::shell::RemoteShellManager::new(super::shell::RemoteShellOptions::default())
+        super::shell::RemoteShellManager::new(super::remote::RemoteCommandOptions::default())
     }
 
     /// 构造默认关闭的远程任务管理器。
@@ -638,7 +638,7 @@ mod tests {
         sequence: OutboundSequence,
     ) -> super::task::RemoteTaskManager {
         super::task::RemoteTaskManager::new(
-            super::task::RemoteTaskOptions::default(),
+            super::remote::RemoteCommandOptions::default(),
             manager,
             outbound_tx,
             sequence,
@@ -924,7 +924,7 @@ mod tests {
         ));
 
         outbound_tx
-            .send(OutboundEvent::RemoteTaskResult(RemoteTaskResultEnvelope {
+            .send(ExportEvent::RemoteTaskResult(RemoteTaskResultEnvelope {
                 agent_id: "agent-service".to_string(),
                 sequence: 1,
                 created_at: 100,
@@ -986,7 +986,7 @@ mod tests {
         ));
 
         outbound_tx
-            .send(OutboundEvent::RemoteTaskResult(RemoteTaskResultEnvelope {
+            .send(ExportEvent::RemoteTaskResult(RemoteTaskResultEnvelope {
                 agent_id: "agent-service".to_string(),
                 sequence: 1,
                 created_at: 100,
@@ -1049,7 +1049,7 @@ mod tests {
         ));
 
         outbound_tx
-            .send(OutboundEvent::RemoteJobResult(RemoteJobResultEnvelope {
+            .send(ExportEvent::RemoteJobResult(RemoteJobResultEnvelope {
                 agent_id: "agent-service".to_string(),
                 sequence: 1,
                 created_at: 100,
@@ -1235,7 +1235,7 @@ mod tests {
         harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::ControlAck(ack) = event else {
+        let ExportEvent::ControlAck(ack) = event else {
             panic!("expected control ack");
         };
         assert_eq!(ack.ack.sequence, 77);
@@ -1266,7 +1266,7 @@ mod tests {
 
         assert!(error.to_string().contains("reporting is disabled"));
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::ControlError(error) = event else {
+        let ExportEvent::ControlError(error) = event else {
             panic!("expected control error");
         };
         assert_eq!(error.error.sequence, Some(78));
@@ -1495,7 +1495,7 @@ mod tests {
 
         assert!(error.to_string().contains("remote shell is disabled"));
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::ControlError(error) = event else {
+        let ExportEvent::ControlError(error) = event else {
             panic!("expected control error");
         };
         assert_eq!(error.error.sequence, Some(91));
@@ -1521,9 +1521,9 @@ mod tests {
         let (reporter_commands, _reporter_command_rx) = reporter_command_channel();
         let dispatcher = ControlDispatcher::new(ControlDispatcherParts {
             config_manager: manager.clone(),
-            remote_shell: super::shell::RemoteShellManager::new(super::shell::RemoteShellOptions {
-                enabled: true,
-            }),
+            remote_shell: super::shell::RemoteShellManager::new(
+                super::remote::RemoteCommandOptions { enabled: true },
+            ),
             remote_task: disabled_remote_task_manager(
                 manager.clone(),
                 outbound_tx.clone(),
@@ -1559,7 +1559,7 @@ mod tests {
 
         assert!(!error.to_string().is_empty());
         let event = outbound_rx.recv().await.unwrap();
-        let OutboundEvent::ControlError(error) = event else {
+        let ExportEvent::ControlError(error) = event else {
             panic!("expected control error");
         };
         assert_eq!(error.error.sequence, Some(92));
@@ -1587,7 +1587,7 @@ mod tests {
         harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::RemoteTaskResult(result) = event else {
+        let ExportEvent::RemoteTaskResult(result) = event else {
             panic!("expected remote task result");
         };
 
@@ -1627,7 +1627,7 @@ mod tests {
         harness.handle_message(&message).await.unwrap();
 
         let event = harness._outbound_rx.recv().await.unwrap();
-        let OutboundEvent::RemoteJobResult(result) = event else {
+        let ExportEvent::RemoteJobResult(result) = event else {
             panic!("expected remote job result");
         };
         let Some(result) = result.result.as_probe() else {

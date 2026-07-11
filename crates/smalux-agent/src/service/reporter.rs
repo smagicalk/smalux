@@ -5,14 +5,14 @@ use crate::config::AgentConfig;
 use crate::config::model::ExportFormat;
 use crate::export::export_format_needs_basic_info;
 use crate::service::outbound::{
-    BasicInfoEnvelope, OutboundEvent, OutboundSender, OutboundSequence, ReportEnvelope,
+    BasicInfoEnvelope, ExportEvent, OutboundSender, OutboundSequence, ReportEnvelope,
 };
 #[cfg(test)]
 use crate::telemetry::ReportEvent;
 #[cfg(test)]
 use crate::telemetry::TelemetryUpdate;
 use crate::telemetry::{LatestTelemetry, TelemetryAggregator};
-use smalux_protocol::{OutboundReport, OutboundReportKind};
+use smalux_protocol::{ClientEvent, ClientEventKind};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
@@ -52,7 +52,7 @@ pub(crate) enum ReporterCommand {
 pub(crate) fn reporter_tick_once(
     state: &LatestTelemetry,
     agent_version: &str,
-) -> anyhow::Result<OutboundReport> {
+) -> anyhow::Result<ClientEvent> {
     let mut aggregator = TelemetryAggregator::default();
     let config = AgentConfig::default();
     let sequence = OutboundSequence::default();
@@ -401,7 +401,7 @@ async fn queue_basic_info_if_ready(
         }
     };
     let sequence = sequence.next();
-    let event = OutboundEvent::BasicInfo(Box::new(BasicInfoEnvelope::new(sequence, report)));
+    let event = ExportEvent::BasicInfo(Box::new(BasicInfoEnvelope::new(sequence, report)));
     outbound_tx
         .send(event)
         .await
@@ -426,7 +426,7 @@ async fn queue_next_report(
             let outbound = event.into_outbound();
             tracing::debug!(
                 sequence = outbound.sequence,
-                report_kind = outbound_report_kind(&outbound.kind),
+                report_kind = outbound_event_kind(&outbound.kind),
                 created_at = outbound.created_at,
                 "reporter generated agent report"
             );
@@ -465,12 +465,12 @@ async fn queue_forced_snapshot(
 /// 把协议上报包装成出站事件并投递。
 async fn queue_report_event(
     outbound_tx: &OutboundSender,
-    outbound: OutboundReport,
+    outbound: ClientEvent,
 ) -> anyhow::Result<()> {
     let sequence = outbound.sequence;
     let created_at = outbound.created_at;
-    let report_kind = outbound_report_kind(&outbound.kind);
-    let event = OutboundEvent::Report(ReportEnvelope::from_outbound(outbound));
+    let report_kind = outbound_event_kind(&outbound.kind);
+    let event = ExportEvent::Report(ReportEnvelope::from_outbound(outbound));
     outbound_tx
         .send(event)
         .await
@@ -480,12 +480,12 @@ async fn queue_report_event(
 }
 
 /// 返回上报语义的稳定日志名称。
-fn outbound_report_kind(kind: &OutboundReportKind) -> &'static str {
+fn outbound_event_kind(kind: &ClientEventKind) -> &'static str {
     match kind {
-        OutboundReportKind::Snapshot { .. } => "snapshot",
-        OutboundReportKind::Heartbeat { .. } => "heartbeat",
-        OutboundReportKind::Delta { .. } => "delta",
-        OutboundReportKind::Ack { .. } => "ack",
+        ClientEventKind::Snapshot { .. } => "snapshot",
+        ClientEventKind::Heartbeat { .. } => "heartbeat",
+        ClientEventKind::Delta { .. } => "delta",
+        ClientEventKind::Ack { .. } => "ack",
     }
 }
 
@@ -566,14 +566,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let OutboundEvent::Report(report) = event else {
+        let ExportEvent::Report(report) = event else {
             panic!("expected report event");
         };
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
         match &report.outbound.kind {
-            smalux_protocol::OutboundReportKind::Snapshot { report } => {
+            smalux_protocol::ClientEventKind::Snapshot { report } => {
                 assert_eq!(report.meta.agent_version.as_str(), "0.1.0-test");
             }
             _ => panic!("expected snapshot report"),
@@ -613,7 +613,7 @@ mod tests {
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
-        let OutboundEvent::BasicInfo(info) = event else {
+        let ExportEvent::BasicInfo(info) = event else {
             panic!("expected basic info event");
         };
         assert_eq!(info.sequence, 1);
@@ -660,7 +660,7 @@ mod tests {
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
-        assert!(matches!(event, OutboundEvent::BasicInfo(_)));
+        assert!(matches!(event, ExportEvent::BasicInfo(_)));
     }
 
     /// 验证关闭 basic info 出站事件后不会产生 basic info 事件。
@@ -696,7 +696,7 @@ mod tests {
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
-        assert!(matches!(event, OutboundEvent::Report(_)));
+        assert!(matches!(event, ExportEvent::Report(_)));
     }
 
     /// 验证采集 update 会驱动 reporter 立即生成下一条上报。
@@ -742,11 +742,11 @@ mod tests {
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
-        let OutboundEvent::Report(report) = event else {
+        let ExportEvent::Report(report) = event else {
             panic!("expected report event");
         };
         match &report.outbound.kind {
-            smalux_protocol::OutboundReportKind::Delta { delta } => {
+            smalux_protocol::ClientEventKind::Delta { delta } => {
                 assert_eq!(
                     delta.core.as_ref().unwrap().as_ref().unwrap().sampled_at,
                     99
@@ -798,12 +798,12 @@ mod tests {
         shutdown_tx.send_replace(true);
         task.await.unwrap();
 
-        let OutboundEvent::Report(report) = event else {
+        let ExportEvent::Report(report) = event else {
             panic!("expected forced report event");
         };
         assert!(matches!(
             report.outbound.kind,
-            smalux_protocol::OutboundReportKind::Snapshot { .. }
+            smalux_protocol::ClientEventKind::Snapshot { .. }
         ));
     }
 }

@@ -52,7 +52,7 @@ mod tests {
     };
     use base64::Engine;
     use smalux_core::model::info::AgentReport;
-    use smalux_protocol::{ClientPayload, OutboundReportKind, decode_client_frame};
+    use smalux_protocol::{ClientEventKind, ClientPayload, decode_client_frame};
 
     /// 验证默认 base URL 会派生出 WebSocket transport plan。
     #[test]
@@ -122,7 +122,7 @@ mod tests {
     fn smalux_json_adapter_outputs_websocket_binary_request() {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
+        let outbound = smalux_protocol::ClientEvent::snapshot(1, 100, report);
         let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let config = ExportConfig::default();
         adapter.transport_plan(&config).unwrap();
@@ -146,7 +146,7 @@ mod tests {
     fn smalux_json_secure_psk_keeps_adapter_transport_neutral() {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
+        let outbound = smalux_protocol::ClientEvent::snapshot(1, 100, report);
         let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
         let token = format!(
             "smx1.agent-key.{}",
@@ -175,10 +175,10 @@ mod tests {
     fn smalux_json_adapter_keeps_supported_reports() {
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = smalux_protocol::OutboundReport::snapshot(1, 100, report);
+        let outbound = smalux_protocol::ClientEvent::snapshot(1, 100, report);
         let mut adapter = build_protocol_adapter(ExportFormat::SmaluxJson);
 
-        assert!(matches!(outbound.kind, OutboundReportKind::Snapshot { .. }));
+        assert!(matches!(outbound.kind, ClientEventKind::Snapshot { .. }));
         assert!(
             !adapter
                 .encode_report(ExportDeliveryId::RealtimeReport, &outbound)

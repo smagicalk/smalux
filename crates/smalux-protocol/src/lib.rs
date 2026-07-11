@@ -13,15 +13,15 @@ pub mod secure;
 pub mod wire;
 
 pub use codec::{
-    client_frame_from_ack, client_frame_from_outbound_report, client_frame_from_protocol_error,
-    client_frame_from_remote_job_result, client_frame_from_remote_task_result, decode_client_frame,
-    decode_client_frame_bytes, decode_server_frame, decode_server_frame_bytes,
+    build_client_frame_from_ack, build_client_frame_from_protocol_error,
+    build_client_frame_from_remote_job_result, build_client_frame_from_remote_task_result,
+    decode_client_frame, decode_client_frame_bytes, decode_server_frame, decode_server_frame_bytes,
     decode_shell_stream_command, encode_client_frame, encode_client_frame_bytes,
     encode_server_frame, encode_server_frame_bytes, encode_shell_stream_event,
 };
 pub use frame::{
-    Ack, ClientFrame, ClientPayload, DeltaReport, Heartbeat, MetricCollectionRequest,
-    OutboundReport, OutboundReportKind, ProtocolError, RemoteJobApplyRequest, RemoteJobKind,
+    Ack, ClientEvent, ClientEventKind, ClientFrame, ClientPayload, DeltaReport, Heartbeat,
+    MetricCollectionRequest, ProtocolError, RemoteJobApplyRequest, RemoteJobKind,
     RemoteJobOperation, RemoteJobResult, RemoteJobRunRequest, RemoteJobSpec, RemoteProbeId,
     RemoteProbeResult, RemoteProbeResultSource, RemoteProbeResultStatus, RemoteProbeType,
     RemoteShellDataEncoding, RemoteShellOpenRequest, RemoteShellStreamCommand,

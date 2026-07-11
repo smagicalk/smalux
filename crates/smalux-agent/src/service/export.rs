@@ -6,7 +6,7 @@ mod pipeline;
 
 use super::inbound::InboundCommandSender;
 use super::outbound::{
-    ControlAckEnvelope, ControlErrorEnvelope, OutboundEvent, OutboundReceiver,
+    ControlAckEnvelope, ControlErrorEnvelope, ExportEvent, OutboundReceiver,
     RemoteJobResultEnvelope, RemoteTaskResultEnvelope, ReportEnvelope,
 };
 use crate::config::ConfigManager;
@@ -70,7 +70,7 @@ pub(crate) async fn export_supervisor(
                 );
 
                 match event {
-                    OutboundEvent::Report(report) => {
+                    ExportEvent::Report(report) => {
                         // report 是 latest-state 语义：如果 export 端落后，只保留最新 report，
                         // 避免慢连接导致大量旧 snapshot/delta 堆积。
                         latest_report = Some(report);
@@ -103,7 +103,7 @@ pub(crate) async fn export_supervisor(
                             .await?;
                         }
                     }
-                    OutboundEvent::BasicInfo(info) => {
+                    ExportEvent::BasicInfo(info) => {
                         // basic info 是低频兼容事件，下一轮 interval 会自然重试。
                         // 这里不做 pending，也不因为 HTTP 辅助请求失败重建主连接。
                         tracing::debug!(
@@ -119,7 +119,7 @@ pub(crate) async fn export_supervisor(
                             tracing::warn!(error = ?err, "basic info export failed; continuing");
                         }
                     }
-                    OutboundEvent::ControlAck(ack) => {
+                    ExportEvent::ControlAck(ack) => {
                         // ack/error/task/probe 是一次性结果语义，必须在 Sent 前保留 pending，
                         // 否则重连窗口里会丢失 server 正在等待的命令响应。
                         tracing::debug!(
@@ -158,7 +158,7 @@ pub(crate) async fn export_supervisor(
                             }
                         }
                     }
-                    OutboundEvent::ControlError(error) => {
+                    ExportEvent::ControlError(error) => {
                         tracing::debug!(
                             sequence = error.sequence,
                             error_code = %error.error.code,
@@ -196,7 +196,7 @@ pub(crate) async fn export_supervisor(
                             }
                         }
                     }
-                    OutboundEvent::RemoteTaskResult(result) => {
+                    ExportEvent::RemoteTaskResult(result) => {
                         tracing::debug!(
                             sequence = result.sequence,
                             task_id = %result.result.task_id,
@@ -234,7 +234,7 @@ pub(crate) async fn export_supervisor(
                             }
                         }
                     }
-                    OutboundEvent::RemoteJobResult(result) => {
+                    ExportEvent::RemoteJobResult(result) => {
                         tracing::debug!(
                             sequence = result.sequence,
                             job_id = %result.result.display_id(),

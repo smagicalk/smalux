@@ -27,7 +27,7 @@
 //!
 //! - 只消费完整 snapshot；delta 和业务级 heartbeat 不发送。
 //! - WebSocket 模式要求 `report.interval <= 10s`，避免第三方服务认为连接空闲。
-//! - basic info 由 reporter 生成 `OutboundEvent::BasicInfo`，默认 5 分钟刷新一次。
+//! - basic info 由 reporter 单独生成低频事件，默认 5 分钟刷新一次。
 //! - Komari terminal 消息会转给 remote shell manager。
 //! - Komari exec 消息会转给 remote task manager，结果按 task/result HTTP 接口回传。
 //! - 其它 Komari server 消息安全忽略。
@@ -52,7 +52,7 @@ use crate::service::outbound::{
     BasicInfoEnvelope, RemoteJobResultEnvelope, RemoteTaskResultEnvelope,
 };
 use model::{BasicInfo, PingResult, Report, TaskResult};
-use smalux_protocol::{OutboundReport, OutboundReportKind};
+use smalux_protocol::{ClientEvent, ClientEventKind};
 use url::{
     komari_basic_info_url, komari_report_websocket_url, komari_task_result_url, redact_komari_url,
 };
@@ -121,9 +121,9 @@ impl ProtocolAdapter for KomariProtocolAdapter {
     fn encode_report(
         &mut self,
         delivery_id: ExportDeliveryId,
-        outbound: &OutboundReport,
+        outbound: &ClientEvent,
     ) -> anyhow::Result<Vec<TransportRequest>> {
-        let OutboundReportKind::Snapshot { report } = &outbound.kind else {
+        let ClientEventKind::Snapshot { report } = &outbound.kind else {
             return Ok(vec![]);
         };
 
@@ -389,7 +389,7 @@ mod tests {
             .unwrap();
         let mut report = AgentReport::default();
         report.identity.agent_id = "agent-1".to_string();
-        let outbound = OutboundReport::snapshot(1, 100, report);
+        let outbound = ClientEvent::snapshot(1, 100, report);
 
         let requests = adapter
             .encode_report(ExportDeliveryId::RealtimeReport, &outbound)
@@ -410,7 +410,7 @@ mod tests {
             .transport_plan(&komari_config("https://example.com"))
             .unwrap();
         let outbound =
-            OutboundReport::heartbeat("agent-1", 1, 100, smalux_protocol::Heartbeat::default());
+            ClientEvent::heartbeat("agent-1", 1, 100, smalux_protocol::Heartbeat::default());
 
         let basic_info = adapter
             .encode_report(ExportDeliveryId::BasicInfo, &outbound)
