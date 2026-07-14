@@ -19,7 +19,7 @@ axum-extra = { version = "0.12.6", features = ["async-read-body", "attachment", 
 # 通用 Service 中间件，用于超时、重试、缓冲、限流和负载保护。
 tower = { version = "0.5.3", features = ["full"] }
 # HTTP 专用中间件，用于 trace、CORS、压缩、request ID 和静态文件。
-tower-http = { version = "0.6.11", features = ["full"] }
+tower-http = { version = "0.7.0", features = ["full"] }
 # 基于 governor 的 Axum 限流中间件。
 tower_governor = { version = "0.8.0", default-features = false, features = ["axum", "tracing"] }
 # Web 管理端会话中间件，支持签名和私密 cookie。
@@ -33,13 +33,13 @@ serde_json = "1.0.150"
 # Server 结构化日志 API。
 tracing = { version = "0.1.44", features = ["log", "std"] }
 # ORM 与数据库连接，支持 SQLite、PostgreSQL 和 MySQL。
-sea-orm = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+sea-orm = { version = "2.0.0-rc.42", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SeaORM 迁移运行时，用于启动时执行数据库 schema 升级。
-sea-orm-migration = { version = "2.0.0-rc.40", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+sea-orm-migration = { version = "2.0.0-rc.42", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SQL 构建器，用于动态查询、复杂条件和迁移辅助。
 sea-query = { version = "1.0.1", default-features = false, features = ["derive", "backend-sqlite", "backend-postgres", "backend-mysql", "serde", "with-json", "with-chrono", "with-time", "with-uuid", "sea-orm"] }
 # 启动和应用边界的通用错误封装。
-anyhow = { version = "1.0.102", features = ["default"] }
+anyhow = { version = "1.0.103", features = ["default"] }
 # Server 各模块的明确错误类型定义。
 thiserror = { version = "2.0.18", features = ["default"] }
 # 在 trait 中定义异步方法，用于 service 和 repository 接口。
@@ -49,23 +49,23 @@ futures-util = { version = "0.3.32", features = ["sink", "io"] }
 # URL 查询参数编解码，用于数据库连接参数和 API query。
 form_urlencoded = "1.2.2"
 # 高效字节缓冲区，用于 WebSocket binary 和 wire frame。
-bytes = "1.11.1"
+bytes = "1.12.1"
 # 标准 HTTP 类型，供 Axum、Tower 和自定义中间件共享。
-http = "1.4.1"
+http = "1.4.2"
 # 强类型 HTTP header，用于认证和请求上下文。
 headers = "0.4.1"
 # 请求 DTO 和配置 patch 的声明式校验。
 validator = { version = "0.20.0", features = ["derive"] }
 # 生成和序列化连接、命令、任务等服务端 ID。
-uuid = { version = "1.23.2", features = ["v4", "serde"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
 # 时间处理与序列化，用于数据库字段、过期时间和 API 输出。
-time = { version = "0.3.47", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
+time = { version = "0.3.53", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
 # URL 构造与编码，用于数据库连接地址和外部链接。
 url = "2.5.8"
 # 敏感值包装，避免 token、secret 和 PSK 被 Debug 或日志泄露。
 secrecy = { version = "0.10.3", features = ["serde"] }
 # 编译期嵌入前端资源，仅在 frontend-embed feature 开启时使用。
-rust-embed = { version = "8.9.0", optional = true }
+rust-embed = { version = "8.12.0", optional = true }
 # 根据资源文件名推断 Content-Type，仅用于内嵌前端资源。
 mime_guess = { version = "2.0.5", optional = true }
 # 项目公共基础库，复用日志、工具和跨 crate 类型。
@@ -73,4 +73,4 @@ smalux-core = { path = "../smalux-core" }
 # 项目自有协议库，复用 ClientFrame、ServerFrame、wire 和 secure。
 smalux-protocol = { path = "../smalux-protocol" }
 # Noise Protocol 实现，用于 Server 端 secure PSK responder。
-snow = "0.9.6"
+snow = "0.10.0"

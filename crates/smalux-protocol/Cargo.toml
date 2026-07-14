@@ -2,25 +2,46 @@
 name = "smalux-protocol"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
-# 协议编解码边界的通用错误封装。
-anyhow = { version = "1.0.100", features = ["default"] }
-# 二进制字段的文本表示，用于 JSON 和兼容协议。
-base64 = "0.22.1"
-# HKDF 密钥派生，用于从 token 或 PSK 派生 secure key。
-hkdf = "0.12.4"
-# SHA-256 摘要算法，配合 HKDF 完成密钥派生。
-sha2 = "0.10.9"
-# Noise Protocol 实现，负责 secure PSK 握手与传输加密。
-snow = "0.9.6"
-# 协议 frame 和配置模型的序列化能力。
-serde = { version = "1.0.228", features = ["derive"] }
-# 自有协议 JSON frame 的编解码。
-serde_json = "1.0.145"
+# 高效字节缓冲区，用于原始帧和流式分帧编解码。
+bytes = "1.12.1"
+# Protocol Buffers 消息编解码实现。
+prost = "0.14.4"
+# Protocol Buffers 标准类型，提供 google.protobuf.Any。
+prost-types = "0.14.4"
+# Noise Protocol Framework 实现，提供 XX/IK 握手和 TransportState。
+snow = "0.10.0"
 # 定义稳定、可匹配的协议错误类型。
 thiserror = { version = "2.0.18", features = ["default"] }
-# 协议配置中人类可读时长字段的 serde 支持。
-humantime-serde = "1.1.1"
-# 复用公共类型、错误辅助和基础工具。
-smalux-core = { path = "../smalux-core" }
+# 主动清理 Provider 持有的静态私钥和临时明文缓冲区。
+zeroize = "1.8.2"
+
+[build-dependencies]
+# 根据 .proto 事实来源生成 Rust 消息模型。
+prost-build = "0.14.4"
+# 内置各平台 protoc，避免构建机器额外安装系统工具。
+protoc-bin-vendored = "3.2.0"
+# 仅为 gRPC example 生成 Tonic Client/Server 代码。
+tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+# 异步 Stream/Sink 扩展，用于 WSS 和 gRPC 示例。
+futures-util = "0.3.32"
+# 为本地 WSS 示例动态生成仅信任 localhost 的临时证书。
+rcgen = "0.14.8"
+# WSS 示例的 TLS 配置和临时证书信任根。
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+# 两个异步网络示例的运行时。
+tokio = { version = "1.52.3", features = ["full"] }
+# 将 Tokio TCP 流包装为 Rustls TLS 流。
+tokio-rustls = "0.26.4"
+# 为 Tonic Server 提供 TcpListenerStream，为双向 RPC 提供 ReceiverStream。
+tokio-stream = { version = "0.1.18", features = ["net"] }
+# WSS Client/Server 实现，启用 Rustls Connector。
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+# gRPC 双向流 Client/Server 运行时。
+tonic = { version = "0.14.6", features = ["transport"] }
+# Tonic 0.14 的 Prost 消息 Codec。
+tonic-prost = "0.14.6"

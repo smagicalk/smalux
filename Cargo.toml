@@ -4,5 +4,6 @@ members = [
     "crates/smalux-server",
     "crates/smalux-core",
     "crates/smalux-protocol",
+    "crates/smalux-plus/smalux-plus-rustic",
 ]
 resolver = "3"

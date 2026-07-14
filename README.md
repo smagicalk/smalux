@@ -56,12 +56,20 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 - **smalux-core**  
   Shared core library containing common types, configuration models, error definitions, and utilities.
 
-- **smalux-proto (optional)**  
-  Contains gRPC and protobuf definitions used for high-performance or cross-language communication.  
-  This crate is optional and only required when gRPC-based communication is enabled.
+- **smalux-protocol**
+  Defines the transport-neutral Protobuf frame model, negotiation state machine, codecs, and
+  built-in Noise XX/IK security layer used by both Agent and Server.
+
+- **smalux-plus**
+  Contains optional feature crates, such as the reserved Restic backup integration, so optional
+  capabilities do not increase the coupling of the Agent core.
 
 - **assets**  
   Static assets such as project icons, diagrams, and documentation resources.
+
+当前实现中，Agent 的本机采集位于 `collect/`，Job 公共模型、配置、任务适配器和
+Scheduler Actor 位于 `job/`；协议的 Provider、Session 与 record 容器位于
+`smalux-protocol/src/security/noise/`。模块入口只负责组织和导出，具体实现按职责存放。
 
 ---
 
