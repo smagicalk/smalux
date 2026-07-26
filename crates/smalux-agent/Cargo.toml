@@ -8,6 +8,8 @@ edition = "2024"
 tokio = { version = "1.52.3", features = ["full"] }
 # Tokio 官方扩展，提供 DelayQueue 与 CancellationToken。
 tokio-util = { version = "0.7.18", features = ["time", "rt"] }
+# Future 与 Stream 扩展，用于调度器异常捕获、定时队列和并发探测。
+futures-util = "0.3.32"
 # 异步 trait 支持，用于可类型擦除的调度 Task。
 async-trait = "0.1.89"
 # UTC 时间和 Cron 计划时间计算。
@@ -16,22 +18,12 @@ chrono = { version = "0.4.42", features = ["serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 # Cron 表达式解析与下一次运行时间计算。
 croner = "3.0.1"
-# Future、Stream 和 Sink 扩展工具，用于组合异步消息流。
-futures-util = { version = "0.3.32", features = ["default", "tokio-io"] }
-# Tokio WebSocket 客户端，用于连接 Smalux 或兼容服务端。
-tokio-tungstenite = { version = "0.29.0", features = ["default", "tokio-rustls", "rustls", "rustls-tls-webpki-roots"] }
-# TLS 协议实现，为 WebSocket 和其他网络传输提供加密连接。
-rustls = { version = "0.23.41", default-features = true }
 # URL 查询参数编解码，用于构造 token 等连接参数。
 form_urlencoded = "1.2.2"
 # Base64 编解码，用于二进制日志预览、终端数据和兼容协议。
 base64 = "0.22.1"
 # 跨平台 PTY 实现，用于远程交互式 shell。
 portable-pty = "0.9.0"
-# Noise Protocol 实现，用于自有协议的 secure PSK 握手和数据加密。
-snow = "0.10.0"
-# 高效字节缓冲区，用于 WebSocket、wire frame 和流式数据。
-bytes = { version = "1.12.1", features = ["default"] }
 # 命令行参数解析，用于 Agent 启动配置。
 clap = { version = "4.6.1", features = ["derive"] }
 # 人类可读时长解析，例如 5s、10m。
@@ -40,10 +32,8 @@ humantime = "2.4.0"
 humantime-serde = "1.1.1"
 # 序列化基础能力，用于配置、采集数据和协议模型。
 serde = { version = "1.0.228", features = ["derive"] }
-# JSON 编解码，用于上报、控制消息和兼容协议。
+# JSON 解析仅用于读取部分第三方公网 IP 服务的响应。
 serde_json = "1.0.150"
-# JSONPath 查询，用于结构化数据筛选和兼容格式处理。
-serde_json_path = { version = "0.7.2", features = ["default"] }
 # 结构化日志 API，记录 Agent 运行状态和诊断信息。
 tracing = { version = "0.1.44", features = ["log", "std"] }
 # tracing 日志订阅器，提供 RUST_LOG、JSON 和本地时间格式支持。
@@ -57,17 +47,13 @@ sysinfo = { version = "0.39.6", features = ["default", "multithread"] }
 # 跨平台 socket 统计，用于连接数量和详细连接信息采集。
 netstat2 = "0.11.2"
 # HTTP 客户端，用于公网 IP、HTTP 上报、探测和兼容端点。
-reqwest = { version = "0.13.4", features = ["multipart", "hickory-dns", "json"] }
+reqwest = { version = "0.13.4", features = ["multipart", "hickory-dns"] }
 # UUID 生成，用于 Agent 标识、任务和会话 ID。
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
-# gRPC 客户端与服务基础能力，为后续 gRPC 传输预留。
-tonic = { version = "0.14.6", features = ["default"] }
-# Protocol Buffers 消息编解码，与 tonic 配合使用。
-prost = { version = "0.14.4", features = ["default"] }
 # 项目公共基础库，复用日志、工具和跨 crate 类型。
 smalux-core = { path = "../smalux-core" }
-# 项目自有协议库，复用 frame、codec 和 secure 能力。
-smalux-protocol = { path = "../smalux-protocol" }
+# Tokio 原生异步 ICMPv4/ICMPv6，实现多节点 Ping 且支持 Linux 非特权 DGRAM socket。
+surge-ping = "0.9.0"
 
 [dev-dependencies]
 # 测试进程初始化钩子，用于测试环境的全局准备工作。

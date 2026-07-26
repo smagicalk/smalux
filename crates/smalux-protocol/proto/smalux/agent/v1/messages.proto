@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+// 所有消息均属于同一个版本化 package，并由 transport.proto 的 SecureMessage 引用。
+package smalux.agent.v1;
+
+// 首次 XXpsk3 注册成功建立密文通道后的 Token 请求/响应封装。
+message TokenMessage {
+  // 请求和响应互斥，空 body 属于无效消息。
+  oneof body {
+    // Agent 发给 Server 的一次性 Token 注册请求。
+    TokenRequest request = 1;
+
+    // Server 完成注册持久化后返回的成功结果。
+    TokenResponse response = 2;
+  }
+}
+
+// Agent 在已加密 XXpsk3 会话中提交的注册资料。
+message TokenRequest {
+  // 一次性注册 Token；只能位于 Noise 密文中，Server 验证成功后应将其消费。
+  string token = 1;
+
+  // Agent 期望使用的可读名称；Server 仍需执行长度、字符和唯一性校验。
+  string agent_name = 2;
+}
+
+// Server 已成功保存 Agent 公钥和业务身份后的注册响应。
+message TokenResponse {
+  // Server 分配的稳定业务 ID，Agent 应与双方 Noise 公钥一同持久化。
+  string agent_id = 1;
+}
+
+// 已授权会话中通用业务请求和响应的封装。
+message Messages {
+  // 请求和响应互斥，具体 payload 再由内层 oneof 决定。
+  oneof body {
+    // Agent 发起的业务消息。
+    MessagesRequest request = 1;
+
+    // Server 对某个 sequence 的确认或结果。
+    MessagesResponse response = 2;
+  }
+}
+
+// 一条带序列号的通用业务请求。
+message MessagesRequest {
+  // 由业务层分配的请求序号，用于幂等、关联响应或断线恢复；它不是 Noise nonce。
+  uint64 sequence = 1;
+
+  // 当前示例支持原始字节、字符串和强类型 Echo；同一请求只能选择一种。
+  oneof payload {
+    // 不需要 Protobuf 子结构的任意二进制业务数据。
+    bytes bytes_payload = 2;
+
+    // UTF-8 文本业务数据。
+    string string_payload = 3;
+
+    // 演示强类型扩展方式的 Echo 请求。
+    EchoRequest echo_request = 4;
+  }
+}
+
+// Server 对一条 MessagesRequest 的业务响应。
+message MessagesResponse {
+  // 对应请求的 sequence；Client 应校验它是否匹配待确认请求。
+  uint64 acknowledged_sequence = 1;
+
+  // 响应 payload 类型通常应与请求类型对应。
+  oneof payload {
+    // 二进制响应内容。
+    bytes bytes_payload = 2;
+
+    // UTF-8 文本响应内容。
+    string string_payload = 3;
+
+    // 强类型 Echo 响应。
+    EchoResponse echo_response = 4;
+  }
+}
+
+// 示例 Echo 请求；实际业务可按相同方式新增独立消息类型。
+message EchoRequest {
+  // Server 原样返回的示例文本。
+  string payload = 1;
+}
+
+// 示例 Echo 响应。
+message EchoResponse {
+  // 从对应 EchoRequest 复制的文本。
+  string payload = 1;
+}
+
+// 当前连接的心跳和对称 cipher rekey 控制消息。
+// 这些消息只改变当前 SecureSession，不轮换长期静态身份。
+message SessionControl {
+  // 每条控制消息只能表示一个动作。
+  oneof body {
+    // 一端发起的存活探测。
+    Ping ping = 1;
+
+    // 对 Ping 的关联响应。
+    Pong pong = 2;
+
+    // Responder 通知 initiator 应发起 rekey，本消息本身不切换 key。
+    RekeyRequired rekey_required = 3;
+
+    // Initiator 请求双方切换到指定 generation。
+    RekeyRequest rekey_request = 4;
+
+    // Responder 使用旧 outgoing key 加密的 rekey 确认。
+    RekeyAck rekey_ack = 5;
+  }
+}
+
+// 加密心跳请求。
+message Ping {
+  // 由发送方生成的关联值；不是 AEAD nonce，也不参与密码学计算。
+  uint64 nonce = 1;
+}
+
+// 加密心跳响应。
+message Pong {
+  // 必须原样复制对应 Ping.nonce，便于发送方关联响应。
+  uint64 nonce = 1;
+}
+
+// Responder 请求 initiator 开始同步 rekey。
+message RekeyRequired {
+  // Responder 期望的下一代，通常等于当前 generation + 1。
+  uint64 next_generation = 1;
+}
+
+// Initiator 发起的同步 rekey 请求。
+message RekeyRequest {
+  // 双方准备提交的目标 generation；跳代或重复值必须被拒绝。
+  uint64 generation = 1;
+}
+
+// Responder 对同步 rekey 的确认。
+message RekeyAck {
+  // 必须与 RekeyRequest.generation 完全一致。
+  uint64 generation = 1;
+}
+
+// 长期 Noise 静态身份轮换的消息封装。
+// 与 SessionControl rekey 不同，此流程需要调用方持久化 snapshot，并影响后续 IK 连接。
+message KeyRotationMessage {
+  // Agent 换钥和 Server 换钥共享封装，但各自拥有独立的请求/确认类型。
+  oneof body {
+    // Agent 公告新静态公钥，请求 Server 加入 pending 授权。
+    AgentKeyRotationRequest agent_request = 1;
+
+    // Server 确认已经保存并授权 Agent pending 公钥。
+    AgentKeyRotationAccepted agent_accepted = 2;
+
+    // Server 公告下一把静态公钥，供 Agent 加入 pending 信任。
+    ServerKeyAnnouncement server_announcement = 3;
+
+    // Agent 确认已经验证并保存 Server pending 公钥。
+    ServerKeyAcknowledgement server_acknowledgement = 4;
+  }
+}
+
+// Agent 长期静态公钥轮换请求；私钥绝不能进入本消息。
+message AgentKeyRotationRequest {
+  // 16 字节随机事务 ID，用于匹配接受、取消和 promote 操作。
+  bytes rotation_id = 1;
+
+  // 新 Agent X25519 静态公钥，固定为 32 字节。
+  bytes new_public_key = 2;
+
+  // new_public_key 的 32 字节 BLAKE2s-256 指纹；接收方必须重新计算并比对。
+  bytes new_key_id = 3;
+}
+
+// Server 已持久化 Agent pending 公钥的确认。
+message AgentKeyRotationAccepted {
+  // 必须匹配对应 AgentKeyRotationRequest.rotation_id。
+  bytes rotation_id = 1;
+}
+
+// Server 长期静态公钥轮换公告；私钥始终只保存在 Server keyring。
+message ServerKeyAnnouncement {
+  // 16 字节随机事务 ID，用于匹配确认和 promote 操作。
+  bytes rotation_id = 1;
+
+  // 新 Server X25519 静态公钥，固定为 32 字节。
+  bytes new_public_key = 2;
+
+  // new_public_key 的 32 字节 BLAKE2s-256 指纹；Agent 必须重新计算并比对。
+  bytes new_key_id = 3;
+}
+
+// Agent 已验证并持久化 Server pending 公钥的确认。
+message ServerKeyAcknowledgement {
+  // 必须匹配对应 ServerKeyAnnouncement.rotation_id。
+  bytes rotation_id = 1;
+
+  // Agent 实际保存的新 Server key ID，Server 应与公告内容再次核对。
+  bytes key_id = 2;
+}

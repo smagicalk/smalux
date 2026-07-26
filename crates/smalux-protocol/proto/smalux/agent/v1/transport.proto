@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+// Smalux Agent 与 Server 交互协议的第 1 个稳定版本。
+// package 会参与生成的 gRPC 完整方法路径，发布后不可随意修改。
+package smalux.agent.v1;
+
+import "smalux/agent/v1/errors.proto";
+import "smalux/agent/v1/messages.proto";
+
+// Agent 与 Server 的版本化 gRPC 入口。
+//
+// HealthCheck 是普通 unary RPC；OpenSession 是承载 Noise 的长期双向流。
+// 两者可由 Axum/Tonic 在同一个 HTTP/2 端口提供，也可以位于反向代理统一前缀下。
+service AgentTransport {
+  // 检查 gRPC 服务是否可达，不执行 Agent 身份认证，也不建立 Noise 会话。
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+
+  // 打开一条长期双向流，在流内依次完成 Noise 握手和加密业务消息收发。
+  // 每次 RPC 都必须使用独立的握手状态、cipher key 和 nonce 序列。
+  rpc OpenSession(stream ProtocolFrame) returns (stream ProtocolFrame);
+}
+
+// HealthCheck 当前不需要请求参数；保留消息类型便于以后兼容增加字段。
+message HealthRequest {}
+
+// 普通健康检查响应，不包含任何 Agent 授权或 Noise 会话状态。
+message HealthResponse {
+  // 供人阅读的简短状态，例如 "ok"。
+  string message = 1;
+
+  // 机器可读状态码；示例实现使用 0 表示服务可达。
+  uint32 code = 2;
+}
+
+// gRPC 流上的明文外层帧。
+//
+// 业务消息绝不能直接新增为 body 分支，必须先编码 SecureMessage，再经 Noise transport
+// mode 加密为 ciphertext。反向代理可以看到帧类型和长度，但看不到 ciphertext 内的内容。
+message ProtocolFrame {
+  // 每个流元素只能处于握手、密文或握手外层错误三种状态之一。
+  oneof body {
+    // Noise 尚未建立时的握手数据；握手完成后再收到该分支属于协议错误。
+    NoiseHandshake handshake = 1;
+
+    // Noise transport mode 输出的完整密文，包含 AEAD 认证标签。
+    bytes ciphertext = 2;
+
+    // Noise 尚未建立时可以返回的通用错误；不得包含任何敏感细节。
+    ProtocolError protocol_error = 3;
+  }
+}
+
+// 一步 Noise 握手消息及其模式、目标 Server key ID。
+message NoiseHandshake {
+  // 当前 OpenSession 使用的 Noise handshake pattern。
+  enum HandshakeType {
+    // 缺失或未知模式；接收方必须拒绝，不能猜测默认握手方式。
+    HANDSHAKE_TYPE_UNSPECIFIED = 0;
+
+    // 首次注册使用 XXpsk3；Client 只需持有注册 PSK，不预置 Server 静态公钥。
+    HANDSHAKE_TYPE_XX_PSK3 = 1;
+
+    // 已注册连接使用 IK；双方使用已经固定的长期静态公钥互相认证。
+    HANDSHAKE_TYPE_IK = 2;
+  }
+
+  // 所属握手模式；同一次流的所有握手帧必须保持一致。
+  HandshakeType type = 1;
+
+  // 32 字节 Server 公钥 BLAKE2s-256 指纹。
+  // IK 首帧必须携带，Server 换钥期间用于选择 current/next/previous responder 私钥。
+  bytes responder_key_id = 2;
+
+  // snow 产生的原始 Noise handshake message；不得由业务层解析或修改。
+  bytes payload = 3;
+}
+
+// Noise 建立后的内部消息总封装。
+//
+// 该消息先经 Prost 编码，再由 Noise transport mode 加密，最终只能出现在
+// ProtocolFrame.ciphertext 内，不能直接作为 gRPC 请求或响应发送。
+message SecureMessage {
+  // 每条密文只承载一种业务或控制消息。
+  oneof body {
+    // 首次注册阶段的 Token 请求或成功响应。
+    TokenMessage token_message = 1;
+
+    // 已授权会话中的通用请求和响应消息。
+    Messages messages = 2;
+
+    // Noise 已建立后返回的加密业务错误。
+    SecureError error = 3;
+
+    // 心跳和当前连接对称密钥 rekey 控制消息。
+    SessionControl session_control = 4;
+
+    // Agent 或 Server 长期静态身份密钥轮换消息。
+    KeyRotationMessage key_rotation = 5;
+  }
+}

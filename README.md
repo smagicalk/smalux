@@ -56,9 +56,9 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 - **smalux-core**  
   Shared core library containing common types, configuration models, error definitions, and utilities.
 
-- **smalux-protocol**
-  Defines the transport-neutral Protobuf frame model, negotiation state machine, codecs, and
-  built-in Noise XX/IK security layer used by both Agent and Server.
+- **[smalux-protocol](crates/smalux-protocol/README.md)**
+  Owns the versioned gRPC schema and generated Tonic types shared by Agent and Server.
+  Concrete reporting, Job, authentication, and streaming RPCs are still being designed.
 
 - **smalux-plus**
   Contains optional feature crates, such as the reserved Restic backup integration, so optional
@@ -67,9 +67,11 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 - **assets**  
   Static assets such as project icons, diagrams, and documentation resources.
 
-当前实现中，Agent 的本机采集位于 `collect/`，Job 公共模型、配置、任务适配器和
-Scheduler Actor 位于 `job/`；协议的 Provider、Session 与 record 容器位于
-`smalux-protocol/src/security/noise/`。模块入口只负责组织和导出，具体实现按职责存放。
+当前实现中，Agent 的底层系统采集器与 Snapshot 位于 `tasks/collect/collectors/`，具体
+采集 `ValueTask` 位于 `tasks/collect/`，触发、队列、并发、重试和生命周期位于
+`scheduler/`。原有 JSON Job 解析层已经移除，后续 Job 配置与控制消息统一使用
+`smalux-protocol` 中 Agent 与 Server 共用的版本化 Proto 定义和生成类型。模块入口只
+负责组织和导出，具体实现按职责存放。
 
 ---
 
@@ -89,9 +91,9 @@ Smalux consists of a small set of focused components, each responsible for a wel
 - **Web Interface**  
   Provides visualization, system overview, and operational access.
 
-- **gRPC Module (Optional)**  
-  Provides a high-performance, strongly-typed communication layer for data ingestion and internal service interaction.  
-  This module is optional and can be enabled when higher throughput, stricter schemas, or cross-language integration is required.
+- **gRPC Transport**
+  Provides a built-in, strongly-typed bidirectional transport definition for Agent and Server communication.
+  HTTP routing, listener setup, authorization, and connection lifecycle remain the responsibility of the calling application.
 
 Smalux 由一组职责明确的核心组件构成：
 
@@ -107,9 +109,9 @@ Smalux 由一组职责明确的核心组件构成：
 - **Web 界面**  
   用于系统状态可视化与运维操作。
 
-- **gRPC 模块（可选）**  
-  提供高性能、强类型的通信能力，用于数据上报或内部服务交互。  
-  当系统需要更高吞吐、更严格数据结构约束或跨语言集成时，可启用该模块。
+- **gRPC Transport**
+  提供 Agent 与 Server 通信所需的内置强类型双向流定义。
+  HTTP 路由、监听地址、授权以及连接生命周期仍由调用应用负责。
 
 ---
 
@@ -124,6 +126,10 @@ Smalux 强调持续且低干扰的观测方式。
 数据采集遵循“可操作、可理解、长期稳定”的原则。
 
 采集内容、采集频率以及数据传输方式都被视为明确的设计选择，而非默认行为。
+
+当前采集 Task 默认返回全部磁盘、网卡和本地地址，也可按磁盘名称、挂载点或接口
+完整名称配置 include/exclude；include 非空时优先于 exclude。公网 IP Task 可选择
+同时查询 IPv4/IPv6，或只查询其中一个地址族。
 
 ---
 
@@ -167,7 +173,7 @@ The Smalux web interface is built with **React** and **TypeScript**, focusing on
 
 HTTP-based interfaces are used as the primary integration surface, prioritizing debuggability and operational transparency.
 
-An optional gRPC-based communication module can be enabled for higher throughput, stricter schema guarantees, or efficient internal service communication.
+The Protocol crate is being reduced to a shared, versioned gRPC schema. Concrete RPC contracts will be added only after their reporting, Job, authentication, and streaming boundaries are defined.
 
 ---
 
@@ -191,7 +197,7 @@ New capabilities can be introduced incrementally while preserving the core princ
 
 Smalux is developed iteratively, with an emphasis on correctness, operational experience, and real-world feedback.
 
-Future work includes improvements to observability quality, operational ergonomics, and optional high-performance communication paths such as gRPC.
+Future work includes improvements to observability quality, operational ergonomics, and versioned gRPC interactions between Agent and Server.
 
 ---
 
