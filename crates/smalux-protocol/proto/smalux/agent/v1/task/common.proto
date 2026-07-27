@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+import "smalux/agent/v1/task/cpu.proto";
+import "smalux/agent/v1/task/host.proto";
+import "smalux/agent/v1/task/io.proto";
+import "smalux/agent/v1/task/ip.proto";
+import "smalux/agent/v1/task/load.proto";
+import "smalux/agent/v1/task/memory.proto";
+import "smalux/agent/v1/task/process.proto";
+import "smalux/agent/v1/task/probe.proto";
+import "smalux/agent/v1/task/socket.proto";
+import "smalux/agent/v1/task/system.proto";
+
+// 固定 Task 类型及其完整配置。
+message TaskDefinition {
+  // 固定任务类型；必须设置一个分支，Agent 不接受任意代码或脚本。
+  oneof task {
+    // 一次采集主机、CPU、内存、负载、磁盘、网卡、IP、Socket 和进程摘要。
+    SystemTaskConfig system = 10;
+    // 采集 CPU 拓扑、频率与使用率。
+    CpuTaskConfig cpu = 11;
+    // 采集物理内存和交换区使用情况。
+    MemoryTaskConfig memory = 12;
+    // 采集系统 1/5/15 分钟平均负载。
+    LoadTaskConfig load = 13;
+    // 采集主机名、系统、内核、架构与启动时间。
+    HostTaskConfig host = 14;
+    // 采集磁盘容量和读写增量/速率。
+    DiskIoTaskConfig disk_io = 15;
+    // 采集网卡流量、数据包与错误计数。
+    NetworkIoTaskConfig network_io = 16;
+    // 枚举本机网卡地址。
+    LocalIpTaskConfig local_ip = 17;
+    // 通过外部解析服务探测公网 IPv4/IPv6。
+    PublicIpTaskConfig public_ip = 18;
+    // 按消耗模式采集进程统计或明细。
+    ProcessTaskConfig process = 19;
+    // 按消耗模式采集 TCP/UDP Socket 统计或明细。
+    SocketTaskConfig socket = 20;
+    // 对多个节点执行 ICMP、TCP Connect 或 HTTP 探测。
+    ProbeTaskConfig probe = 21;
+  }
+}
+
+// 一次 Task 执行生成的强类型结果。
+message TaskResult {
+  // 本次采样的公共时间信息。
+  SampleMetadata sample = 1;
+
+  oneof result {
+    // 与 SystemTaskConfig 对应的组合快照。
+    SystemSnapshot system = 10;
+    // 与 CpuTaskConfig 对应的 CPU 快照。
+    CpuSnapshot cpu = 11;
+    // 与 MemoryTaskConfig 对应的内存快照。
+    MemorySnapshot memory = 12;
+    // 与 LoadTaskConfig 对应的负载快照。
+    LoadSnapshot load = 13;
+    // 与 HostTaskConfig 对应的主机静态信息。
+    HostSnapshot host = 14;
+    // 与 DiskIoTaskConfig 对应的磁盘快照。
+    DiskIoSnapshot disk_io = 15;
+    // 与 NetworkIoTaskConfig 对应的网卡快照。
+    NetworkIoSnapshot network_io = 16;
+    // 与 LocalIpTaskConfig 对应的本地地址快照。
+    IpSnapshot local_ip = 17;
+    // 与 PublicIpTaskConfig 对应的公网地址快照。
+    PublicIpSnapshot public_ip = 18;
+    // 与 ProcessTaskConfig 对应的进程快照。
+    ProcessSnapshot process = 19;
+    // 与 SocketTaskConfig 对应的连接快照。
+    SocketSnapshot socket = 20;
+    // 与 ProbeTaskConfig 对应的探测快照。
+    ProbeSnapshot probe = 21;
+  }
+}
+
+// ReportingTask 成功后交给连接层的完整上报消息。
+message TaskReport {
+  // 产生结果的 Job UUID，固定 16 字节。
+  bytes job_id = 1;
+  // Server 的 JobDefinition revision，不是 Scheduler 内部 generation。
+  uint64 job_revision = 2;
+  // 单次逻辑执行 UUID；重试的不同 attempt 共用同一个 run_id。
+  bytes run_id = 3;
+  // 本逻辑执行的尝试序号，从 1 开始。
+  uint32 attempt = 4;
+  // Trigger 原计划时间，可用于计算调度延迟。
+  google.protobuf.Timestamp scheduled_at = 5;
+  // Scheduler 实际启动 Task 的时间。
+  google.protobuf.Timestamp started_at = 6;
+  // Task 成功返回的强类型业务结果。
+  TaskResult result = 7;
+}
+
+// 所有采集结果共用的采样时间元数据。
+message SampleMetadata {
+  // 本次采样开始时的 Unix 毫秒时间戳。
+  uint64 sampled_at_ms = 1;
+
+  // 与同一 Task 上次采样开始时间的间隔；首次采样缺失。
+  optional uint64 sample_interval_ms = 2;
+}

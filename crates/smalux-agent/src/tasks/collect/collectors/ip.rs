@@ -1,80 +1,24 @@
 //! IP 快照模型与本地网卡地址采集。
 
-use serde::Serialize;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use sysinfo::Networks;
+
+pub use smalux_protocol::agent::v1::{
+    InterfaceAddress, IpScope, IpSnapshot, PublicIpSnapshot, PublicIpState, PublicIpStatus,
+};
 
 mod public;
 
 pub(crate) use public::collect_public_families;
 pub use public::{collect_public, fetch_public_ips};
 
-/// IP 地址作用域。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IpScope {
-    /// 本机回环地址。
-    Loopback,
-    /// IPv4 私网或 IPv6 Unique Local 地址。
-    Private,
-    /// 仅当前链路有效的地址。
-    LinkLocal,
-    /// 可作为公网或全局单播地址使用。
-    Global,
-    /// 未指定、组播、文档地址等其他作用域。
-    Other,
-}
-
-/// 单个网卡地址。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct InterfaceAddress {
-    /// 网卡接口名称。
-    pub interface: String,
-    /// IPv4 或 IPv6 地址。
-    pub address: IpAddr,
-    /// CIDR 前缀长度。
-    pub prefix_length: u8,
-    /// 根据地址规则分类的作用域。
-    pub scope: IpScope,
-}
-
-/// 公网 IP 查询状态。
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum PublicIpState {
-    /// 本次采集没有请求该地址族。
-    NotRequested,
-    /// 已取得并校验合法公网地址。
-    Resolved {
-        /// 端点返回的公网 IP 地址。
-        address: IpAddr,
-    },
-    /// 所有内置端点均失败。
-    Failed {
-        /// 汇总后的失败原因，不包含认证信息。
-        message: String,
-    },
-}
-
-/// 公网 IPv4 与 IPv6 查询结果。
-#[derive(Debug, Clone, Serialize)]
-pub struct PublicIpSnapshot {
-    /// 公网 IPv4 查询状态。
-    pub ipv4: PublicIpState,
-    /// 公网 IPv6 查询状态。
-    pub ipv6: PublicIpState,
-}
-
-/// IP 信息快照。
-#[derive(Debug, Clone, Serialize)]
-pub struct IpSnapshot {
-    /// 本机全部去重网卡地址。
-    pub local: Vec<InterfaceAddress>,
-    /// 公网 IPv4 状态。
-    pub public_ipv4: PublicIpState,
-    /// 公网 IPv6 状态。
-    pub public_ipv6: PublicIpState,
+pub(crate) fn public_ip_not_requested() -> PublicIpState {
+    PublicIpState {
+        status: PublicIpStatus::NotRequested as i32,
+        address: None,
+        message: None,
+    }
 }
 
 /// 本地接口地址发现状态，与网络流量增量统计相互独立。
@@ -117,9 +61,9 @@ pub(super) fn collect(networks: &Networks) -> IpSnapshot {
             if seen.insert(key.clone()) {
                 local.push(InterfaceAddress {
                     interface: key.0,
-                    address: key.1,
-                    prefix_length: key.2,
-                    scope: scope(key.1),
+                    address: key.1.to_string(),
+                    prefix_length: key.2.into(),
+                    scope: scope(key.1) as i32,
                 });
             }
         }
@@ -128,13 +72,13 @@ pub(super) fn collect(networks: &Networks) -> IpSnapshot {
     local.sort_by(|left, right| {
         left.interface
             .cmp(&right.interface)
-            .then_with(|| left.address.to_string().cmp(&right.address.to_string()))
+            .then_with(|| left.address.cmp(&right.address))
     });
 
     IpSnapshot {
         local,
-        public_ipv4: PublicIpState::NotRequested,
-        public_ipv6: PublicIpState::NotRequested,
+        public_ipv4: Some(public_ip_not_requested()),
+        public_ipv6: Some(public_ip_not_requested()),
     }
 }
 
@@ -186,8 +130,14 @@ mod tests {
 
         let snapshot = collector.collect();
 
-        assert!(matches!(snapshot.public_ipv4, PublicIpState::NotRequested));
-        assert!(matches!(snapshot.public_ipv6, PublicIpState::NotRequested));
+        assert_eq!(
+            snapshot.public_ipv4.expect("IPv4 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
+        assert_eq!(
+            snapshot.public_ipv6.expect("IPv6 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
     }
 
     #[test]

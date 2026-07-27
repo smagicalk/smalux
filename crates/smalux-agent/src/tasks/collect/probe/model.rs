@@ -7,6 +7,7 @@ use std::{
 };
 
 use serde::Serialize;
+use smalux_protocol::agent::v1::{ProbeTaskConfig as ProtoProbeTaskConfig, probe_node_config};
 
 /// 单个 Task 允许配置的最大探测节点数。
 pub const MAX_PROBE_NODES: usize = 256;
@@ -177,6 +178,29 @@ impl ProbeTaskConfig {
 /// Probe Task 配置不满足安全边界时返回的错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeConfigError {
+    /// 并发数必须显式设置为正整数。
+    #[error("probe concurrency must be greater than zero")]
+    InvalidConcurrency,
+    /// 节点尝试次数必须显式设置为正整数且不超过 u16。
+    #[error("probe node '{name}' attempts must be within 1..={maximum}")]
+    InvalidAttempts {
+        /// 配置错误的节点名称。
+        name: String,
+        /// 允许的最大尝试次数。
+        maximum: u16,
+    },
+    /// 节点没有配置 ICMP、TCP 或 HTTP target。
+    #[error("probe node '{name}' target is required")]
+    MissingTarget {
+        /// 配置错误的节点名称。
+        name: String,
+    },
+    /// TCP 端口不是 1 到 65535。
+    #[error("probe node '{name}' TCP port must be within 1..=65535")]
+    InvalidTcpPort {
+        /// 配置错误的节点名称。
+        name: String,
+    },
     /// 未配置任何探测节点。
     #[error("at least one probe node is required")]
     EmptyNodes,
@@ -250,6 +274,90 @@ pub enum ProbeConfigError {
         /// 允许的最大间隔。
         maximum: Duration,
     },
+}
+
+/// 将可反序列化的 Proto 配置编译成执行器使用的强类型配置。
+pub(super) fn compile_config(
+    config: &ProtoProbeTaskConfig,
+) -> Result<ProbeTaskConfig, ProbeConfigError> {
+    let concurrency = NonZeroUsize::new(config.concurrency as usize)
+        .ok_or(ProbeConfigError::InvalidConcurrency)?;
+    let nodes = config
+        .nodes
+        .iter()
+        .map(|node| {
+            let attempts = u16::try_from(node.attempts)
+                .ok()
+                .and_then(NonZeroU16::new)
+                .ok_or_else(|| ProbeConfigError::InvalidAttempts {
+                    name: node.name.clone(),
+                    maximum: MAX_PROBE_ATTEMPTS,
+                })?;
+            let timeout = proto_duration(node.timeout.as_ref()).ok_or_else(|| {
+                ProbeConfigError::InvalidTimeout {
+                    name: node.name.clone(),
+                    maximum: MAX_PROBE_TIMEOUT,
+                }
+            })?;
+            let interval = match node.interval.as_ref() {
+                Some(value) => proto_duration(Some(value)).ok_or_else(|| {
+                    ProbeConfigError::IntervalTooHigh {
+                        name: node.name.clone(),
+                        maximum: MAX_PROBE_INTERVAL,
+                    }
+                })?,
+                None => Duration::ZERO,
+            };
+            let target = match node.target.as_ref() {
+                Some(probe_node_config::Target::IcmpEcho(_)) => ProbeTarget::IcmpEcho,
+                Some(probe_node_config::Target::TcpConnect(target)) => {
+                    let port = u16::try_from(target.port)
+                        .ok()
+                        .and_then(NonZeroU16::new)
+                        .ok_or_else(|| ProbeConfigError::InvalidTcpPort {
+                            name: node.name.clone(),
+                        })?;
+                    ProbeTarget::TcpConnect { port }
+                }
+                Some(probe_node_config::Target::Http(target)) => ProbeTarget::Http {
+                    url: reqwest::Url::parse(&target.url).map_err(|_| {
+                        ProbeConfigError::InvalidHttpUrl {
+                            name: node.name.clone(),
+                        }
+                    })?,
+                    expected_status: HttpStatusRange {
+                        min: u16::try_from(target.expected_status_min).unwrap_or(u16::MAX),
+                        max: u16::try_from(target.expected_status_max).unwrap_or(u16::MAX),
+                    },
+                    follow_redirects: target.follow_redirects,
+                },
+                None => {
+                    return Err(ProbeConfigError::MissingTarget {
+                        name: node.name.clone(),
+                    });
+                }
+            };
+            Ok(ProbeNodeConfig {
+                name: node.name.clone(),
+                host: node.host.clone(),
+                target,
+                attempts,
+                timeout,
+                interval,
+            })
+        })
+        .collect::<Result<Vec<_>, ProbeConfigError>>()?;
+    let compiled = ProbeTaskConfig { concurrency, nodes };
+    compiled.validate()?;
+    Ok(compiled)
+}
+
+fn proto_duration(value: Option<&prost_types::Duration>) -> Option<Duration> {
+    let value = value?;
+    if value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos) {
+        return None;
+    }
+    Some(Duration::new(value.seconds as u64, value.nanos as u32))
 }
 
 /// 一次 ICMP Echo、TCP Connect 或 HTTP 尝试的结果。

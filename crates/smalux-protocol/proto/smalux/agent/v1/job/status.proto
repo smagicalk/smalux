@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Scheduler 对外提供的 Job 运行状态，不包含不可序列化的 Task 实例。
+message JobStatus {
+  // Job UUID，固定 16 字节。
+  bytes job_id = 1;
+  // Server 业务配置版本，不是 Scheduler 内部 generation。
+  uint64 revision = 2;
+  // Agent 实际绑定的稳定 Task 类型名称，供诊断展示。
+  string task_kind = 3;
+  // 当前生命周期状态。
+  JobRuntimeState state = 4;
+  // DISABLED 时的停用原因，其他状态为空字符串。
+  string disabled_reason = 5;
+  // 当前允许同时执行的实例数。
+  uint32 concurrency = 6;
+  // 当前允许等待的触发数量。
+  uint32 max_pending = 7;
+  // 此刻正在执行的实例数量。
+  uint32 running_count = 8;
+  // 此刻等待执行的触发数量。
+  uint32 pending_count = 9;
+  // 最近连续失败次数；成功后清零。
+  uint32 consecutive_failures = 10;
+  // 下一次计划运行时间；完成或停用后可能缺失。
+  optional google.protobuf.Timestamp next_run_at = 11;
+  // 最近一次实际开始时间；从未运行时缺失。
+  optional google.protobuf.Timestamp last_started_at = 12;
+  // 最近一次实际结束时间；尚未结束或从未运行时缺失。
+  optional google.protobuf.Timestamp last_finished_at = 13;
+  // 最近一次结果摘要，供诊断阅读。
+  string last_outcome = 14;
+  // Job 首次安装到当前 Scheduler 的时间。
+  google.protobuf.Timestamp created_at = 15;
+  // Job 状态或配置最近一次变化时间。
+  google.protobuf.Timestamp updated_at = 16;
+}
+
+// Scheduler 中 Job 的生命周期状态。
+enum JobRuntimeState {
+  // 未指定，仅作为 Proto 零值。
+  JOB_RUNTIME_STATE_UNSPECIFIED = 0;
+  // 可继续接收正常计划触发。
+  JOB_RUNTIME_STATE_ENABLED = 1;
+  // 单次 Job 已正常结束，不再产生触发。
+  JOB_RUNTIME_STATE_COMPLETED = 2;
+  // 被配置、失败策略或人为操作停用。
+  JOB_RUNTIME_STATE_DISABLED = 3;
+}

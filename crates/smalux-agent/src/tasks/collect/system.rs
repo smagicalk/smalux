@@ -1,28 +1,20 @@
 //! 完整本机指标周期采集任务。
 
 use async_trait::async_trait;
+pub use smalux_protocol::agent::v1::SystemTaskConfig;
+use smalux_protocol::agent::v1::{SampleMetadata, SystemSnapshot, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::{HostMetricsCollector, SystemSnapshot},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::{HostMetricsCollector, SystemSnapshot as CollectedSystemSnapshot},
 };
 
 use super::{
-    DiskIoTaskConfig, LocalIpTaskConfig, MetricSample, NetworkIoTaskConfig,
     blocking::CollectState,
+    process::into_proto_snapshot as into_proto_process_snapshot,
     selection::{filter_disk, filter_local_ip, filter_network},
+    socket::into_proto_snapshot as into_proto_socket_snapshot,
 };
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// System Task 对组合快照中各资源的筛选配置。
-pub struct SystemTaskConfig {
-    /// 磁盘容量与 IO 的筛选配置。
-    pub disk_io: DiskIoTaskConfig,
-    /// 网络流量的网卡筛选配置。
-    pub network_io: NetworkIoTaskConfig,
-    /// 本地地址的网卡筛选配置。
-    pub local_ip: LocalIpTaskConfig,
-}
 
 /// 使用独立组合 collector 生成完整本机快照的调度任务。
 pub struct SystemTask {
@@ -60,23 +52,47 @@ impl Default for SystemTask {
 }
 
 #[async_trait]
-impl ValueTask for SystemTask {
-    type Output = MetricSample<SystemSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
+impl ReportingTask for SystemTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let mut output = self
             .state
             .collect(context, HostMetricsCollector::collect)
             .await?;
         output.sampled_at_ms = output.snapshot.sampled_at_ms;
         output.sample_interval_ms = output.snapshot.sample_interval_ms;
-        filter_disk(&mut output.snapshot.disk_io, &self.config.disk_io.disks);
-        filter_network(
-            &mut output.snapshot.network_io,
-            &self.config.network_io.interfaces,
-        );
-        filter_local_ip(&mut output.snapshot.ip, &self.config.local_ip.interfaces);
-        Ok(output)
+        if let Some(selection) = self
+            .config
+            .disk_io
+            .as_ref()
+            .and_then(|config| config.disks.as_ref())
+        {
+            filter_disk(&mut output.snapshot.disk_io, selection);
+        }
+        if let Some(selection) = self
+            .config
+            .network_io
+            .as_ref()
+            .and_then(|config| config.interfaces.as_ref())
+        {
+            filter_network(&mut output.snapshot.network_io, selection);
+        }
+        if let Some(selection) = self
+            .config
+            .local_ip
+            .as_ref()
+            .and_then(|config| config.interfaces.as_ref())
+        {
+            filter_local_ip(&mut output.snapshot.ip, selection);
+        }
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::System(Box::new(into_proto_snapshot(
+                output.snapshot,
+            )))),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -88,10 +104,24 @@ impl ValueTask for SystemTask {
     }
 }
 
+fn into_proto_snapshot(snapshot: CollectedSystemSnapshot) -> SystemSnapshot {
+    SystemSnapshot {
+        host: Some(snapshot.host),
+        cpu: Some(snapshot.cpu),
+        memory: Some(snapshot.memory),
+        load: Some(snapshot.load),
+        disk_io: Some(snapshot.disk_io),
+        network_io: Some(snapshot.network_io),
+        ip: Some(snapshot.ip),
+        sockets: Some(into_proto_socket_snapshot(snapshot.sockets)),
+        processes: Some(into_proto_process_snapshot(snapshot.processes)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
-        scheduler::ValueTask,
+        scheduler::ReportingTask,
         tasks::collect::{
             CpuTask, DiskIoTaskConfig, DiskSelection, InterfaceSelection, LocalIpTaskConfig,
             NetworkIoTaskConfig, context,
@@ -109,12 +139,17 @@ mod tests {
         let cpu = cpu_task.run(context()).await.unwrap();
 
         assert_eq!(system_task.kind(), SystemTask::KIND);
-        assert_eq!(system.sampled_at_ms, system.snapshot.sampled_at_ms);
-        assert_eq!(
-            system.sample_interval_ms,
-            system.snapshot.sample_interval_ms
-        );
-        assert!(!cpu.snapshot.warmed_up);
+        let sample = system.sample.expect("system sample metadata is required");
+        assert!(sample.sampled_at_ms > 0);
+        let Some(smalux_protocol::agent::v1::task_result::Result::System(system)) = system.result
+        else {
+            panic!("system task must return TaskResult.system");
+        };
+        assert!(system.cpu.is_some());
+        let Some(smalux_protocol::agent::v1::task_result::Result::Cpu(cpu)) = cpu.result else {
+            panic!("CPU task must return TaskResult.cpu");
+        };
+        assert!(!cpu.warmed_up);
     }
 
     #[tokio::test]
@@ -124,25 +159,46 @@ mod tests {
             exclude: Vec::new(),
         };
         let task = SystemTask::with_config(SystemTaskConfig {
-            disk_io: DiskIoTaskConfig {
-                disks: DiskSelection {
+            disk_io: Some(DiskIoTaskConfig {
+                disks: Some(DiskSelection {
                     include_names: vec!["smalux-missing-disk".to_owned()],
                     ..DiskSelection::default()
-                },
-            },
-            network_io: NetworkIoTaskConfig {
-                interfaces: missing_interface.clone(),
-            },
-            local_ip: LocalIpTaskConfig {
-                interfaces: missing_interface,
-            },
+                }),
+            }),
+            network_io: Some(NetworkIoTaskConfig {
+                interfaces: Some(missing_interface.clone()),
+            }),
+            local_ip: Some(LocalIpTaskConfig {
+                interfaces: Some(missing_interface),
+            }),
         });
 
         let output = task.run(context()).await.unwrap();
 
-        assert_eq!(task.config().disk_io.disks.include_names.len(), 1);
-        assert!(output.snapshot.disk_io.devices.is_empty());
-        assert!(output.snapshot.network_io.interfaces.is_empty());
-        assert!(output.snapshot.ip.local.is_empty());
+        assert_eq!(
+            task.config()
+                .disk_io
+                .as_ref()
+                .expect("disk config is configured")
+                .disks
+                .as_ref()
+                .expect("disk selection is configured")
+                .include_names
+                .len(),
+            1
+        );
+        let Some(smalux_protocol::agent::v1::task_result::Result::System(snapshot)) = output.result
+        else {
+            panic!("system task must return TaskResult.system");
+        };
+        assert!(snapshot.disk_io.expect("disk snapshot").devices.is_empty());
+        assert!(
+            snapshot
+                .network_io
+                .expect("network snapshot")
+                .interfaces
+                .is_empty()
+        );
+        assert!(snapshot.ip.expect("IP snapshot").local.is_empty());
     }
 }

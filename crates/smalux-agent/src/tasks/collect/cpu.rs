@@ -1,13 +1,14 @@
 //! CPU 周期采集任务。
 
 use async_trait::async_trait;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::{cpu::CpuSnapshot, system::SystemCollector},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::system::SystemCollector,
 };
 
-use super::{MetricSample, blocking::CollectState};
+use super::blocking::CollectState;
 
 /// 独立维护 CPU 采样基线的调度任务。
 pub struct CpuTask {
@@ -33,13 +34,19 @@ impl Default for CpuTask {
 }
 
 #[async_trait]
-impl ValueTask for CpuTask {
-    type Output = MetricSample<CpuSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
-        self.state
+impl ReportingTask for CpuTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
+        let output = self
+            .state
             .collect(context, SystemCollector::collect_cpu)
-            .await
+            .await?;
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::Cpu(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -59,7 +66,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::scheduler::{
-        JobOptions, SchedulerConfig, SchedulerError, SchedulerRuntime, Trigger, ValueTask,
+        JobOptions, ReportingTask, SchedulerConfig, SchedulerError, SchedulerRuntime, Trigger,
     };
 
     use super::CpuTask;
@@ -72,12 +79,14 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), CpuTask::KIND);
-        assert!(output.sampled_at_ms > 0);
-        assert_eq!(output.sample_interval_ms, None);
-        assert_eq!(
-            output.snapshot.logical_cpu_count,
-            output.snapshot.cpus.len()
-        );
+        let sample = output.sample.as_ref().expect("sample metadata is required");
+        assert!(sample.sampled_at_ms > 0);
+        assert_eq!(sample.sample_interval_ms, None);
+        let Some(smalux_protocol::agent::v1::task_result::Result::Cpu(snapshot)) = output.result
+        else {
+            panic!("CPU task must return TaskResult.cpu");
+        };
+        assert_eq!(snapshot.logical_cpu_count as usize, snapshot.cpus.len());
     }
 
     #[tokio::test]
@@ -87,7 +96,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
 
         scheduler
-            .add_value_channel(
+            .add_reporting_channel(
                 Trigger::once(Utc::now()).with_timeout(None),
                 Arc::new(CpuTask::new()),
                 sender,
@@ -100,10 +109,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            output.snapshot.logical_cpu_count,
-            output.snapshot.cpus.len()
-        );
+        let Some(smalux_protocol::agent::v1::task_result::Result::Cpu(snapshot)) = output.result
+        else {
+            panic!("CPU task must return TaskResult.cpu");
+        };
+        assert_eq!(snapshot.logical_cpu_count as usize, snapshot.cpus.len());
 
         runtime.shutdown().await.unwrap();
     }
@@ -115,7 +125,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
 
         let error = scheduler
-            .add_value_channel(
+            .add_reporting_channel(
                 Trigger::once(Utc::now()).with_timeout(Some(Duration::from_secs(1))),
                 Arc::new(CpuTask::new()),
                 sender,

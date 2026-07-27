@@ -60,7 +60,7 @@ impl ServerXxAwaitMessage3 {
             .map_err(|_| NoiseError::AuthenticationFailed)?;
         finish(
             self.handshake,
-            HandshakeMode::EnrollmentXxPsk3,
+            HandshakeMode::RegistrationXxPsk3,
             self.responder_key_id,
         )
     }

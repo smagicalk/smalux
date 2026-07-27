@@ -19,36 +19,24 @@ mod selection;
 mod socket;
 mod system;
 
-/// 采集结果的详细程度；档位越高，系统查询和输出体积通常越大。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CollectionMode {
-    /// 只返回完整汇总，不保留逐项列表。
-    #[default]
-    Summary,
-    /// 返回不含高成本关联字段的轻量列表。
-    Basic,
-    /// 返回 PID、资源或命令等高成本详细字段。
-    Detailed,
-}
+pub use smalux_protocol::agent::v1::{
+    CollectionMode, HttpTarget, IcmpEchoTarget, ProbeAttemptSnapshot, ProbeNodeConfig,
+    ProbeNodeSnapshot, ProbeProtocol, ProbeSnapshot, ProcessDetails, ProcessEntry, ProcessRanking,
+    ProcessSelection, ProcessSnapshot, ProcessState, ProcessStateCount, SocketAddressFamily,
+    SocketAddressFamilySelection, SocketAvailability, SocketCollectionStatus, SocketEntry,
+    SocketProtocol, SocketProtocolSelection, SocketSnapshot, SystemSnapshot, TcpConnectTarget,
+    TcpConnectionState, TcpStateCount,
+};
 
 pub use collectors::{
-    SystemSnapshot,
     cpu::{CpuCoreSnapshot, CpuSnapshot},
     host::HostSnapshot,
     io::{DiskDeviceSnapshot, DiskIoSnapshot, NetworkInterfaceSnapshot, NetworkIoSnapshot},
-    ip::{InterfaceAddress, IpScope, IpSnapshot, PublicIpSnapshot, PublicIpState},
+    ip::{InterfaceAddress, IpScope, IpSnapshot, PublicIpSnapshot, PublicIpState, PublicIpStatus},
     load::LoadSnapshot,
     memory::MemorySnapshot,
-    process::{
-        ProcessConfigError, ProcessDetails, ProcessEntry, ProcessRanking, ProcessSelection,
-        ProcessSnapshot, ProcessState, ProcessStateCount,
-    },
-    socket::{
-        SocketAddressFamily, SocketAddressFamilySelection, SocketCollectionError,
-        SocketCollectionStatus, SocketEntry, SocketProtocol, SocketProtocolSelection,
-        SocketSnapshot, TcpConnectionState, TcpStateCount,
-    },
+    process::ProcessConfigError,
+    socket::SocketCollectionError,
 };
 pub use cpu::CpuTask;
 pub use disk_io::{DiskIoTask, DiskIoTaskConfig};
@@ -57,15 +45,11 @@ pub use load::LoadTask;
 pub use local_ip::{LocalIpTask, LocalIpTaskConfig};
 pub use memory::MemoryTask;
 pub use network_io::{NetworkIoTask, NetworkIoTaskConfig};
-pub use probe::{
-    HttpStatusRange, ProbeAttemptSnapshot, ProbeConfigError, ProbeNodeConfig, ProbeNodeSnapshot,
-    ProbeProtocol, ProbeSnapshot, ProbeTarget, ProbeTask, ProbeTaskConfig,
-};
+pub use probe::{ProbeConfigError, ProbeTask, ProbeTaskConfig};
 pub use process::{ProcessTask, ProcessTaskConfig};
-pub use public_ip::{PublicIpTask, PublicIpTaskConfig};
-pub use sample::MetricSample;
+pub use public_ip::{PublicIpConfigError, PublicIpTask, PublicIpTaskConfig};
 pub use selection::{DiskSelection, InterfaceSelection, IpFamilySelection};
-pub use socket::{SocketTask, SocketTaskConfig};
+pub use socket::{SocketConfigError, SocketTask, SocketTaskConfig};
 pub use system::{SystemTask, SystemTaskConfig};
 
 #[cfg(test)]

@@ -3,21 +3,26 @@
 //! `TonicNoiseSession` 把请求 sender、响应 stream 和 `SecureSession` 绑定在同一可变对象中，
 //! 强制所有 nonce 相关操作串行执行。
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
 use crate::{
     agent::v1::{
-        AgentKeyRotationAccepted, KeyRotationMessage, Ping, Pong, ProtocolFrame, RekeyAck,
-        RekeyRequest, RekeyRequired, SecureMessage, ServerKeyAcknowledgement, SessionControl,
-        key_rotation_message, secure_message, session_control,
+        AgentKeyRotationAccepted, JobCommand, JobCommandResult, KeyRotationMessage, Messages, Ping,
+        Pong, ProtocolFrame, RegistrationMessage, RekeyAck, RekeyRequest, RekeyRequired,
+        SecureMessage, ServerKeyAcknowledgement, SessionControl, TaskReport, key_rotation_message,
+        secure_message, session_control,
     },
     noise::{AgentRotationPrepared, NoiseError, RotationId, SecureSession, ServerRotationPrepared},
 };
 
 use super::TransportError;
+use super::driver::DriverCommand;
 
 #[derive(Clone, Copy, Debug)]
 /// 长流存活检测策略。
@@ -47,6 +52,72 @@ pub struct RekeyPolicy {
     pub max_frames: u64,
     /// `true` 时 initiator 会在 `receive()` 中自动发起 rekey。
     pub automatic: bool,
+}
+
+/// 当前会话维护动作是否已经到期。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceStatus {
+    /// 当前连接已经超过最大无入站时长，继续使用前应关闭并重连。
+    pub heartbeat_expired: bool,
+    /// 当前端近期没有发送数据，可以发送加密 Ping。
+    pub ping_due: bool,
+    /// initiator 已达到自动 rekey 的时间或帧数阈值。
+    pub rekey_due: bool,
+}
+
+/// 一次 [`TonicNoiseSession::perform_maintenance`] 实际完成的动作。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceResult {
+    /// 本次调用是否发送了 Ping。
+    pub ping_sent: bool,
+    /// 本次调用完成的新 generation；未执行 rekey 时为 `None`。
+    pub rekeyed_generation: Option<u64>,
+}
+
+/// 已解密并完成控制帧过滤后的强类型会话事件。
+#[derive(Debug)]
+pub enum SessionEvent {
+    /// 首次注册状态消息。
+    Registration(RegistrationMessage),
+    /// 通用请求或响应消息。
+    Messages(Messages),
+    /// 长期静态身份密钥轮换消息。
+    KeyRotation(KeyRotationMessage),
+    /// Server 下发的 Job 控制命令。
+    JobCommand(JobCommand),
+    /// Agent 返回的 Job 控制结果。
+    JobCommandResult(Box<JobCommandResult>),
+    /// Agent 上报的强类型 Task 执行结果。
+    TaskReport(Box<TaskReport>),
+}
+
+impl TryFrom<SecureMessage> for SessionEvent {
+    type Error = TransportError;
+
+    /// 把底层 Protobuf envelope 分类为业务事件；控制帧不允许从该入口泄漏。
+    fn try_from(message: SecureMessage) -> Result<Self, Self::Error> {
+        match message.body {
+            Some(secure_message::Body::RegistrationMessage(value)) => Ok(Self::Registration(value)),
+            Some(secure_message::Body::Messages(value)) => Ok(Self::Messages(value)),
+            Some(secure_message::Body::KeyRotation(value)) => Ok(Self::KeyRotation(value)),
+            Some(secure_message::Body::JobCommand(value)) => Ok(Self::JobCommand(value)),
+            Some(secure_message::Body::JobCommandResult(value)) => {
+                Ok(Self::JobCommandResult(value))
+            }
+            Some(secure_message::Body::TaskReport(value)) => Ok(Self::TaskReport(value)),
+            Some(secure_message::Body::Error(error)) => {
+                let code = crate::agent::v1::SecureErrorCode::try_from(error.code)
+                    .unwrap_or(crate::agent::v1::SecureErrorCode::Unspecified);
+                Err(TransportError::RemoteSecure(code, error.message))
+            }
+            Some(secure_message::Body::SessionControl(_)) => Err(TransportError::Protocol(
+                "session control escaped the transport state machine".to_owned(),
+            )),
+            None => Err(TransportError::Protocol(
+                "SecureMessage body is required".to_owned(),
+            )),
+        }
+    }
 }
 
 impl Default for RekeyPolicy {
@@ -90,6 +161,8 @@ pub struct TonicNoiseSession {
     heartbeat: HeartbeatPolicy,
     /// 当前 rekey 参数。
     rekey: RekeyPolicy,
+    /// rekey 等待 ACK 时提前到达的业务消息，完成换钥后按原顺序返回。
+    buffered_messages: VecDeque<SecureMessage>,
 }
 
 impl TonicNoiseSession {
@@ -129,6 +202,7 @@ impl TonicNoiseSession {
             next_ping_nonce: 1,
             heartbeat: HeartbeatPolicy::default(),
             rekey: RekeyPolicy::default(),
+            buffered_messages: VecDeque::new(),
         }
     }
 
@@ -164,6 +238,34 @@ impl TonicNoiseSession {
                 || self.secure.encrypted_frames() >= self.rekey.max_frames)
     }
 
+    /// 返回当前维护状态，不发送网络消息也不改变 cipher state。
+    pub fn maintenance_status(&self) -> MaintenanceStatus {
+        MaintenanceStatus {
+            heartbeat_expired: self.heartbeat_expired(),
+            ping_due: self.should_ping(),
+            rekey_due: self.initiator && self.should_rekey(),
+        }
+    }
+
+    /// 执行一次已经到期的心跳或自动 rekey；调用方可在自己的 `select!` 循环中定期调用。
+    pub async fn perform_maintenance(&mut self) -> Result<MaintenanceResult, TransportError> {
+        let status = self.maintenance_status();
+        if status.heartbeat_expired {
+            return Err(TransportError::HeartbeatTimeout);
+        }
+        let mut result = MaintenanceResult::default();
+        if status.rekey_due {
+            result.rekeyed_generation = Some(self.request_rekey().await?);
+        }
+        if status.ping_due {
+            let nonce = self.next_ping_nonce;
+            self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
+            self.ping(nonce).await?;
+            result.ping_sent = true;
+        }
+        Ok(result)
+    }
+
     /// 编码并加密一条业务或控制消息，然后写入当前端的 Tonic channel。
     ///
     /// `&mut self` 保证同一会话不会并发复用 sending nonce。
@@ -175,14 +277,54 @@ impl TonicNoiseSession {
         Ok(())
     }
 
+    /// 发送一条强类型 Task 上报。
+    pub async fn send_task_report(&mut self, report: TaskReport) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::TaskReport(Box::new(report))),
+        })
+        .await
+    }
+
+    /// 发送一条 Server Job 控制命令。
+    pub async fn send_job_command(&mut self, command: JobCommand) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::JobCommand(command)),
+        })
+        .await
+    }
+
+    /// 发送一条 Agent Job 控制结果。
+    pub async fn send_job_command_result(
+        &mut self,
+        result: JobCommandResult,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::JobCommandResult(Box::new(result))),
+        })
+        .await
+    }
+
+    /// 接收下一条强类型业务事件；心跳和 rekey 控制帧仍在内部处理。
+    pub async fn receive_event(&mut self) -> Result<Option<SessionEvent>, TransportError> {
+        self.receive()
+            .await?
+            .map(SessionEvent::try_from)
+            .transpose()
+    }
+
     /// 接收下一条业务消息；Ping/Pong 和 responder rekey 在内部处理。
     ///
     /// 控制消息不会返回给普通业务循环；方法会持续读取，直到得到业务消息、流关闭或错误。
     pub async fn receive(&mut self) -> Result<Option<SecureMessage>, TransportError> {
         loop {
+            if let Some(message) = self.buffered_messages.pop_front() {
+                return Ok(Some(message));
+            }
             // 只有 initiator 发起同步 rekey，防止双方同时切 key 造成方向失步。
             if self.initiator && self.should_rekey() {
                 self.request_rekey().await?;
+                // request_rekey 可能在 Ack 前收到并缓存业务帧，回到循环顶部优先交付它们。
+                continue;
             }
             if self.heartbeat_expired() {
                 return Err(TransportError::HeartbeatTimeout);
@@ -204,7 +346,12 @@ impl TonicNoiseSession {
             self.last_received = Instant::now();
             match message.body {
                 Some(secure_message::Body::SessionControl(control)) => {
-                    self.handle_control(control).await?;
+                    match self.handle_control(control).await {
+                        Err(TransportError::RekeyRequired) if self.initiator => {
+                            self.request_rekey().await?;
+                        }
+                        result => result?,
+                    }
                 }
                 _ => return Ok(Some(message)),
             }
@@ -326,14 +473,12 @@ impl TonicNoiseSession {
                     self.last_received = Instant::now();
                     return Ok(generation);
                 }
-                Some(secure_message::Body::SessionControl(control)) => {
-                    self.handle_control(control).await?;
-                }
-                _ => {
-                    return Err(TransportError::Protocol(
-                        "business message arrived while rekey was pending".to_owned(),
-                    ));
-                }
+                Some(secure_message::Body::SessionControl(control)) => match control.body {
+                    Some(session_control::Body::RekeyRequired(required))
+                        if required.next_generation == generation => {}
+                    _ => self.handle_control(control).await?,
+                },
+                _ => self.buffered_messages.push_back(message),
             }
         }
     }
@@ -387,6 +532,164 @@ impl TonicNoiseSession {
                 "invalid session control message".to_owned(),
             )),
         }
+    }
+
+    /// 运行可选 Driver 的单所有者事件循环。
+    pub(crate) async fn run_driver(
+        mut self,
+        mut commands: mpsc::Receiver<DriverCommand>,
+        events: mpsc::Sender<Result<SessionEvent, TransportError>>,
+    ) {
+        // interval 的第一次 tick 会立即完成，先消费它，避免 Driver 启动后无条件发送 Ping。
+        let tick_period = self.heartbeat.interval.max(Duration::from_millis(1));
+        let mut maintenance = tokio::time::interval(tick_period);
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        maintenance.tick().await;
+
+        loop {
+            tokio::select! {
+                // 入站优先，尽快处理 Ping、rekey 等控制帧，降低对端等待时间。
+                biased;
+                inbound = self.inbound.message() => {
+                    let frame = match inbound {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => {
+                            let _ = events.send(Err(TransportError::Closed)).await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = events.send(Err(TransportError::Status(error))).await;
+                            return;
+                        }
+                    };
+                    match self.process_driver_frame(frame).await {
+                        Ok(Some(event)) => {
+                            if events.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = events.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                    if self.flush_buffered_events(&events).await.is_err() {
+                        return;
+                    }
+                }
+                command = commands.recv() => {
+                    match command {
+                        Some(DriverCommand::Send { message, completed }) => {
+                            match self.send(message).await {
+                                Ok(()) => {
+                                    let _ = completed.send(Ok(()));
+                                }
+                                Err(error) => {
+                                    let _ = completed.send(Err(error));
+                                    return;
+                                }
+                            }
+                        }
+                        Some(DriverCommand::Shutdown { completed }) => {
+                            let _ = completed.send(());
+                            return;
+                        }
+                        Some(DriverCommand::Ping { nonce, completed }) => {
+                            let failed = match self.ping(nonce).await {
+                                Ok(()) => {
+                                    let _ = completed.send(Ok(()));
+                                    false
+                                }
+                                Err(error) => {
+                                    let _ = completed.send(Err(error));
+                                    true
+                                }
+                            };
+                            if failed {
+                                return;
+                            }
+                        }
+                        Some(DriverCommand::RequestRekey { completed }) => {
+                            let failed = match self.request_rekey().await {
+                                Ok(generation) => {
+                                    let _ = completed.send(Ok(generation));
+                                    false
+                                }
+                                Err(error) => {
+                                    let _ = completed.send(Err(error));
+                                    true
+                                }
+                            };
+                            if failed {
+                                return;
+                            }
+                            if self.flush_buffered_events(&events).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(DriverCommand::RequireRekey { completed }) => {
+                            let failed = match self.require_rekey().await {
+                                Ok(generation) => {
+                                    let _ = completed.send(Ok(generation));
+                                    false
+                                }
+                                Err(error) => {
+                                    let _ = completed.send(Err(error));
+                                    true
+                                }
+                            };
+                            if failed {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+                _ = maintenance.tick() => {
+                    if let Err(error) = self.perform_maintenance().await {
+                        let _ = events.send(Err(error)).await;
+                        return;
+                    }
+                    if self.flush_buffered_events(&events).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 解密 Driver 收到的一帧，并在返回业务事件前完成所有内部控制动作。
+    async fn process_driver_frame(
+        &mut self,
+        frame: ProtocolFrame,
+    ) -> Result<Option<SessionEvent>, TransportError> {
+        let message = self.secure.decrypt(frame)?;
+        self.last_received = Instant::now();
+        match message.body {
+            Some(secure_message::Body::SessionControl(control)) => {
+                match self.handle_control(control).await {
+                    Err(TransportError::RekeyRequired) if self.initiator => {
+                        self.request_rekey().await?;
+                    }
+                    result => result?,
+                }
+                Ok(None)
+            }
+            _ => SessionEvent::try_from(message).map(Some),
+        }
+    }
+
+    /// 把 rekey 等待期间缓存的业务消息按原始接收顺序交给 Driver 事件队列。
+    async fn flush_buffered_events(
+        &mut self,
+        events: &mpsc::Sender<Result<SessionEvent, TransportError>>,
+    ) -> Result<(), ()> {
+        while let Some(message) = self.buffered_messages.pop_front() {
+            let event = SessionEvent::try_from(message);
+            events.send(event).await.map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     async fn send_frame(&self, frame: ProtocolFrame) -> Result<(), TransportError> {

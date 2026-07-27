@@ -3,16 +3,28 @@
 //! Client 通过 [`AgentProtocolClient`] 完成首次注册（XXpsk3）或后续连接（IK）；
 //! Server 通过 [`ServerSessionAcceptor`] 解析同一条 `OpenSession` 流并返回待授权会话。
 //! 握手成功后，双方都使用 [`TonicNoiseSession`] 收发加密消息、心跳及密钥轮换控制帧。
+//! 需要并发提交上报和接收命令时，可把会话交给 [`SessionDriver`]，业务层仅持有可克隆
+//! [`SessionHandle`] 与单消费者 [`SessionEventReceiver`]。
 //!
 //! 本模块不保存 Token、长期私钥或授权记录。调用方应自行持久化 `noise` 模块的 snapshot。
 
 mod client;
+mod driver;
 mod server;
 mod session;
 
-pub use client::{AgentProtocolClient, EnrollmentOutcome};
-pub use server::{ServerPendingSession, ServerSessionAcceptor};
-pub use session::{HeartbeatPolicy, RekeyPolicy, TonicNoiseSession};
+pub use client::{AgentPendingRegistration, AgentProtocolClient, AgentRegistration};
+pub use driver::{
+    RunningSession, SessionDriver, SessionDriverConfig, SessionEventReceiver, SessionHandle,
+};
+pub use server::{
+    IncomingSession, ServerAuthentication, ServerPendingSession, ServerRegistration,
+    ServerSessionAcceptor,
+};
+pub use session::{
+    HeartbeatPolicy, MaintenanceResult, MaintenanceStatus, RekeyPolicy, SessionEvent,
+    TonicNoiseSession,
+};
 
 use std::fmt;
 

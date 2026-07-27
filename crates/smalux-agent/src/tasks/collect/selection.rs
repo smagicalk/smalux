@@ -2,84 +2,47 @@
 
 use super::collectors::io::{DiskIoSnapshot, NetworkIoSnapshot};
 use super::collectors::ip::IpSnapshot;
+pub use smalux_protocol::agent::v1::{DiskSelection, InterfaceSelection, IpFamilySelection};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-/// 公网地址采集请求的 IP 协议族。
-pub enum IpFamilySelection {
-    /// 同时请求 IPv4 与 IPv6。
-    #[default]
-    Both,
-    /// 只请求 IPv4。
-    V4,
-    /// 只请求 IPv6。
-    V6,
-}
-
-impl IpFamilySelection {
-    pub(crate) const fn requested(self) -> (bool, bool) {
-        match self {
-            Self::Both => (true, true),
-            Self::V4 => (true, false),
-            Self::V6 => (false, true),
-        }
-    }
-}
-
-/// 按设备名称或挂载点选择磁盘；任一 include 列表非空时忽略全部 exclude。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiskSelection {
-    /// 允许的设备名称；任一 include 非空时启用白名单模式。
-    pub include_names: Vec<String>,
-    /// 允许的挂载点；与 `include_names` 使用 OR 关系。
-    pub include_mount_points: Vec<String>,
-    /// 白名单模式未启用时排除的设备名称。
-    pub exclude_names: Vec<String>,
-    /// 白名单模式未启用时排除的挂载点。
-    pub exclude_mount_points: Vec<String>,
-}
-
-impl DiskSelection {
-    /// 判断给定设备名称和挂载点是否满足当前筛选规则。
-    pub fn matches(&self, name: &str, mount_point: &str) -> bool {
-        let has_include = !self.include_names.is_empty() || !self.include_mount_points.is_empty();
-        if has_include {
-            return self.include_names.iter().any(|value| value == name)
-                || self
-                    .include_mount_points
-                    .iter()
-                    .any(|value| value == mount_point);
-        }
-        !self.exclude_names.iter().any(|value| value == name)
-            && !self
-                .exclude_mount_points
+/// 判断给定设备名称和挂载点是否满足 protobuf 筛选规则。
+fn disk_matches(selection: &DiskSelection, name: &str, mount_point: &str) -> bool {
+    let has_include =
+        !selection.include_names.is_empty() || !selection.include_mount_points.is_empty();
+    if has_include {
+        return selection.include_names.iter().any(|value| value == name)
+            || selection
+                .include_mount_points
                 .iter()
-                .any(|value| value == mount_point)
+                .any(|value| value == mount_point);
     }
+    !selection.exclude_names.iter().any(|value| value == name)
+        && !selection
+            .exclude_mount_points
+            .iter()
+            .any(|value| value == mount_point)
 }
 
-/// 按接口完整名称选择或排除网卡；非空 include 优先于 exclude。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InterfaceSelection {
-    /// 非空时只允许完全匹配的接口名称，并忽略 `exclude`。
-    pub include: Vec<String>,
-    /// `include` 为空时排除完全匹配的接口名称。
-    pub exclude: Vec<String>,
+/// 判断完整接口名称是否满足 protobuf 筛选规则。
+fn interface_matches(selection: &InterfaceSelection, interface: &str) -> bool {
+    if !selection.include.is_empty() {
+        return selection.include.iter().any(|name| name == interface);
+    }
+    !selection.exclude.iter().any(|name| name == interface)
 }
 
-impl InterfaceSelection {
-    /// 判断完整接口名称是否满足当前筛选规则。
-    pub fn matches(&self, interface: &str) -> bool {
-        if !self.include.is_empty() {
-            return self.include.iter().any(|name| name == interface);
-        }
-        !self.exclude.iter().any(|name| name == interface)
+pub(crate) const fn requested_ip_families(selection: IpFamilySelection) -> (bool, bool) {
+    match selection {
+        IpFamilySelection::Both => (true, true),
+        IpFamilySelection::V4 => (true, false),
+        IpFamilySelection::V6 => (false, true),
+        IpFamilySelection::Unspecified => (false, false),
     }
 }
 
 pub(super) fn filter_network(snapshot: &mut NetworkIoSnapshot, selection: &InterfaceSelection) {
     snapshot
         .interfaces
-        .retain(|network| selection.matches(&network.interface));
+        .retain(|network| interface_matches(selection, &network.interface));
     snapshot.received_bytes = snapshot
         .interfaces
         .iter()
@@ -109,7 +72,7 @@ pub(super) fn filter_network(snapshot: &mut NetworkIoSnapshot, selection: &Inter
 pub(super) fn filter_disk(snapshot: &mut DiskIoSnapshot, selection: &DiskSelection) {
     snapshot
         .devices
-        .retain(|disk| selection.matches(&disk.name, &disk.mount_point));
+        .retain(|disk| disk_matches(selection, &disk.name, &disk.mount_point));
     snapshot.read_bytes = snapshot.devices.iter().map(|disk| disk.read_bytes).sum();
     snapshot.written_bytes = snapshot.devices.iter().map(|disk| disk.written_bytes).sum();
     snapshot.read_bytes_per_second = snapshot.warmed_up.then(|| {
@@ -131,7 +94,7 @@ pub(super) fn filter_disk(snapshot: &mut DiskIoSnapshot, selection: &DiskSelecti
 pub(super) fn filter_local_ip(snapshot: &mut IpSnapshot, selection: &InterfaceSelection) {
     snapshot
         .local
-        .retain(|address| selection.matches(&address.interface));
+        .retain(|address| interface_matches(selection, &address.interface));
 }
 
 #[cfg(test)]
@@ -140,12 +103,12 @@ mod tests {
         DiskDeviceSnapshot, DiskIoSnapshot, NetworkInterfaceSnapshot, NetworkIoSnapshot,
     };
     use crate::tasks::collect::collectors::ip::{
-        InterfaceAddress, IpScope, IpSnapshot, PublicIpState,
+        InterfaceAddress, IpScope, IpSnapshot, PublicIpState, PublicIpStatus,
     };
 
     use super::{
-        DiskSelection, InterfaceSelection, IpFamilySelection, filter_disk, filter_local_ip,
-        filter_network,
+        DiskSelection, InterfaceSelection, IpFamilySelection, disk_matches, filter_disk,
+        filter_local_ip, filter_network, interface_matches, requested_ip_families,
     };
 
     fn disk(name: &str, mount: &str, read: u64, written: u64) -> DiskDeviceSnapshot {
@@ -190,8 +153,8 @@ mod tests {
             exclude: vec!["eth0".to_owned(), "eth1".to_owned()],
         };
 
-        assert!(selection.matches("eth0"));
-        assert!(!selection.matches("eth1"));
+        assert!(interface_matches(&selection, "eth0"));
+        assert!(!interface_matches(&selection, "eth1"));
     }
 
     #[test]
@@ -255,19 +218,27 @@ mod tests {
             local: vec![
                 InterfaceAddress {
                     interface: "eth0".to_owned(),
-                    address: "192.0.2.1".parse().unwrap(),
+                    address: "192.0.2.1".to_owned(),
                     prefix_length: 24,
-                    scope: IpScope::Global,
+                    scope: IpScope::Global as i32,
                 },
                 InterfaceAddress {
                     interface: "eth1".to_owned(),
-                    address: "198.51.100.1".parse().unwrap(),
+                    address: "198.51.100.1".to_owned(),
                     prefix_length: 24,
-                    scope: IpScope::Global,
+                    scope: IpScope::Global as i32,
                 },
             ],
-            public_ipv4: PublicIpState::NotRequested,
-            public_ipv6: PublicIpState::NotRequested,
+            public_ipv4: Some(PublicIpState {
+                status: PublicIpStatus::NotRequested as i32,
+                address: None,
+                message: None,
+            }),
+            public_ipv6: Some(PublicIpState {
+                status: PublicIpStatus::NotRequested as i32,
+                address: None,
+                message: None,
+            }),
         };
 
         filter_local_ip(
@@ -284,9 +255,24 @@ mod tests {
 
     #[test]
     fn public_ip_family_selection_exposes_requested_families() {
-        assert_eq!(IpFamilySelection::default(), IpFamilySelection::Both);
-        assert_eq!(IpFamilySelection::Both.requested(), (true, true));
-        assert_eq!(IpFamilySelection::V4.requested(), (true, false));
-        assert_eq!(IpFamilySelection::V6.requested(), (false, true));
+        assert_eq!(requested_ip_families(IpFamilySelection::Both), (true, true));
+        assert_eq!(requested_ip_families(IpFamilySelection::V4), (true, false));
+        assert_eq!(requested_ip_families(IpFamilySelection::V6), (false, true));
+        assert_eq!(
+            requested_ip_families(IpFamilySelection::Unspecified),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn disk_include_by_name_takes_priority_over_exclude() {
+        let selection = DiskSelection {
+            include_names: vec!["sda".to_owned()],
+            exclude_names: vec!["sda".to_owned()],
+            ..DiskSelection::default()
+        };
+
+        assert!(disk_matches(&selection, "sda", "/"));
+        assert!(!disk_matches(&selection, "sdb", "/data"));
     }
 }

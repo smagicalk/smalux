@@ -1,13 +1,14 @@
 //! 内存周期采集任务。
 
 use async_trait::async_trait;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::{memory::MemorySnapshot, system::SystemCollector},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::system::SystemCollector,
 };
 
-use super::{MetricSample, blocking::CollectState};
+use super::blocking::CollectState;
 
 /// 独立刷新内存与交换空间的调度任务。
 pub struct MemoryTask {
@@ -33,13 +34,19 @@ impl Default for MemoryTask {
 }
 
 #[async_trait]
-impl ValueTask for MemoryTask {
-    type Output = MetricSample<MemorySnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
-        self.state
+impl ReportingTask for MemoryTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
+        let output = self
+            .state
             .collect(context, SystemCollector::collect_memory)
-            .await
+            .await?;
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::Memory(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -53,7 +60,7 @@ impl ValueTask for MemoryTask {
 
 #[cfg(test)]
 mod tests {
-    use crate::{scheduler::ValueTask, tasks::collect::context};
+    use crate::{scheduler::ReportingTask, tasks::collect::context};
 
     use super::MemoryTask;
 
@@ -63,7 +70,16 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), MemoryTask::KIND);
-        assert!(output.sampled_at_ms > 0);
-        assert!(output.snapshot.total_bytes >= output.snapshot.used_bytes);
+        assert!(
+            output
+                .sample
+                .as_ref()
+                .is_some_and(|sample| sample.sampled_at_ms > 0)
+        );
+        let Some(smalux_protocol::agent::v1::task_result::Result::Memory(snapshot)) = output.result
+        else {
+            panic!("Memory task must return TaskResult.memory");
+        };
+        assert!(snapshot.total_bytes >= snapshot.used_bytes);
     }
 }

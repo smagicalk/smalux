@@ -10,44 +10,19 @@ use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 use crate::tasks::collect::CollectionMode;
+pub use smalux_protocol::agent::v1::{ProcessRanking, ProcessSelection};
 
 /// Basic 模式未配置上限时最多返回的进程数量。
 pub const DEFAULT_BASIC_PROCESS_ENTRIES: usize = 256;
 /// Detailed 模式未配置上限时最多返回的进程数量。
 pub const DEFAULT_DETAILED_PROCESS_ENTRIES: usize = 128;
 
-/// Detailed 模式选择有限进程列表时使用的排名字段。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ProcessRanking {
-    /// 按 PID 升序，先截断再刷新详细字段，资源消耗最低。
-    #[default]
-    Pid,
-    /// 为全部匹配进程刷新 CPU 后按使用率降序取 TopN。
-    CpuUsage,
-    /// 为全部匹配进程刷新内存后按物理内存降序取 TopN。
-    Memory,
-}
-
-/// 按 PID 或完整进程名称选择进程；任一 include 非空时忽略 exclude。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProcessSelection {
-    /// 白名单 PID；与 `include_names` 使用 OR 关系。
-    pub include_pids: Vec<u32>,
-    /// 白名单进程名称，区分大小写并要求完整匹配。
-    pub include_names: Vec<String>,
-    /// 未启用白名单时排除的完整进程名称。
-    pub exclude_names: Vec<String>,
-}
-
-impl ProcessSelection {
-    /// 判断 PID 和名称是否满足白名单优先规则。
-    pub fn matches(&self, pid: u32, name: &str) -> bool {
-        if !self.include_pids.is_empty() || !self.include_names.is_empty() {
-            return self.include_pids.contains(&pid)
-                || self.include_names.iter().any(|value| value == name);
-        }
-        !self.exclude_names.iter().any(|value| value == name)
+fn process_matches(selection: &ProcessSelection, pid: u32, name: &str) -> bool {
+    if !selection.include_pids.is_empty() || !selection.include_names.is_empty() {
+        return selection.include_pids.contains(&pid)
+            || selection.include_names.iter().any(|value| value == name);
     }
+    !selection.exclude_names.iter().any(|value| value == name)
 }
 
 /// 跨平台稳定的进程状态。
@@ -134,7 +109,7 @@ pub struct ProcessEntry {
 }
 
 /// 一次本机进程采集结果。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcessSnapshot {
     /// 实际使用的采集档位。
     pub mode: CollectionMode,
@@ -155,6 +130,15 @@ pub struct ProcessSnapshot {
 /// 进程 Task 配置不满足模式约束时返回的错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProcessConfigError {
+    /// protobuf 模式使用了零值或未知值。
+    #[error("process collection mode is unspecified or unknown")]
+    InvalidMode,
+    /// protobuf 排名使用了零值或未知值。
+    #[error("process ranking is unspecified or unknown")]
+    InvalidRanking,
+    /// 显式列表上限必须大于零。
+    #[error("process max_entries must be greater than zero")]
+    InvalidMaxEntries,
     /// Summary/Basic 不允许高成本 TopN 排名。
     #[error("CPU or memory ranking requires detailed process collection")]
     RankingRequiresDetailed,
@@ -186,6 +170,12 @@ impl ProcessCollector {
         selection: &ProcessSelection,
         ranking: ProcessRanking,
     ) -> Result<(), ProcessConfigError> {
+        if mode == CollectionMode::Unspecified {
+            return Err(ProcessConfigError::InvalidMode);
+        }
+        if ranking == ProcessRanking::Unspecified {
+            return Err(ProcessConfigError::InvalidRanking);
+        }
         if mode != CollectionMode::Detailed && ranking != ProcessRanking::Pid {
             return Err(ProcessConfigError::RankingRequiresDetailed);
         }
@@ -224,7 +214,7 @@ impl ProcessCollector {
             .filter_map(|(pid, process)| {
                 let pid = pid.as_u32();
                 let name = process.name().to_string_lossy();
-                selection.matches(pid, &name).then_some(pid)
+                process_matches(selection, pid, &name).then_some(pid)
             })
             .collect::<Vec<_>>();
         matched.sort_unstable();
@@ -238,6 +228,7 @@ impl ProcessCollector {
         let matched_processes = matched.len();
         let limit = resolved_limit(mode, max_entries);
         let (entries, cpu_warmed_up) = match mode {
+            CollectionMode::Unspecified => (Vec::new(), false),
             CollectionMode::Summary => (Vec::new(), false),
             CollectionMode::Basic => (
                 matched
@@ -391,6 +382,7 @@ fn resolved_limit(mode: CollectionMode, configured: Option<NonZeroUsize>) -> usi
         return 0;
     }
     configured.map(NonZeroUsize::get).unwrap_or(match mode {
+        CollectionMode::Unspecified => 0,
         CollectionMode::Summary => 0,
         CollectionMode::Basic => DEFAULT_BASIC_PROCESS_ENTRIES,
         CollectionMode::Detailed => DEFAULT_DETAILED_PROCESS_ENTRIES,
@@ -490,9 +482,9 @@ mod tests {
             exclude_names: vec!["allowed".to_owned(), "blocked".to_owned()],
         };
 
-        assert!(selection.matches(7, "blocked"));
-        assert!(selection.matches(8, "allowed"));
-        assert!(!selection.matches(8, "blocked"));
+        assert!(process_matches(&selection, 7, "blocked"));
+        assert!(process_matches(&selection, 8, "allowed"));
+        assert!(!process_matches(&selection, 8, "blocked"));
     }
 
     #[test]

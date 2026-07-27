@@ -1,19 +1,6 @@
 //! 系统平均负载采集。
 
-use serde::Serialize;
-
-/// 1、5、15 分钟平均负载。
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadSnapshot {
-    /// Windows 等不提供 Unix load average 语义的平台返回 `false`。
-    pub supported: bool,
-    /// 最近 1 分钟平均负载。
-    pub one: f64,
-    /// 最近 5 分钟平均负载。
-    pub five: f64,
-    /// 最近 15 分钟平均负载。
-    pub fifteen: f64,
-}
+pub use smalux_protocol::agent::v1::LoadSnapshot;
 
 /// 采集系统平均负载。
 pub(crate) fn collect() -> LoadSnapshot {

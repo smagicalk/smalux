@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "smalux/agent/v1/task/cpu.proto";
+import "smalux/agent/v1/task/host.proto";
+import "smalux/agent/v1/task/io.proto";
+import "smalux/agent/v1/task/ip.proto";
+import "smalux/agent/v1/task/load.proto";
+import "smalux/agent/v1/task/memory.proto";
+import "smalux/agent/v1/task/process.proto";
+import "smalux/agent/v1/task/socket.proto";
+
+// 组合系统采集任务配置；未列出的子任务使用其固定默认配置。
+message SystemTaskConfig {
+  // 磁盘筛选配置。
+  DiskIoTaskConfig disk_io = 1;
+  // 网卡筛选配置。
+  NetworkIoTaskConfig network_io = 2;
+  // 本地 IP 网卡筛选配置。
+  LocalIpTaskConfig local_ip = 3;
+}
+
+// 一次系统综合采样产生的组合快照。
+message SystemSnapshot {
+  // 主机静态信息和启动状态。
+  HostSnapshot host = 1;
+  // CPU 拓扑、频率和使用率。
+  CpuSnapshot cpu = 2;
+  // 内存和交换区使用情况。
+  MemorySnapshot memory = 3;
+  // 1/5/15 分钟平均负载。
+  LoadSnapshot load = 4;
+  // 选中磁盘的容量与 IO。
+  DiskIoSnapshot disk_io = 5;
+  // 选中网卡的流量与错误计数。
+  NetworkIoSnapshot network_io = 6;
+  // 本地地址；组合采集默认不执行外部公网请求。
+  IpSnapshot ip = 7;
+  // Socket 统计或明细。
+  SocketSnapshot sockets = 8;
+  // 进程统计或明细。
+  ProcessSnapshot processes = 9;
+}

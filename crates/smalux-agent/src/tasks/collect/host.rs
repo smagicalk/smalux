@@ -1,13 +1,14 @@
 //! 主机身份周期采集任务。
 
 use async_trait::async_trait;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::host::{self, HostSnapshot},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::host,
 };
 
-use super::{MetricSample, blocking::CollectState};
+use super::blocking::CollectState;
 
 /// 采集变化频率较低的主机身份信息。
 pub struct HostTask {
@@ -33,11 +34,16 @@ impl Default for HostTask {
 }
 
 #[async_trait]
-impl ValueTask for HostTask {
-    type Output = MetricSample<HostSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
-        self.state.collect(context, |_| host::collect()).await
+impl ReportingTask for HostTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
+        let output = self.state.collect(context, |_| host::collect()).await?;
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::Host(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -51,7 +57,7 @@ impl ValueTask for HostTask {
 
 #[cfg(test)]
 mod tests {
-    use crate::{scheduler::ValueTask, tasks::collect::context};
+    use crate::{scheduler::ReportingTask, tasks::collect::context};
 
     use super::HostTask;
 
@@ -61,7 +67,11 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), HostTask::KIND);
-        assert!(!output.snapshot.hostname.is_empty());
-        assert!(!output.snapshot.architecture.is_empty());
+        let Some(smalux_protocol::agent::v1::task_result::Result::Host(snapshot)) = output.result
+        else {
+            panic!("Host task must return TaskResult.host");
+        };
+        assert!(!snapshot.hostname.is_empty());
+        assert!(!snapshot.architecture.is_empty());
     }
 }

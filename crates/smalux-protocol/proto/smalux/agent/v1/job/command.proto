@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "smalux/agent/v1/job/definition.proto";
+import "smalux/agent/v1/job/status.proto";
+
+// Server 下发的一条幂等 Job 控制命令。
+message JobCommand {
+  // 命令 UUID，固定 16 字节；RunNow 等非配置操作依靠它防止重复执行。
+  bytes command_id = 1;
+
+  // 实际操作；必须设置一个分支，空 oneof 会被 Agent 拒绝。
+  oneof action {
+    // 用 Server 的完整期望集合进行对账，通常用于首次连接或 revision 断档后恢复。
+    ReplaceAllJobs replace_all = 10;
+    // 创建或完整替换一个 Job。
+    UpsertJob upsert = 11;
+    // 删除一个由远程控制器拥有的 Job。
+    DeleteJob delete = 12;
+    // 不修改正常时间表，额外触发一次现有 Job。
+    RunJobNow run_now = 13;
+  }
+}
+
+// 用完整 Server 期望状态替换当前全部远程 Job。
+message ReplaceAllJobs {
+  // 远程 Job 集合的新版本，必须恰好等于 Agent 当前版本加一。
+  uint64 catalog_revision = 1;
+  // Server 期望 Agent 最终持有的完整远程 Job 集合；空数组表示删除全部远程 Job。
+  repeated JobDefinition jobs = 2;
+}
+
+// 创建或以完整定义替换一个远程 Job。
+message UpsertJob {
+  // 远程 Job 集合的新版本，必须恰好等于 Agent 当前版本加一。
+  uint64 catalog_revision = 1;
+  // 要创建或替换的完整定义；缺失时命令无效。
+  JobDefinition job = 2;
+}
+
+// 删除一个远程 Job。
+message DeleteJob {
+  // 远程 Job 集合的新版本，必须恰好等于 Agent 当前版本加一。
+  uint64 catalog_revision = 1;
+  // 待删除 Job 的 UUID，固定 16 字节。
+  bytes job_id = 2;
+  // Server 认为 Agent 当前持有的业务 revision，用作乐观锁。
+  uint64 expected_revision = 3;
+}
+
+// 不改变正常调度相位，立即运行现有 Job 一次。
+message RunJobNow {
+  // 待立即运行 Job 的 UUID，固定 16 字节。
+  bytes job_id = 1;
+  // Server 期望的业务 revision；不匹配时拒绝执行，避免运行旧配置。
+  uint64 expected_revision = 2;
+}
+
+// Agent 应用命令后的结构化结果。
+message JobCommandResult {
+  // 原样回传请求 command_id，供 Server 将异步结果关联到命令。
+  bytes command_id = 1;
+  // 命令最终处理状态。
+  JobCommandStatus status = 2;
+  // Agent 当前已成功应用的目录版本；拒绝时不会错误推进。
+  uint64 catalog_revision = 3;
+  // 创建、更新或立即运行后的最新 Job 状态；不适用时缺失。
+  optional JobStatus job = 4;
+  // 拒绝原因；APPLIED 时应缺失。
+  optional JobCommandError error = 5;
+}
+
+// Job 命令的顶层处理结果。
+enum JobCommandStatus {
+  // 未指定，仅作为 Proto 零值；业务代码不应发送。
+  JOB_COMMAND_STATUS_UNSPECIFIED = 0;
+  // 命令已经在 Scheduler 中生效。
+  JOB_COMMAND_STATUS_APPLIED = 1;
+  // 命令无效或当前状态不允许执行，详情见 error。
+  JOB_COMMAND_STATUS_REJECTED = 2;
+  // 增量目录无法继续，Server 应发送完整 ReplaceAll 重新对账。
+  JOB_COMMAND_STATUS_RESYNC_REQUIRED = 3;
+}
+
+// 可机器分类、也可供日志阅读的命令错误。
+message JobCommandError {
+  // 稳定错误类别，Server 应优先依据该字段决定恢复策略。
+  JobCommandErrorCode code = 1;
+  // 包含错误链上下文的人类可读说明，不应依赖其文本做业务判断。
+  string message = 2;
+}
+
+// Job 命令错误类别。
+enum JobCommandErrorCode {
+  // 未指定，仅作为 Proto 零值。
+  JOB_COMMAND_ERROR_CODE_UNSPECIFIED = 0;
+  // 命令身份、动作或命令级字段无效。
+  JOB_COMMAND_ERROR_CODE_INVALID_COMMAND = 1;
+  // JobDefinition 或 Task 配置无法通过校验。
+  JOB_COMMAND_ERROR_CODE_INVALID_JOB = 2;
+  // 指定的远程 Job 不存在。
+  JOB_COMMAND_ERROR_CODE_NOT_FOUND = 3;
+  // catalog revision、Job revision 或 Scheduler generation 冲突。
+  JOB_COMMAND_ERROR_CODE_REVISION_CONFLICT = 4;
+  // 同 UUID 已被本地 Job 或其他所有者占用。
+  JOB_COMMAND_ERROR_CODE_OWNERSHIP_CONFLICT = 5;
+  // Scheduler 已达到 Job 或队列容量限制。
+  JOB_COMMAND_ERROR_CODE_CAPACITY_EXCEEDED = 6;
+  // Scheduler 关闭、故障或发生无法细分的内部错误。
+  JOB_COMMAND_ERROR_CODE_SCHEDULER_UNAVAILABLE = 7;
+}

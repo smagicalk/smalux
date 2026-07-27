@@ -6,35 +6,12 @@ use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo
 use serde::Serialize;
 
 use crate::tasks::collect::CollectionMode;
+pub use smalux_protocol::agent::v1::{SocketAddressFamilySelection, SocketProtocolSelection};
 
 /// Basic 模式未配置上限时最多返回的 socket 数量。
 pub const DEFAULT_BASIC_SOCKET_ENTRIES: usize = 256;
 /// Detailed 模式未配置上限时最多返回的 socket 数量。
 pub const DEFAULT_DETAILED_SOCKET_ENTRIES: usize = 128;
-
-/// 本次采集包含的传输层协议。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SocketProtocolSelection {
-    /// 同时统计 TCP 和 UDP。
-    #[default]
-    Both,
-    /// 只统计 TCP。
-    Tcp,
-    /// 只统计 UDP。
-    Udp,
-}
-
-/// 本次采集包含的 IP 地址族。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SocketAddressFamilySelection {
-    /// 同时统计 IPv4 和 IPv6。
-    #[default]
-    Both,
-    /// 只统计 IPv4。
-    Ipv4,
-    /// 只统计 IPv6。
-    Ipv6,
-}
 
 /// Snapshot 中稳定的传输层协议值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -132,7 +109,7 @@ pub enum SocketCollectionStatus {
 }
 
 /// 一次本机 socket 采集结果。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketSnapshot {
     /// 实际使用的采集档位。
     pub mode: CollectionMode,
@@ -327,6 +304,7 @@ fn resolved_limit(mode: CollectionMode, configured: Option<NonZeroUsize>) -> usi
         return 0;
     }
     configured.map(NonZeroUsize::get).unwrap_or(match mode {
+        CollectionMode::Unspecified => 0,
         CollectionMode::Summary => 0,
         CollectionMode::Basic => DEFAULT_BASIC_SOCKET_ENTRIES,
         CollectionMode::Detailed => DEFAULT_DETAILED_SOCKET_ENTRIES,
@@ -335,6 +313,7 @@ fn resolved_limit(mode: CollectionMode, configured: Option<NonZeroUsize>) -> usi
 
 fn address_flags(selection: SocketAddressFamilySelection) -> AddressFamilyFlags {
     match selection {
+        SocketAddressFamilySelection::Unspecified => AddressFamilyFlags::empty(),
         SocketAddressFamilySelection::Both => AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
         SocketAddressFamilySelection::Ipv4 => AddressFamilyFlags::IPV4,
         SocketAddressFamilySelection::Ipv6 => AddressFamilyFlags::IPV6,
@@ -343,6 +322,7 @@ fn address_flags(selection: SocketAddressFamilySelection) -> AddressFamilyFlags 
 
 fn protocol_flags(selection: SocketProtocolSelection) -> ProtocolFlags {
     match selection {
+        SocketProtocolSelection::Unspecified => ProtocolFlags::empty(),
         SocketProtocolSelection::Both => ProtocolFlags::TCP | ProtocolFlags::UDP,
         SocketProtocolSelection::Tcp => ProtocolFlags::TCP,
         SocketProtocolSelection::Udp => ProtocolFlags::UDP,

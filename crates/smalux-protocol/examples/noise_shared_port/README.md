@@ -1,8 +1,22 @@
 # TLS + Noise 单端口示例
 
-该目录是正式 `smalux.agent.v1` 协议的可运行交互示例。Axum HTTP 和 Tonic gRPC
-共用一个端口，Noise 在 gRPC 双向流内部提供端到端认证与加密。示例只保留路由、
-Token/Agent 注册表和本地文件；握手、密文帧、心跳与 rekey 都调用协议 crate 的公开方法。
+该目录是正式 `smalux.agent.v1` 协议的可运行交互示例。Axum REST、WebSocket 和
+Tonic gRPC 共用一个端口，Noise 在 Agent gRPC 双向流内部提供端到端认证与加密。
+示例只保留路由、Token/Agent 注册表和本地文件；握手、密文帧、心跳与 rekey 都调用
+协议 crate 的公开方法。
+
+Server 路由结构：
+
+```text
+127.0.0.1:8080
+├── GET /api/v1/health       # 普通文本健康检查
+├── GET /api/v1/status       # 普通 REST JSON 响应
+├── GET /api/v1/ws           # WebSocket 文本/二进制 Echo
+└── /api/v1/grpc/*           # Tonic AgentTransport，HTTP/2 + Noise
+```
+
+REST 与 WebSocket 用于演示普通应用接口和 gRPC 如何共享 Axum Router。它们本身没有
+自动使用 Noise；正式浏览器接口应通过 TLS/WSS，并独立实现登录、授权和消息校验。
 
 ## 为什么使用 XXpsk3 + IK
 
@@ -30,10 +44,13 @@ Client                         Server
   | ---- XXpsk3 message 1 -----> |
   | <--- XXpsk3 message 2 ------ |  Client 暂存握手得到的 Server 静态公钥
   | ---- XXpsk3 message 3 -----> |  双方在此处混入同一个 Token PSK
-  | ---- encrypted Token ------> |  Token 与 Agent 名称都在 Noise 密文内
-  | <--- encrypted agent_id ---- |  Client 验证 PSK 成功后保存 Server 公钥
+  | ---- RegistrationRequest --> |  Server 验证 Token 并保存 pending 事务
+  | <--- RegistrationPrepared -- |  Client 保存身份、公钥、agent_id 和事务 ID
+  | ---- RegistrationCommit ---> |  Server 激活 Agent 并最终消费 Token
+  | <--- RegistrationCommitted - |  Client 标记本地注册完成
+  | <== encrypted business =====>|  当前 XX Session 直接进入业务阶段，不主动断开
 
-后续连接（IK）
+断线或重启后的连接（IK）
 Client                         Server
   | ---- IK message 1 --------> |  Server 查找已登记的 Client 公钥
   | <--- IK message 2 ---------- |  双方进入 Noise transport mode
@@ -53,7 +70,7 @@ Client                         Server
 examples/
 └── noise_shared_port/
     ├── client/main.rs                # 正式协议 Client、身份持久化与业务会话
-    ├── server/main.rs                # Axum + Tonic Server、注册表与业务处理
+    ├── server/main.rs                # Axum REST/WS + Tonic gRPC、注册表与业务处理
     ├── common.rs                     # 双方地址、路由和环境变量
     ├── support.rs                    # 密钥、Token、Agent 公钥注册表及测试
     └── README.md                     # 本文
@@ -69,15 +86,43 @@ wire 契约只有 `proto/smalux/agent/v1/*.proto` 一份；示例不再生成私
 cargo run -p smalux-protocol --example noise_shared_port_server
 ```
 
+默认 `manual` 模式逐步调用小方法，便于阅读流程；`driver` 模式把长流交给自动 Driver：
+
+```powershell
+cargo run -p smalux-protocol --example noise_shared_port_server -- --mode driver
+```
+
 Server 输出固定的示例 Token 和 Client 启动命令：
 
 ```powershell
-$env:SMALUX_EXAMPLE_ENROLLMENT_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
 
-首次 Client 运行会先执行 XXpsk3 注册，再自动建立 IK 会话并发送三条消息。身份默认
-保存在 `target/smalux-noise-agent/`。再次运行 Client 时不再需要 Token，直接使用 IK。
+Client 和 Server 可以独立选择模式，wire 协议完全相同；Driver Client 的启动方式为：
+
+```powershell
+cargo run -p smalux-protocol --example noise_shared_port_client -- --mode driver
+```
+
+Server 启动后可直接检查普通接口：
+
+```powershell
+curl.exe http://127.0.0.1:8080/api/v1/status
+```
+
+返回：
+
+```json
+{"status":"ok","transports":["rest","websocket","grpc"]}
+```
+
+WebSocket Client 连接 `ws://127.0.0.1:8080/api/v1/ws` 后，Server 会回显收到的文本或
+二进制帧。Agent 示例仍连接 `/api/v1/grpc`，完成 XXpsk3、IK 和加密业务流。
+
+首次 Client 运行会执行 XXpsk3 注册，保存身份后直接在当前 XX Session 发送三条消息，
+不会为了切换 IK 主动断开。身份默认保存在 `target/smalux-noise-agent/`；再次运行或断线
+重连时不再需要 Token，直接使用 IK。
 
 Server 数据默认保存在 `target/smalux-noise-server/`：
 
@@ -85,6 +130,7 @@ Server 数据默认保存在 `target/smalux-noise-server/`：
 noise/static-private.bin  # Server Noise 私钥
 noise/static-public.bin   # Server Noise 公钥
 agents/<agent>.key        # 已登记的 Agent Noise 公钥
+registrations/<agent>/    # pending/committed 注册事务及恢复字段
 ```
 
 ## 密钥生命周期与更换
@@ -94,15 +140,17 @@ agents/<agent>.key        # 已登记的 Agent Noise 公钥
 | 位置 | 文件或值 | 谁创建 | 用途 |
 | --- | --- | --- | --- |
 | Server | `noise/static-private.bin`、`noise/static-public.bin` | Server 第一次启动 | 长期 Noise 身份；XXpsk3 和 IK 都使用同一对密钥。 |
-| Server | 固定的 64 位十六进制示例 Token | 示例代码 | 32 字节注册 PSK；单次 Server 进程中只允许成功注册一次，不是 Server 长期密钥。 |
+| Server | 固定的 64 位十六进制示例 Token | 示例代码 | 32 字节注册 PSK；只允许绑定同一注册事务，不是 Server 长期密钥。 |
+| Server | `registrations/<agent>/` | `prepare` | 保存事务 ID、Token、Agent 名称、公钥和 committed 标记。 |
 | Server | `agents/<agent>.key` | XXpsk3 注册成功后 | Agent 公钥到 Agent 名称的授权记录；后续 IK 用它识别 Agent。 |
 | Agent | `noise/static-private.bin`、`noise/static-public.bin` | Agent 首次注册前 | Agent 长期 Noise 身份；私钥只保留在本机，握手中只证明其持有。 |
-| Agent | `server-public.bin`、`agent-id.txt` | 收到加密注册确认后 | 固定 Server 身份，并保存 Server 确认的 Agent 名称。 |
+| Agent | `server-public.bin`、`agent-id.txt`、`registration-id.bin` | 收到 prepared 后 | commit 前保存的 pending 身份材料。 |
+| Agent | `registration-committed` | 收到 committed 后 | 只有存在该标记，下次启动才允许直接使用 IK。 |
 
-Token 既参与 XXpsk3 的 `psk(3, ...)`，也被放在 Noise 加密的注册请求中供注册表消费。公钥文件写入
-成功后，注册表立即将它标记为已用；本次 Server 进程内再次注册会得到 `TokenAlreadyUsed`。为了方便
-反复手工运行，本示例在 Server 重启后会重新启用同一个固定 Token。生产代码绝不能这样做，应生成
-随机、短期、单次且可审计的 Token。已注册的 IK 连接不读取 Token。
+Token 既参与 XXpsk3 的 `psk(3, ...)`，也位于 Noise 加密的注册请求中。第一次 prepare 后，Token
+只允许相同 Agent 名称和公钥恢复同一事务；不同公钥重用会得到 `TokenAlreadyUsed`。Agent 在 commit
+前退出时，下次仍用原 Noise 身份和 Token 继续；Server 已 commit 但最终响应丢失时，也会返回同一事务。
+生产代码仍应生成随机、短期、单次且可审计的 Token。已完成注册的 IK 连接不读取 Token。
 
 不要只删除 Agent 目录中的一个文件。Client 发现 `noise/`、`server-public.bin`、`agent-id.txt` 只要
 缺少任意一项就会报 `incomplete Agent Noise identity directory`，避免混用新旧身份。要让该 Agent
@@ -119,7 +167,7 @@ Token 既参与 XXpsk3 的 `psk(3, ...)`，也被放在 Noise 加密的注册请
 
    ```powershell
    Remove-Item -Recurse -Force target/smalux-noise-agent
-   $env:SMALUX_EXAMPLE_ENROLLMENT_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   $env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    cargo run -p smalux-protocol --example noise_shared_port_client
    ```
 
@@ -165,9 +213,10 @@ server> quit
 
 ```text
 [server][rpc:1] opened; waiting for first handshake frame
-[server][rpc:1] Noise handshake completed mode=EnrollmentXxPsk3
-[server][rpc:1][xxpsk3] waiting for encrypted TokenRequest
-[server][rpc:1][xxpsk3] registered agent=example-agent
+[server][rpc:1] Noise handshake completed mode=RegistrationXxPsk3
+[server][rpc:1][xxpsk3] waiting for encrypted RegistrationRequest
+[server][rpc:1][xxpsk3] pending agent=example-agent resumed=false
+[server][rpc:1][xxpsk3] committed agent=example-agent
 [server][rpc:1] completed
 ```
 
@@ -194,27 +243,33 @@ $env:SMALUX_EXAMPLE_ENDPOINT = "https://agent.example.com"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
 
+未设置证书时，示例使用标准 `axum::serve` 同时接受普通 HTTP/1 和 gRPC h2c。设置证书时，
+同一个 Axum Router 交给 `tonic::transport::Server`，由 Tonic 配置 TLS 并同时接受 HTTP/1
+和 HTTP/2。这两个分支只替换监听与 TLS 层，不改变 REST、WebSocket、gRPC 路由或 Noise
+握手逻辑。
+
 如果 TLS 在 Cloudflare 或 Nginx 终止，Rust Server 可保持当前 h2c 配置，或按代理到源站
 的策略启用 TLS。无论 TLS 在哪里终止，首次仍由 Token PSK 认证，后续由保存的 Noise
 公钥使用 IK 认证。
 
 ## 按代码执行
 
-1. `client/main.rs::main` 先查找本地 `agent-id.txt`、Server 公钥和 Agent
-   静态密钥；完整时进入 IK，完全不存在时进入 `enroll`。
-2. `enroll` 把磁盘字节恢复为 `NoiseIdentity`，然后调用
-   `AgentProtocolClient::enroll`。该方法内部完成 XXpsk3、发送加密 `TokenRequest`，并返回
-   `EnrollmentOutcome { agent_id, server_public_key, session }`。
-3. Client 只有取得 `EnrollmentOutcome` 后才调用 `save_agent_identity`。协议层只返回状态，
-   不替调用方决定保存到文件、数据库还是 KMS。
+1. `client/main.rs::main` 只有读到完整身份和 `registration-committed` 才进入 IK；只有 Noise
+   身份或缺少 committed 标记时，使用原身份恢复首次注册。
+2. `register_agent` 调用 `AgentProtocolClient::prepare_registration` 完成 XXpsk3，发送
+   `RegistrationRequest` 并取得 `AgentPendingRegistration`。
+3. Client 调用 `save_pending_registration`，保存成功后才调用 `pending.commit()`；收到
+   `RegistrationCommitted` 后写入完成标记。协议层不替调用方决定具体存储。
 4. Server 的 `open_session` 把 Tonic 流交给
-   `ServerSessionAcceptor::accept_session`。返回的 `ServerPendingSession` 提供
-   `handshake_mode()`、`peer_public_key()` 与 `authorize()`，业务层据此执行注册或授权查询。
-5. XXpsk3 分支读取加密 `TokenMessage`，注册表写入 Agent 公钥成功后再发送加密
-   `TokenResponse`；失败则发送加密 `SecureError`，不会把 Token 放进外层 gRPC 状态。
-6. `run_ik_session` 调用 `AgentProtocolClient::connect`，Server 用握手得到的 Agent 公钥
-   查询注册表。成功后双方通过 `TonicNoiseSession::send/receive` 收发 `Messages`。
-7. `receive` 内部自动处理 Ping/Pong 与 responder rekey。主动端可调用 `request_rekey`；
+   `ServerSessionAcceptor::accept_incoming`，得到 `IncomingSession::Registration` 或
+   `IncomingSession::Authentication`。
+5. 注册分支依次调用 `receive_request`、注册表 `prepare`、协议 `prepare`、`wait_for_commit`、
+   注册表 `commit` 和协议 `complete`；失败返回加密 `SecureError`。
+6. 首次注册和后续 IK 最终都调用 `run_messages`。只有已有身份或断线重连时才由
+   `open_ik_session` 调用 `AgentProtocolClient::connect`；成功后双方通过
+   manual 模式使用 `TonicNoiseSession` 小方法，driver 模式使用 `SessionHandle/SessionEventReceiver`。
+7. `receive_event` 和 Driver 自动处理 Ping/Pong 与 rekey。手动循环也可定期调用
+   `maintenance_status/perform_maintenance`；
    静态密钥轮换则使用 `AgentKeySet`、`ServerKeyRing`、`PinnedServerKeys` 的方法和 snapshot。
 
 ## 超时与错误演示
@@ -227,7 +282,7 @@ Client 会在 XXpsk3 第三条消息阶段得到通用 Noise 认证失败：
 
 ```powershell
 $env:SMALUX_EXAMPLE_AGENT_DATA_DIR = "target/noise-bad-token-agent"
-$env:SMALUX_EXAMPLE_ENROLLMENT_TOKEN = "0000000000000000000000000000000000000000000000000000000000000000"
+$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0000000000000000000000000000000000000000000000000000000000000000"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
 
@@ -237,6 +292,6 @@ cargo run -p smalux-protocol --example noise_shared_port_client
 
 ## 示例边界
 
-该实现有意保持简单：注册 Token 没有 TTL、数据库事务或限流，私钥文件没有接入系统
-密钥库，在线换钥状态也没有写入真实存储。生产实现还应增加 Token 过期、审计、原子持久化、
+该实现有意保持简单：注册 Token 没有 TTL、数据库事务或限流，多个事务文件也不是数据库式原子提交，
+私钥文件没有接入系统密钥库，在线换钥状态也没有写入真实存储。生产实现还应增加 Token 过期、审计、原子持久化、
 密钥文件权限、重放/消息幂等策略和受认证的管理接口。

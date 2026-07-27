@@ -11,14 +11,23 @@
 - 加密业务消息、心跳和同步 rekey
 - Agent/Server 静态密钥轮换状态及可持久化快照
 - Tonic Client/Server 会话适配方法
+- 可组合的会话维护方法与可选 `SessionDriver`
+- 可断线恢复的四阶段首次注册状态机
+- 可拆分维护的 Job 定义、控制命令、固定 Task 配置和强类型结果
 
 `.proto` 是 wire 契约的唯一事实来源；业务 crate 不应自行维护重复的握手或消息结构。
+
+完整交互顺序、方法调用和持久化时点单独整理在
+[`PROTOCOL_FLOW.md`](PROTOCOL_FLOW.md)，阅读或接入协议时建议先看该文档。
 
 ## 目录结构
 
 ```text
 smalux-protocol/
-├── proto/smalux/agent/v1/  # 正式 wire 契约
+├── proto/smalux/agent/v1/
+│   ├── job/                # 调度、完整定义、命令、状态和事件
+│   ├── task/               # 固定 Task 配置与强类型 Snapshot
+│   └── *.proto             # 传输、错误和会话消息
 ├── src/noise/
 │   ├── client/             # Agent/initiator 的 XXpsk3 与 IK 握手状态机
 │   ├── server/             # Server/responder 的 XXpsk3 与 IK 握手状态机
@@ -47,6 +56,200 @@ smalux-protocol/
 - 数据库、本地文件、HSM/KMS 或集群密钥同步；
 - RPC 重试、业务消息持久化和幂等；
 - Agent 调度、采集任务或 Server 业务处理。
+
+## Job 与 Task 协议
+
+`.proto` 是 Job 配置和采集结果的唯一公开模型。Agent 不再维护可从 JSON 反序列化的
+第二套 `Job`、`TaskConfig` 或 Snapshot；本地持久化也应保存 `JobDefinition` 的 protobuf
+字节或由它无损转换出的数据库字段。
+
+### 固定调用流程
+
+```text
+Server 或本地存储生成 JobDefinition
+    -> Agent JobController::apply(JobCommand)
+    -> 校验 job_id、revision、trigger、options 和具体 TaskConfig
+    -> TaskFactory 创建固定 ReportingTask
+    -> Scheduler 使用 Server UUID 和私有 generation 执行
+    -> ReportingTask 返回 TaskResult
+    -> TaskReportSink 选择持久化或发送方式
+```
+
+`JobDefinition.revision` 是 Server 业务配置版本；Scheduler 的 generation 只用于隔离已经
+启动的旧执行，两者不能混用。`ReplaceAllJobs` 只替换远程所有权 Job，不应删除 Agent
+本地 Job。相同 `command_id` 必须返回缓存结果，尤其不能重复执行 `RunJobNow`。
+
+### JobController 方法
+
+| 方法 | 输入 | 行为 |
+| --- | --- | --- |
+| `new(scheduler, sink)` | Scheduler 与结果出口 | 创建不包含连接逻辑的控制器。 |
+| `apply(command)` | `JobCommand` | 幂等处理 ReplaceAll、Upsert、Delete 或 RunNow，返回结构化结果。 |
+| `clear()` | 无 | 删除全部远程所有权 Job，本地 Job 保持不变。 |
+
+调用方只需要提供 Scheduler 和报告出口，连接与落盘策略可以独立替换：
+
+```rust,ignore
+// SchedulerRuntime 拥有后台运行循环；Scheduler 是可克隆的控制句柄。
+let runtime = SchedulerRuntime::start(SchedulerConfig::default())?;
+
+// Sink 收到的是完整 TaskReport，可在这里写本地队列、数据库或 gRPC 长流。
+let sink: Arc<dyn TaskReportSink> = Arc::new(|report: TaskReport| async move {
+    save_or_send(report)
+        .await
+        .map_err(CallbackError::Transient)
+});
+
+// JobController 只管理通过自身安装的远程 Job。
+let controller = JobController::new(runtime.scheduler(), sink);
+
+// 网络层解码出 JobCommand 后直接交给控制器；返回值应原样关联到 command_id 上报。
+let result = controller.apply(command).await;
+send_command_result(result).await?;
+```
+
+一次 `apply` 的内部顺序如下：
+
+```text
+1. 校验 16 字节 command_id。
+2. 命中幂等缓存时直接返回首次结果。
+3. 锁定远程目录状态，检查 catalog_revision 和 expected_revision。
+4. 把 Proto trigger/options/task 编译为 Scheduler 强类型。
+5. 安装、更新、删除或立即触发 Scheduler Job。
+6. Scheduler 成功后才更新本地 revision/generation 索引。
+7. 缓存 APPLIED 或 REJECTED 结果并返回调用方。
+```
+
+`UpsertJob` 和 `DeleteJob` 的单 Job Scheduler 修改是原子的。`ReplaceAllJobs` 会先校验全部
+定义，再逐个修改 Scheduler，但当前不是跨多个 Job 的数据库式事务；如果运行中途发生
+Scheduler 故障，连接层应读取返回错误并用新的完整目录重新对账，不能假定整批自动回滚。
+
+连接断开不会自动删除 Scheduler 中已经安装的 Job，因此短时网络波动期间仍会继续采集。
+连接层可以把 `TaskReportSink` 实现为本地缓冲，再在会话恢复后上报；缓冲上限、过期策略
+和重连退避不属于协议 crate 或 Scheduler 的职责。
+
+## 扩展固定 Task 与 Plus 模块
+
+新增采集能力或 `plus` 功能时，继续使用“固定 Proto 类型映射到固定 Rust 实现”的方式。
+Server 只能选择 Agent 已编译并声明支持的能力，不能通过 Proto 指定任意 Rust 类型、命令、
+动态库或可执行代码。
+
+推荐扩展链路：
+
+```text
+Server JobDefinition
+    -> TaskDefinition.oneof
+    -> Agent TaskFactory
+        -> 内置 Collect Task
+        -> PlusTaskFactory
+            -> RusticBackupTask
+            -> 其他固定 Plus Task
+    -> ReportingTask::run
+    -> TaskResult.oneof
+    -> TaskReportSink
+```
+
+### Proto 扩展步骤
+
+以新增 Rustic 备份能力为例：
+
+1. 在 `proto/smalux/agent/v1/task/` 下按领域维护独立 `.proto` 文件；
+2. 定义该 Task 的完整配置消息和强类型结果消息；
+3. 在 `TaskDefinition.oneof task` 中分配新的配置字段；
+4. 在 `TaskResult.oneof result` 中分配对应的结果字段；
+5. 在 Agent 工厂中把该 Proto 分支注册到唯一的本地 Task 实现；
+6. 为配置解析、执行结果、协议 round-trip 和不支持能力补充测试。
+
+已发布的 Proto 字段编号不能改变或分配给其他含义。功能删除后应使用 `reserved` 保留原编号
+和字段名，避免旧消息被新版本错误解释。配置消息应只包含执行业务所需的稳定参数，不复制
+Scheduler 已经提供的触发、超时、并发、队列和重试字段。
+
+概念上的配置与结果如下：
+
+```proto
+message RusticBackupTaskConfig {
+  string repository_id = 1;
+  string source_id = 2;
+}
+
+message RusticBackupResult {
+  bool succeeded = 1;
+  string snapshot_id = 2;
+}
+```
+
+`repository_id` 和 `source_id` 是 Agent 本地配置或安全存储的引用，不是仓库密码、访问 Token、
+完整 shell 命令或任意路径。Agent 根据引用读取凭据并执行本地授权检查，敏感信息不得进入
+Job Proto、TaskReport 或普通日志。
+
+### 工厂职责
+
+顶层 `TaskFactory` 只做稳定的类型分发，不直接实现 Plus 业务：
+
+```text
+Task::Cpu(config)          -> 内置 CpuTask
+Task::Process(config)      -> 内置 ProcessTask
+Task::RusticBackup(config) -> PlusTaskFactory -> RusticBackupTask
+```
+
+具体 Plus 工厂负责：
+
+- 校验 Plus 配置和本地资源引用；
+- 注入仓库、凭据存储、文件系统策略等运行依赖；
+- 创建实现 `ReportingTask` 的固定 Task；
+- 把领域结果包装为对应的 `TaskResult` 分支。
+
+Scheduler、`JobController` 和 `TaskReportSink` 不应理解 Rustic 或其他 Plus 的业务细节。这样
+新增 Plus 能力时，变化只集中在 Proto、Plus 实现和工厂注册位置。
+
+### 能力协商
+
+不同 Agent 版本或安装类型可能不包含相同 Plus 模块。Agent 注册或建立会话后应上报能力，
+至少包括协议版本、支持的 Task 类型、Task 配置版本和启用的 Plus 功能。Server 只向声明
+支持该能力的 Agent 下发 Job。
+
+如果 Agent 收到未编译、未启用或版本不支持的 Task，必须返回稳定的结构化错误，例如
+`UNSUPPORTED_TASK`，不能静默忽略、猜测配置或退化为其他 Task。错误消息可用于诊断，
+Server 的恢复逻辑应依据错误码和能力列表，而不是匹配错误文本。
+
+### 只读采集与有副作用任务
+
+CPU、内存、网络等采集通常是只读操作；备份、更新、脚本和修复操作会产生外部副作用。
+有副作用的 Plus Task 在接入统一 Job 模型前，必须额外确定：
+
+- 是否允许 Server 远程创建和 `RunNow`；
+- Agent 本地授权范围以及允许访问的目录、仓库和凭据；
+- 重复执行是否安全，使用什么业务幂等键；
+- Agent 重启或断联后是否继续执行，以及最长离线执行时间；
+- 最大运行时间、并发限制和取消能否真正终止底层操作；
+- 运行日志、安全审计、结果保留和失败恢复方式。
+
+`JobController` 当前的 `command_id` 缓存是进程内有限窗口，适合防止网络重发导致的重复
+`RunNow`，但不能替代有副作用任务的持久化幂等。备份等任务需要把业务运行 ID、执行状态
+和最终结果保存在数据库或本地文件中，Agent 重启后仍应能够识别已经开始或完成的操作。
+
+### 推荐模块边界
+
+```text
+smalux-protocol
+    稳定的配置、命令、状态、结果和能力契约
+
+smalux-agent/tasks/collect
+    内置只读采集 Task
+
+smalux-plus-rustic
+    Rustic 领域配置校验、执行逻辑和结果构造
+
+smalux-agent/task_factory
+    将协议 Task 分支映射到内置或 Plus 实现
+
+smalux-agent/job_control
+    处理命令幂等、业务版本、所有权和 Scheduler 装配
+```
+
+协议 crate 不访问数据库、文件或 KMS；Plus crate 不处理 gRPC 会话；`JobController` 不实现
+具体任务。持久化、连接和业务实现通过明确的方法与 trait 组合，避免后期扩展反向耦合到
+Scheduler 或传输层。
 
 ## 使用层级
 
@@ -90,7 +293,7 @@ ServerSessionAcceptor
 
 | 消息 | 用途 |
 | --- | --- |
-| `TokenMessage` | XXpsk3 后提交一次性 Token 和返回 `agent_id`。 |
+| `RegistrationMessage` | XXpsk3 后执行 request、prepared、commit、committed 四阶段注册。 |
 | `Messages` | 上报、命令、应答等业务数据。 |
 | `SecureError` | 已加密的 Token、授权或业务错误。 |
 | `SessionControl` | Ping/Pong 和同步 rekey。 |
@@ -140,29 +343,33 @@ ServerSessionAcceptor
 | `new(endpoint)` | 创建 Client 配置。 | `http://` 使用 h2c；`https://` 使用系统根证书验证 TLS。 |
 | `set_handshake_timeout(duration)` | 修改连接和每一步握手超时。 | 默认 5 秒，只限制建连/握手，不限制长期业务流。 |
 | `set_grpc_prefix(prefix)` | 设置 Axum/Nginx 下的统一 gRPC 前缀。 | 示例使用 `/api/v1/grpc`。 |
-| `enroll(identity, psk, token, agent_name)` | 执行 XXpsk3、发送加密 Token 请求。 | Client 不需要预置 Server 公钥。 |
+| `prepare_registration(identity, psk, token, agent_name)` | 执行 XXpsk3 并等待 Server 保存 pending 注册。 | 返回后应先持久化结果，再调用 `commit()`。 |
+| `register_agent(identity, psk, token, agent_name)` | 依次执行 prepare 和 commit 的便捷方法。 | 适合测试；生产持久化应使用分步方法。 |
 | `connect(identity, server_key)` | 使用固定 Server 公钥执行 IK。 | 成功后返回可持续使用的 `TonicNoiseSession`。 |
 | `connect_with_candidates(identity, candidates)` | 依次尝试多把 Server 公钥。 | Server 换钥期间通常传 `PinnedServerKeys::connection_candidates()`。 |
 
-`enroll` 返回 `EnrollmentOutcome`：
+`prepare_registration` 返回 `AgentPendingRegistration`，其中的 `agent_identity`、
+`server_public_key`、`agent_id` 和 `registration_id` 都必须先持久化。随后调用 `commit()`，
+成功后得到 `AgentRegistration`：
 
 | 字段 | 含义 | 是否需要持久化 |
 | --- | --- | --- |
 | `agent_id` | Server 确认的业务身份。 | 是。 |
 | `agent_identity` | 本次注册使用的 Agent 长期身份。 | 是，尤其是私钥。 |
 | `server_public_key` | XXpsk3 认证后学到的 Server 公钥。 | 是，后续 IK 必需。 |
-| `session` | 已建立的 XXpsk3 加密会话。 | 否，只在当前进程和连接内有效。 |
+| `registration_id` | Server 分配的 16 字节幂等注册事务 ID。 | 是，用于恢复和审计。 |
+| `session` | 已完成注册授权的 XXpsk3 加密会话，可立即承载业务。 | 否，只在当前进程和连接内有效。 |
 
 ### 首次注册调用流程
 
-```rust,no_run
+```rust,ignore
 // 引入长期 Noise 身份和封装完整 Tonic/Noise 流程的高层 Client。
 use smalux_protocol::{
     noise::NoiseIdentity,
     tonic_transport::AgentProtocolClient,
 };
 
-# async fn enroll() -> Result<(), Box<dyn std::error::Error>> {
+# async fn register_agent() -> Result<(), Box<dyn std::error::Error>> {
 // 首次运行生成 Agent 长期静态身份；生产代码应立即加密持久化私钥。
 let identity = NoiseIdentity::generate()?;
 // XXpsk3 要求恰好 32 字节 PSK；示例常由一次性 Token 解码得到。
@@ -173,9 +380,9 @@ let mut client = AgentProtocolClient::new("https://agent.example.com");
 // Server 使用 Axum nest 或反向代理前缀时，Client 必须配置同一前缀。
 client.set_grpc_prefix("/api/v1/grpc");
 
-// enroll 内部完成 XXpsk3 三消息握手和加密 TokenRequest/TokenResponse。
-let enrolled = client
-    .enroll(
+// prepare_registration 完成 XXpsk3、发送 RegistrationRequest，并等待 RegistrationPrepared。
+let pending = client
+    .prepare_registration(
         // 方法取得身份所有权，并在成功结果中通过 agent_identity 交还。
         identity,
         // PSK 只参与首次握手，不用于后续 IK。
@@ -185,14 +392,22 @@ let enrolled = client
         // Agent 名称是业务注册标识，不代替静态公钥认证。
         "agent-001".to_owned(),
     )
-    // 只有 await 成功才表示收到了 Server 的加密注册确认。
+    // 成功只表示 Server 已保存 pending，还不能使用 IK。
     .await?;
 
-// 这里由调用方开启数据库事务并保存：
-// enrolled.agent_id
-// enrolled.agent_identity.export_private_key().as_bytes()
-// enrolled.agent_identity.public_key().as_bytes()
-// enrolled.server_public_key.as_bytes()
+// 这里由调用方开启数据库事务并保存 pending 中的四项长期状态：
+// pending.agent_id
+// pending.registration_id
+// pending.agent_identity（含私钥）
+// pending.server_public_key
+save_pending_registration(&pending)?;
+
+// 保存成功后再发送 RegistrationCommit，并等待 Server 的 RegistrationCommitted。
+let mut registration = pending.commit().await?;
+mark_registration_committed(registration.registration_id)?;
+
+// 持久化成功后直接复用 registration.session 发送业务消息；不需要立即重连 IK。
+// registration.session.send(message).await?;
 # Ok(())
 # }
 ```
@@ -202,15 +417,17 @@ let enrolled = client
 ```text
 1. Agent 从安全渠道取得一次性 Token/PSK。
 2. Agent 生成或恢复自己的 NoiseIdentity。
-3. AgentProtocolClient::enroll 执行 XXpsk3 三消息握手。
+3. `prepare_registration` 执行 XXpsk3 三消息握手。
 4. 双方确认持有相同 PSK，Client 得到已认证的 Server 公钥。
-5. Client 在 Noise 密文内发送 TokenRequest。
-6. Server 保存 Agent 公钥并返回加密 TokenResponse。
-7. Client 收到 EnrollmentOutcome 后才持久化 Server 公钥和 agent_id。
-8. 当前注册会话可以关闭；后续连接统一使用 IK。
+5. Client 在 Noise 密文内发送 `RegistrationRequest`。
+6. Server 保存 pending 事务并返回 `RegistrationPrepared`。
+7. Client 持久化身份、Server 公钥、`agent_id` 和 `registration_id`。
+8. Client 发送 `RegistrationCommit`；Server 激活 Agent、消费 Token 并返回 `RegistrationCommitted`。
+9. Client 标记本地注册完成，当前 XX Session 直接进入业务循环。
+10. 只有当前流断开、进程重启或网络切换后，下一条连接才使用 IK。
 ```
 
-如果 Server 返回加密 `SecureError`，`enroll` 会返回
+如果 Server 返回加密 `SecureError`，`register_agent` 会返回
 `TransportError::RemoteSecure(code, message)`。此时不得保存 Server 公钥或把 Agent 标记为注册成功。
 
 ### 后续 IK 连接
@@ -285,50 +502,49 @@ let keyring = ServerKeyRing::new(identity);
 | --- | --- |
 | `default()` | 创建默认 5 秒握手超时的接收器。 |
 | `new(handshake_timeout)` | 使用自定义握手超时。 |
-| `accept_session(inbound, sender, keyring, enrollment_psk)` | 读取首帧，选择 XXpsk3/IK 和对应 Server 私钥，完成握手。 |
+| `accept_session(inbound, sender, keyring, registration_psk)` | 读取首帧，选择 XXpsk3/IK 和对应 Server 私钥，完成握手。 |
+| `accept_incoming(inbound, sender, keyring, registration_psk)` | 完成同一握手并返回强类型注册或认证阶段。 |
 
 `accept_session` 返回 `ServerPendingSession`，此时 Noise 已认证，但业务授权还没有自动完成：
 
 | 方法 | 作用 | 使用时机 |
 | --- | --- | --- |
-| `handshake_mode()` | 返回 `EnrollmentXxPsk3` 或 `AuthenticatedIk`。 | 决定进入注册还是已注册会话。 |
+| `handshake_mode()` | 返回 `RegistrationXxPsk3` 或 `AuthenticatedIk`。 | 决定执行首次注册还是已注册授权。 |
 | `peer_public_key()` | 返回握手认证得到的 Agent 静态公钥。 | 注册时写入；IK 时查询授权表。 |
 | `authorize()` | 消费 pending 状态并返回 `TonicNoiseSession`。 | 业务层确认允许继续处理时。 |
 | `reject(secure_error)` | 在已建立的 Noise 会话中发送加密错误。 | Token、吊销、租户或业务授权失败时。 |
 
-推荐的 Server 处理骨架：
+推荐使用强类型 Server 处理骨架；原始 `accept_session` 和 `ServerPendingSession` 仍保留：
 
 ```rust,ignore
-// accept_session 负责密码学握手，但故意不替业务层决定 Agent 是否有权限。
-let pending = ServerSessionAcceptor::default()
-    // inbound/sender 来自同一个 OpenSession RPC；PSK 仅在 XXpsk3 分支使用。
-    .accept_session(inbound, sender, &keyring, &enrollment_psk)
+let incoming = ServerSessionAcceptor::default()
+    .accept_incoming(inbound, sender, &keyring, &registration_psk)
     .await?;
 
-// 握手模式决定这是首次注册还是已注册 IK。
-let mode = pending.handshake_mode();
-// 该公钥来自 Noise 握手认证，不能用请求 body 中自报的公钥替代。
-let agent_key = pending.peer_public_key();
-
-match mode {
-    HandshakeMode::EnrollmentXxPsk3 => {
-        // XXpsk3 只证明双方持有 PSK；下一步还要验证加密 TokenRequest。
-        let mut session = pending.authorize();
-        // receive() 读取加密 TokenRequest。
-        // 数据库事务成功保存 agent_key 后，send() 返回 TokenResponse。
+let (agent_id, session) = match incoming {
+    IncomingSession::Registration(mut registration) => {
+        let agent_key = registration.peer_public_key();
+        let request = registration.receive_request().await?;
+        // 数据库方法必须对 token + agent_key 的重复请求返回同一事务。
+        let prepared = registry.prepare(request, agent_key)?;
+        registration.prepare(prepared.id, prepared.agent_id.clone()).await?;
+        registration.wait_for_commit(prepared.id, commit_timeout).await?;
+        // 先提交数据库并消费 Token，再发送最终成功响应。
+        registry.commit(prepared.id, agent_key)?;
+        let session = registration.complete(prepared.id).await?;
+        (prepared.agent_id, session)
     }
-    HandshakeMode::AuthenticatedIk => {
-        // Server 用握手得到的 Agent 公钥查询注册表、吊销状态和租户授权。
-        if !agent_registry.authorize(agent_key) {
-            // Noise 已建立，拒绝原因应作为加密 SecureError 返回。
-            pending.reject(not_authorized_error).await?;
+    IncomingSession::Authentication(authentication) => {
+        let Some(agent_id) = registry.authorize(authentication.peer_public_key()) else {
+            authentication.reject(not_authorized_error).await?;
             return Ok(());
-        }
-        // 业务授权成功后才消费 pending，取得可持续收发的会话。
-        let mut session = pending.authorize();
-        // 循环 receive()/send() 处理业务消息。
+        };
+        (agent_id, authentication.authorize())
     }
-}
+};
+
+// 注册成功的 XX 和已授权 IK 在这里汇合，共用同一业务循环。
+messages_loop(&mut session, &agent_id).await?;
 ```
 
 握手失败时还没有安全的 Noise 会话，Server 可以调用
@@ -338,8 +554,8 @@ match mode {
 
 ### `TonicNoiseSession`
 
-该类型必须由一个任务顺序持有；不要把它拆给多个并发 reader/writer。若业务需要并发，应在会话外
-使用 channel 汇聚消息，再由单一 actor 调用 `send` 和 `receive`。
+该类型必须由一个任务顺序持有；不要把它拆给多个并发 reader/writer。业务需要并发时可以直接使用
+下文的 `SessionDriver`，也可以自行用 channel 汇聚后调用这些小方法。
 
 | 方法 | 哪端调用 | 作用 |
 | --- | --- | --- |
@@ -349,8 +565,14 @@ match mode {
 | `should_ping()` | 两端 | 判断距离上次发送是否超过心跳间隔。 |
 | `heartbeat_expired()` | 两端 | 判断距离上次接收是否超过失联上限。 |
 | `should_rekey()` | 两端 | 判断自动 rekey 的时间或帧数条件是否满足。 |
+| `maintenance_status()` | 两端 | 无副作用查询心跳超时、Ping 和 rekey 是否到期。 |
+| `perform_maintenance()` | 两端 | 执行一次到期的 Ping 或 initiator rekey。 |
 | `send(message)` | 两端 | Prost 编码、Noise 加密并发送一条 `SecureMessage`。 |
+| `send_task_report(report)` | Agent | 发送强类型采集结果。 |
+| `send_job_command(command)` | Server | 发送强类型 Job 命令。 |
+| `send_job_command_result(result)` | Agent | 发送强类型 Job 处理结果。 |
 | `receive()` | 两端 | 等待下一条业务消息；内部处理 Ping/Pong 和 responder rekey。 |
+| `receive_event()` | 两端 | 返回 `SessionEvent`，无需手动匹配 `SecureMessage.oneof`。 |
 | `ping(nonce)` | 两端 | 手动发送加密 Ping；通常无需直接调用。 |
 | `request_rekey()` | Agent/initiator | 发起同步 rekey，等待 Ack 后切换双向 cipher state。 |
 | `require_rekey()` | Server/responder | 通知 Agent 应发起 rekey，本身不立即切换密钥。 |
@@ -371,8 +593,21 @@ match mode {
 | `Ok(Some(message))` | 收到一条非会话控制的加密消息。 |
 | `Ok(None)` | 对端正常关闭 gRPC 流。 |
 | `Err(HeartbeatTimeout)` | 超过心跳失联上限。 |
-| `Err(RekeyRequired)` | Server 要求 Agent 调用 `request_rekey()`。 |
 | 其他 `Err` | gRPC、Noise、帧格式或远端协议错误。 |
+
+自动模式下 `RekeyRequired` 会在 `receive()` 或 Driver 内部触发 rekey，不再作为普通业务错误返回。
+rekey 等待 Ack 时提前到达的业务消息会被缓存，并在换钥完成后按原顺序交付。
+
+### `SessionDriver`
+
+`SessionDriver::new(session, config)` 返回尚未启动的 Driver、可克隆 `SessionHandle` 和单消费者
+`SessionEventReceiver`；调用方可自行 spawn `driver.run()`。`SessionDriver::spawn` 是对应的便捷入口，
+返回 `RunningSession { handle, events, task }`。
+
+`SessionHandle` 提供 `send`、`send_messages`、`send_task_report`、`send_job_command`、
+`send_job_command_result`、`ping`、`request_rekey`、`require_rekey`、四个静态密钥轮换发送方法和
+幂等 `shutdown`。所有请求经过有界队列，真正的 Prost 编码、Noise 加密、rekey 和 nonce 推进只发生
+在 Driver task 中。事件队列同样有界，消费过慢会形成反压而不是静默丢包。
 
 手动 rekey 流程：
 
@@ -415,7 +650,7 @@ Tonic 适配层已经调用这些方法。自定义 QUIC、WebSocket 或其他�
 | 字段 | 含义 |
 | --- | --- |
 | `session` | 底层 `SecureSession`。 |
-| `mode` | `EnrollmentXxPsk3` 或 `AuthenticatedIk`。 |
+| `mode` | `RegistrationXxPsk3` 或 `AuthenticatedIk`。 |
 | `remote_static_key` | 握手认证得到的对端静态公钥。 |
 | `responder_key_id` | 本次实际使用的 Server 公钥标识。 |
 
@@ -590,7 +825,7 @@ Noise 位于 gRPC 消息内部，因此外层 TLS 可以由 Rust、Nginx 或 Clo
 独立示例位于 `examples/noise_shared_port/`。Server 与 Client 均直接使用正式协议层方法，
 `tests/official_protocol.rs` 另外做真实 gRPC 端到端验证。示例演示：
 
-- Axum HTTP 与 Tonic gRPC 共用端口；
+- Axum REST、WebSocket 与 Tonic gRPC 共用端口；
 - Noise XXpsk3 首次注册：Client 只持有一次性 Token，不预置 Server 公钥；
 - Noise IK 恢复已登记 Agent 的双向加密流；
 - 可选外层 TLS，以及 Cloudflare/Nginx 终止 TLS 时的职责边界。

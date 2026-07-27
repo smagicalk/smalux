@@ -3,13 +3,15 @@ use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 use smalux_protocol::{
     agent::v1::{
         HealthRequest, HealthResponse, Messages, MessagesResponse, ProtocolErrorCode,
-        ProtocolFrame, SecureError, SecureErrorCode, SecureMessage, TokenMessage, TokenResponse,
+        ProtocolFrame, SecureError, SecureErrorCode, SecureMessage,
         agent_transport_client::AgentTransportClient,
         agent_transport_server::{AgentTransport, AgentTransportServer},
-        messages, messages_response, protocol_frame, secure_message, token_message,
+        messages, messages_request, messages_response, protocol_frame, secure_message,
     },
-    noise::{ClientXxHandshake, HandshakeMode, NoiseIdentity, ServerKeyRing},
-    tonic_transport::{AgentProtocolClient, ServerSessionAcceptor, TransportError},
+    noise::{ClientXxHandshake, NoiseIdentity, ServerKeyRing},
+    tonic_transport::{
+        AgentProtocolClient, IncomingSession, ServerSessionAcceptor, TransportError,
+    },
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::{
@@ -17,6 +19,74 @@ use tokio_stream::{
     wrappers::{ReceiverStream, TcpListenerStream},
 };
 use tonic::{Request, Response, Status, Streaming, transport::Server};
+
+#[test]
+fn registration_message_has_explicit_prepare_commit_and_completed_stages() {
+    use smalux_protocol::agent::v1::{
+        RegistrationCommit, RegistrationCommitted, RegistrationMessage, RegistrationPrepared,
+        registration_message,
+    };
+
+    let transaction_id = vec![7; 16];
+    let prepared = RegistrationMessage {
+        body: Some(registration_message::Body::Prepared(RegistrationPrepared {
+            registration_id: transaction_id.clone(),
+            agent_id: "agent-1".to_owned(),
+        })),
+    };
+    let commit = RegistrationMessage {
+        body: Some(registration_message::Body::Commit(RegistrationCommit {
+            registration_id: transaction_id.clone(),
+        })),
+    };
+    let committed = RegistrationMessage {
+        body: Some(registration_message::Body::Committed(
+            RegistrationCommitted {
+                registration_id: transaction_id,
+            },
+        )),
+    };
+
+    assert!(matches!(
+        prepared.body,
+        Some(registration_message::Body::Prepared(_))
+    ));
+    assert!(matches!(
+        commit.body,
+        Some(registration_message::Body::Commit(_))
+    ));
+    assert!(matches!(
+        committed.body,
+        Some(registration_message::Body::Committed(_))
+    ));
+}
+
+#[test]
+fn secure_messages_are_classified_as_typed_session_events() {
+    use smalux_protocol::{
+        agent::v1::{TaskReport, secure_message},
+        tonic_transport::SessionEvent,
+    };
+
+    let report = TaskReport {
+        job_id: vec![1; 16],
+        job_revision: 7,
+        run_id: vec![2; 16],
+        attempt: 1,
+        scheduled_at: None,
+        started_at: None,
+        result: None,
+    };
+    let event = SessionEvent::try_from(SecureMessage {
+        body: Some(secure_message::Body::TaskReport(Box::new(report))),
+    })
+    .unwrap();
+
+    let SessionEvent::TaskReport(report) = event else {
+        panic!("expected a typed TaskReport event");
+    };
+    assert_eq!(report.job_revision, 7);
+}
 
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<ProtocolFrame, Status>> + Send + 'static>>;
 
@@ -71,52 +141,37 @@ impl TestService {
         inbound: Streaming<ProtocolFrame>,
         sender: mpsc::Sender<Result<ProtocolFrame, Status>>,
     ) -> Result<(), smalux_protocol::tonic_transport::TransportError> {
-        let pending = ServerSessionAcceptor::new(self.handshake_timeout)
-            .accept_session(inbound, sender, &self.keyring, &self.psk)
+        let incoming = ServerSessionAcceptor::new(self.handshake_timeout)
+            .accept_incoming(inbound, sender, &self.keyring, &self.psk)
             .await?;
-        let peer_key = pending.peer_public_key();
-        let mode = pending.handshake_mode();
-        let mut session = pending.authorize();
-        match mode {
-            HandshakeMode::EnrollmentXxPsk3 => {
-                let message = session
-                    .receive()
-                    .await?
-                    .ok_or(smalux_protocol::tonic_transport::TransportError::Closed)?;
-                let Some(secure_message::Body::TokenMessage(TokenMessage {
-                    body: Some(token_message::Body::Request(request)),
-                })) = message.body
-                else {
-                    return Err(smalux_protocol::tonic_transport::TransportError::Protocol(
-                        "expected TokenRequest".to_owned(),
-                    ));
-                };
+        let mut session = match incoming {
+            IncomingSession::Registration(mut registration) => {
+                let peer_key = registration.peer_public_key();
+                let request = registration.receive_request().await?;
                 if request.token != "test-token" {
-                    session
-                        .send(SecureMessage {
-                            body: Some(secure_message::Body::Error(SecureError {
-                                code: SecureErrorCode::InvalidToken as i32,
-                                message: "invalid token".to_owned(),
-                            })),
+                    registration
+                        .reject(SecureError {
+                            code: SecureErrorCode::InvalidToken as i32,
+                            message: "invalid token".to_owned(),
                         })
                         .await?;
                     return Ok(());
                 }
+                let registration_id = [3; 16];
+                registration
+                    .prepare(registration_id, request.agent_name.clone())
+                    .await?;
+                registration
+                    .wait_for_commit(registration_id, self.handshake_timeout)
+                    .await?;
                 self.agents
                     .lock()
                     .await
                     .insert(peer_key.as_bytes().to_vec(), request.agent_name.clone());
-                session
-                    .send(SecureMessage {
-                        body: Some(secure_message::Body::TokenMessage(TokenMessage {
-                            body: Some(token_message::Body::Response(TokenResponse {
-                                agent_id: request.agent_name,
-                            })),
-                        })),
-                    })
-                    .await?;
+                registration.complete(registration_id).await?
             }
-            HandshakeMode::AuthenticatedIk => {
+            IncomingSession::Authentication(authentication) => {
+                let peer_key = authentication.peer_public_key();
                 if !self
                     .agents
                     .lock()
@@ -127,40 +182,66 @@ impl TestService {
                         "Agent is not registered".to_owned(),
                     ));
                 }
-                let message = session
-                    .receive()
-                    .await?
-                    .ok_or(smalux_protocol::tonic_transport::TransportError::Closed)?;
-                let Some(secure_message::Body::Messages(Messages {
-                    body: Some(messages::Body::Request(request)),
-                })) = message.body
-                else {
-                    return Err(smalux_protocol::tonic_transport::TransportError::Protocol(
-                        "expected MessagesRequest".to_owned(),
-                    ));
-                };
+                let mut session = authentication.authorize();
+                // 故意在 Agent 发起 rekey 前插入业务帧，验证等待 Ack 时会缓存而不是报错。
                 session
                     .send(SecureMessage {
                         body: Some(secure_message::Body::Messages(Messages {
                             body: Some(messages::Body::Response(MessagesResponse {
-                                acknowledged_sequence: request.sequence,
-                                payload: request.payload.map(|payload| match payload {
-                                    smalux_protocol::agent::v1::messages_request::Payload::BytesPayload(value) => messages_response::Payload::BytesPayload(value),
-                                    smalux_protocol::agent::v1::messages_request::Payload::StringPayload(value) => messages_response::Payload::StringPayload(value),
-                                    smalux_protocol::agent::v1::messages_request::Payload::EchoRequest(value) => messages_response::Payload::EchoResponse(smalux_protocol::agent::v1::EchoResponse { payload: value.payload }),
-                                }),
+                                acknowledged_sequence: 999,
+                                payload: Some(messages_response::Payload::StringPayload(
+                                    "queued-before-rekey".to_owned(),
+                                )),
                             })),
                         })),
                     })
                     .await?;
+                session
             }
-        }
+        };
+        // 注册成功的 XX 与已登记的 IK 都已完成授权，随后共享同一业务消息阶段。
+        let message = session
+            .receive()
+            .await?
+            .ok_or(smalux_protocol::tonic_transport::TransportError::Closed)?;
+        let Some(secure_message::Body::Messages(Messages {
+            body: Some(messages::Body::Request(request)),
+        })) = message.body
+        else {
+            return Err(smalux_protocol::tonic_transport::TransportError::Protocol(
+                "expected MessagesRequest".to_owned(),
+            ));
+        };
+        session
+            .send(SecureMessage {
+                body: Some(secure_message::Body::Messages(Messages {
+                    body: Some(messages::Body::Response(MessagesResponse {
+                        acknowledged_sequence: request.sequence,
+                        payload: request.payload.map(|payload| match payload {
+                            messages_request::Payload::BytesPayload(value) => {
+                                messages_response::Payload::BytesPayload(value)
+                            }
+                            messages_request::Payload::StringPayload(value) => {
+                                messages_response::Payload::StringPayload(value)
+                            }
+                            messages_request::Payload::EchoRequest(value) => {
+                                messages_response::Payload::EchoResponse(
+                                    smalux_protocol::agent::v1::EchoResponse {
+                                        payload: value.payload,
+                                    },
+                                )
+                            }
+                        }),
+                    })),
+                })),
+            })
+            .await?;
         Ok(())
     }
 }
 
 #[tokio::test]
-async fn official_protocol_enrolls_then_opens_an_ik_session() {
+async fn registration_session_handles_business_then_ik_reconnects() {
     let server_identity = NoiseIdentity::generate().unwrap();
     let service = TestService {
         keyring: Arc::new(ServerKeyRing::new(server_identity)),
@@ -183,8 +264,8 @@ async fn official_protocol_enrolls_then_opens_an_ik_session() {
 
     let client = AgentProtocolClient::new(format!("http://{address}"));
     let identity = NoiseIdentity::generate().unwrap();
-    let enrolled = client
-        .enroll(
+    let mut registration = client
+        .register_agent(
             identity.clone(),
             &[9; 32],
             "test-token".to_owned(),
@@ -192,16 +273,50 @@ async fn official_protocol_enrolls_then_opens_an_ik_session() {
         )
         .await
         .unwrap();
-    assert_eq!(enrolled.agent_id, "agent-1");
-    drop(enrolled.session);
+    assert_eq!(registration.agent_id, "agent-1");
+
+    // 首次注册确认后不应强制断开；同一条 XXpsk3 Session 必须能直接进入业务阶段。
+    registration
+        .session
+        .send(SecureMessage {
+            body: Some(secure_message::Body::Messages(Messages {
+                body: Some(messages::Body::Request(
+                    smalux_protocol::agent::v1::MessagesRequest {
+                        sequence: 1,
+                        payload: Some(messages_request::Payload::StringPayload(
+                            "first-registration-report".to_owned(),
+                        )),
+                    },
+                )),
+            })),
+        })
+        .await
+        .unwrap();
+    let first_response = registration.session.receive().await.unwrap().unwrap();
+    let Some(secure_message::Body::Messages(Messages {
+        body: Some(messages::Body::Response(first_response)),
+    })) = first_response.body
+    else {
+        panic!("expected MessagesResponse on registration session");
+    };
+    assert_eq!(first_response.acknowledged_sequence, 1);
+    drop(registration.session);
 
     let mut session = client
-        .connect(&identity, enrolled.server_public_key)
+        .connect(&identity, registration.server_public_key)
         .await
         .unwrap();
     // rekey 不新建 gRPC 流；双方同步更新 Noise cipher state 后继续复用当前会话。
     assert_eq!(session.request_rekey().await.unwrap(), 1);
     assert_eq!(session.generation(), 1);
+    let queued = session.receive().await.unwrap().unwrap();
+    let Some(secure_message::Body::Messages(Messages {
+        body: Some(messages::Body::Response(queued)),
+    })) = queued.body
+    else {
+        panic!("expected the business message buffered during rekey");
+    };
+    assert_eq!(queued.acknowledged_sequence, 999);
     session
         .send(SecureMessage {
             body: Some(secure_message::Body::Messages(Messages {
@@ -231,7 +346,73 @@ async fn official_protocol_enrolls_then_opens_an_ik_session() {
 }
 
 #[tokio::test]
-async fn enrollment_returns_the_encrypted_token_error() {
+async fn session_driver_sends_and_receives_typed_events() {
+    use smalux_protocol::tonic_transport::{SessionDriver, SessionDriverConfig, SessionEvent};
+
+    let service = TestService {
+        keyring: Arc::new(ServerKeyRing::new(NoiseIdentity::generate().unwrap())),
+        psk: [9; 32],
+        agents: Arc::new(Mutex::new(HashMap::new())),
+        handshake_timeout: Duration::from_secs(5),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(AgentTransportServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let registration = AgentProtocolClient::new(format!("http://{address}"))
+        .register_agent(
+            NoiseIdentity::generate().unwrap(),
+            &[9; 32],
+            "test-token".to_owned(),
+            "driver-agent".to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut running = SessionDriver::spawn(registration.session, SessionDriverConfig::default());
+    assert_eq!(running.handle.request_rekey().await.unwrap(), 1);
+    running
+        .handle
+        .send_messages(Messages {
+            body: Some(messages::Body::Request(
+                smalux_protocol::agent::v1::MessagesRequest {
+                    sequence: 41,
+                    payload: Some(messages_request::Payload::StringPayload(
+                        "driver".to_owned(),
+                    )),
+                },
+            )),
+        })
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(2), running.events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let SessionEvent::Messages(Messages {
+        body: Some(messages::Body::Response(response)),
+    }) = event
+    else {
+        panic!("expected a typed Messages response");
+    };
+    assert_eq!(response.acknowledged_sequence, 41);
+    running.handle.shutdown().await.unwrap();
+    running.task.await.unwrap();
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn registration_returns_the_encrypted_token_error() {
     let service = TestService {
         keyring: Arc::new(ServerKeyRing::new(NoiseIdentity::generate().unwrap())),
         psk: [9; 32],
@@ -252,7 +433,7 @@ async fn enrollment_returns_the_encrypted_token_error() {
     });
 
     let result = AgentProtocolClient::new(format!("http://{address}"))
-        .enroll(
+        .register_agent(
             NoiseIdentity::generate().unwrap(),
             &[9; 32],
             "wrong-token".to_owned(),

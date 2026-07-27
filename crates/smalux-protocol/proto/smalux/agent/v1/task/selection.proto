@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 采集结果详细程度；零值必须被拒绝。
+enum CollectionMode {
+  // 未指定；需要明确成本语义的 Task 必须拒绝该值。
+  COLLECTION_MODE_UNSPECIFIED = 0;
+  // 最低成本：只返回总数和聚合统计，不枚举条目。
+  COLLECTION_MODE_SUMMARY = 1;
+  // 中等成本：返回基础条目，不读取昂贵的扩展详情。
+  COLLECTION_MODE_BASIC = 2;
+  // 最高成本：返回条目及进程关联、命令行等扩展信息。
+  COLLECTION_MODE_DETAILED = 3;
+}
+
+// 按完整网卡名称筛选；任一 include 非空时白名单优先。
+message InterfaceSelection {
+  // 要保留的完整网卡名；非空时先执行白名单，再执行 exclude。
+  repeated string include = 1;
+  // 要排除的完整网卡名；与 include 同时命中时排除优先。
+  repeated string exclude = 2;
+}
+
+// 按设备名称或挂载点筛选磁盘；任一 include 非空时白名单优先。
+message DiskSelection {
+  // 要保留的完整设备名；任一 include 字段非空时启用白名单模式。
+  repeated string include_names = 1;
+  // 要保留的完整挂载点。
+  repeated string include_mount_points = 2;
+  // 要排除的完整设备名；排除规则最终优先。
+  repeated string exclude_names = 3;
+  // 要排除的完整挂载点；排除规则最终优先。
+  repeated string exclude_mount_points = 4;
+}
+
+// 公网地址探测的 IP 协议族选择。
+enum IpFamilySelection {
+  // 未指定；配置编译器按任务约定决定拒绝或使用默认值。
+  IP_FAMILY_SELECTION_UNSPECIFIED = 0;
+  // 同时探测 IPv4 和 IPv6。
+  IP_FAMILY_SELECTION_BOTH = 1;
+  // 只探测 IPv4。
+  IP_FAMILY_SELECTION_V4 = 2;
+  // 只探测 IPv6。
+  IP_FAMILY_SELECTION_V6 = 3;
+}

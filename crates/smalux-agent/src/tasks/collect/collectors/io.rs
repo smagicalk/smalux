@@ -3,105 +3,13 @@
 //! `read_bytes`、`written_bytes`、`received_bytes` 和 `transmitted_bytes`
 //! 表示当前刷新周期增量；`total_*` 表示系统累计值。
 
-use serde::Serialize;
+pub use smalux_protocol::agent::v1::{
+    DiskDeviceSnapshot, DiskIoSnapshot, NetworkInterfaceSnapshot, NetworkIoSnapshot,
+};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks};
 
 use super::{elapsed_since, ip};
-
-/// 单块磁盘的容量与 IO 指标。
-#[derive(Debug, Clone, Serialize)]
-pub struct DiskDeviceSnapshot {
-    /// 系统报告的设备名称。
-    pub name: String,
-    /// 文件系统挂载点。
-    pub mount_point: String,
-    /// 文件系统类型，例如 NTFS、ext4。
-    pub file_system: String,
-    /// 磁盘介质类型文本。
-    pub kind: String,
-    /// 文件系统总容量。
-    pub total_space_bytes: u64,
-    /// 当前可用容量。
-    pub available_space_bytes: u64,
-    /// 本次刷新周期新增读取字节数。
-    pub read_bytes: u64,
-    /// 本次刷新周期新增写入字节数。
-    pub written_bytes: u64,
-    /// 系统启动或计数器建立以来累计读取字节数。
-    pub total_read_bytes: u64,
-    /// 系统启动或计数器建立以来累计写入字节数。
-    pub total_written_bytes: u64,
-    /// 按实际采样间隔计算的读取速度；首次采样为 None。
-    pub read_bytes_per_second: Option<f64>,
-    /// 按实际采样间隔计算的写入速度；首次采样为 None。
-    pub written_bytes_per_second: Option<f64>,
-}
-
-/// 磁盘 IO 汇总快照。
-#[derive(Debug, Clone, Serialize)]
-pub struct DiskIoSnapshot {
-    /// 是否具有可用于计算速度的前一次采样。
-    pub warmed_up: bool,
-    /// 每块磁盘的容量和 IO 指标。
-    pub devices: Vec<DiskDeviceSnapshot>,
-    /// 所有磁盘本次刷新周期读取增量之和。
-    pub read_bytes: u64,
-    /// 所有磁盘本次刷新周期写入增量之和。
-    pub written_bytes: u64,
-    /// 汇总读取速度；首次采样为 None。
-    pub read_bytes_per_second: Option<f64>,
-    /// 汇总写入速度；首次采样为 None。
-    pub written_bytes_per_second: Option<f64>,
-}
-
-/// 单个网卡的 IO 指标。
-#[derive(Debug, Clone, Serialize)]
-pub struct NetworkInterfaceSnapshot {
-    /// 网卡接口名称。
-    pub interface: String,
-    /// 网卡 MAC 地址文本。
-    pub mac_address: String,
-    /// 最大传输单元，单位字节。
-    pub mtu: u64,
-    /// 本次刷新周期接收字节增量。
-    pub received_bytes: u64,
-    /// 本次刷新周期发送字节增量。
-    pub transmitted_bytes: u64,
-    /// 系统累计接收字节数。
-    pub total_received_bytes: u64,
-    /// 系统累计发送字节数。
-    pub total_transmitted_bytes: u64,
-    /// 按实际采样间隔计算的接收速度；首次采样为 None。
-    pub received_bytes_per_second: Option<f64>,
-    /// 按实际采样间隔计算的发送速度；首次采样为 None。
-    pub transmitted_bytes_per_second: Option<f64>,
-    /// 本次刷新周期接收数据包数量。
-    pub received_packets: u64,
-    /// 本次刷新周期发送数据包数量。
-    pub transmitted_packets: u64,
-    /// 本次刷新周期接收错误数量。
-    pub receive_errors: u64,
-    /// 本次刷新周期发送错误数量。
-    pub transmit_errors: u64,
-}
-
-/// 网络 IO 汇总快照。
-#[derive(Debug, Clone, Serialize)]
-pub struct NetworkIoSnapshot {
-    /// 是否具有可用于计算速度的前一次采样。
-    pub warmed_up: bool,
-    /// 每个网卡接口的 IO 指标。
-    pub interfaces: Vec<NetworkInterfaceSnapshot>,
-    /// 所有网卡本次刷新周期接收字节增量之和。
-    pub received_bytes: u64,
-    /// 所有网卡本次刷新周期发送字节增量之和。
-    pub transmitted_bytes: u64,
-    /// 汇总接收速度；首次采样为 None。
-    pub received_bytes_per_second: Option<f64>,
-    /// 汇总发送速度；首次采样为 None。
-    pub transmitted_bytes_per_second: Option<f64>,
-}
 
 /// 磁盘列表及其增量速率采样基线。
 pub(crate) struct DiskIoCollector {

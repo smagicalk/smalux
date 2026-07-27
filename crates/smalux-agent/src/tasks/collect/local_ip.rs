@@ -1,20 +1,15 @@
 //! 本地接口地址周期采集任务。
 
 use async_trait::async_trait;
+pub use smalux_protocol::agent::v1::LocalIpTaskConfig;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::ip::{IpSnapshot, LocalIpCollector},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::ip::LocalIpCollector,
 };
 
-use super::{InterfaceSelection, MetricSample, blocking::CollectState, selection::filter_local_ip};
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// 本地 IP Task 的采集配置。
-pub struct LocalIpTaskConfig {
-    /// 按完整名称筛选本地地址来源网卡；默认选择全部网卡。
-    pub interfaces: InterfaceSelection,
-}
+use super::{blocking::CollectState, selection::filter_local_ip};
 
 /// 使用独立接口发现状态采集本地 IP 的调度任务。
 pub struct LocalIpTask {
@@ -52,16 +47,22 @@ impl Default for LocalIpTask {
 }
 
 #[async_trait]
-impl ValueTask for LocalIpTask {
-    type Output = MetricSample<IpSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
+impl ReportingTask for LocalIpTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let mut output = self
             .state
             .collect(context, LocalIpCollector::collect)
             .await?;
-        filter_local_ip(&mut output.snapshot, &self.config.interfaces);
-        Ok(output)
+        if let Some(selection) = self.config.interfaces.as_ref() {
+            filter_local_ip(&mut output.snapshot, selection);
+        }
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::LocalIp(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -76,8 +77,8 @@ impl ValueTask for LocalIpTask {
 #[cfg(test)]
 mod tests {
     use crate::{
-        scheduler::ValueTask,
-        tasks::collect::{PublicIpState, context},
+        scheduler::ReportingTask,
+        tasks::collect::{PublicIpStatus, context},
     };
 
     use super::{LocalIpTask, LocalIpTaskConfig};
@@ -89,28 +90,46 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), LocalIpTask::KIND);
-        assert!(matches!(
-            output.snapshot.public_ipv4,
-            PublicIpState::NotRequested
-        ));
-        assert!(matches!(
-            output.snapshot.public_ipv6,
-            PublicIpState::NotRequested
-        ));
+        let Some(smalux_protocol::agent::v1::task_result::Result::LocalIp(snapshot)) =
+            output.result
+        else {
+            panic!("local IP task must return TaskResult.local_ip");
+        };
+        assert_eq!(
+            snapshot.public_ipv4.expect("IPv4 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
+        assert_eq!(
+            snapshot.public_ipv6.expect("IPv6 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
     }
 
     #[tokio::test]
     async fn configured_local_ip_task_returns_empty_addresses_when_nothing_matches() {
         let task = LocalIpTask::with_config(LocalIpTaskConfig {
-            interfaces: InterfaceSelection {
+            interfaces: Some(InterfaceSelection {
                 include: vec!["smalux-missing-interface".to_owned()],
                 exclude: Vec::new(),
-            },
+            }),
         });
 
         let output = task.run(context()).await.unwrap();
 
-        assert_eq!(task.config().interfaces.include.len(), 1);
-        assert!(output.snapshot.local.is_empty());
+        assert_eq!(
+            task.config()
+                .interfaces
+                .as_ref()
+                .expect("selection is configured")
+                .include
+                .len(),
+            1
+        );
+        let Some(smalux_protocol::agent::v1::task_result::Result::LocalIp(snapshot)) =
+            output.result
+        else {
+            panic!("local IP task must return TaskResult.local_ip");
+        };
+        assert!(snapshot.local.is_empty());
     }
 }

@@ -1,30 +1,7 @@
 //! 内存与交换空间指标采集。
 
-use serde::Serialize;
+pub use smalux_protocol::agent::v1::MemorySnapshot;
 use sysinfo::System;
-
-/// 内存指标快照，容量单位统一为字节。
-#[derive(Debug, Clone, Serialize)]
-pub struct MemorySnapshot {
-    /// 物理内存总容量。
-    pub total_bytes: u64,
-    /// 当前已使用物理内存。
-    pub used_bytes: u64,
-    /// 操作系统估算的可供应用使用内存。
-    pub available_bytes: u64,
-    /// 当前完全空闲的物理内存。
-    pub free_bytes: u64,
-    /// used_bytes / total_bytes 的百分比；总容量为零时返回 0。
-    pub usage_percent: f64,
-    /// 交换空间总容量。
-    pub swap_total_bytes: u64,
-    /// 当前已使用交换空间。
-    pub swap_used_bytes: u64,
-    /// 当前空闲交换空间。
-    pub swap_free_bytes: u64,
-    /// swap_used_bytes / swap_total_bytes 的百分比。
-    pub swap_usage_percent: f64,
-}
 
 /// 从已刷新的 `System` 中提取内存指标。
 pub(super) fn collect(system: &System) -> MemorySnapshot {

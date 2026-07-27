@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Job 的完整触发规则。未设置 schedule 的消息必须被 Agent 拒绝。
+message JobTrigger {
+  // 单次 Task 执行超时；缺失表示不由 Scheduler 设置超时。
+  optional google.protobuf.Duration timeout = 1;
+
+  // Scheduler 晚于计划时间运行时采用的补偿规则。
+  MisfirePolicy misfire = 2;
+
+  // 每个 Job 必须且只能设置一种时间规则。
+  oneof schedule {
+    // 在指定 UTC 时间执行一次。
+    OnceSchedule once = 10;
+
+    // 按固定间隔重复执行。
+    IntervalSchedule interval = 11;
+
+    // 按 Cron 表达式和 IANA 时区执行。
+    CronSchedule cron = 12;
+  }
+}
+
+// 单次运行时间。
+message OnceSchedule {
+  // 计划运行时间；过去时间由 Scheduler 尽快执行。
+  google.protobuf.Timestamp at = 1;
+}
+
+// 固定周期规则。
+message IntervalSchedule {
+  // 两次计划运行之间的时长，必须大于 Agent 最小周期。
+  google.protobuf.Duration every = 1;
+
+  // 首次计划时间；缺失时从 Agent 应用 Job 的时间开始。
+  optional google.protobuf.Timestamp start_at = 2;
+}
+
+// Cron 时间规则。
+message CronSchedule {
+  // Cron 表达式，例如 `0 */5 * * * *`。
+  string expression = 1;
+
+  // IANA 时区，例如 `Asia/Shanghai`。
+  string timezone = 2;
+}
+
+// 错过计划周期后的行为。
+message MisfirePolicy {
+  // 具体处理方式；零值必须被拒绝，不能猜测 Server 意图。
+  MisfireBehavior behavior = 1;
+
+  // CATCH_UP 最多补执行次数；其他行为必须保持为零。
+  uint32 max_runs = 2;
+}
+
+enum MisfireBehavior {
+  // 未指定；Agent 必须拒绝，不能猜测补执行策略。
+  MISFIRE_BEHAVIOR_UNSPECIFIED = 0;
+  // 丢弃已经错过的执行周期，只保留未来计划。
+  MISFIRE_BEHAVIOR_SKIP = 1;
+  // 无论错过多少周期，只立即补执行一次。
+  MISFIRE_BEHAVIOR_FIRE_ONCE = 2;
+  // 按时间顺序补执行多个周期，但不超过 max_runs。
+  MISFIRE_BEHAVIOR_CATCH_UP = 3;
+}

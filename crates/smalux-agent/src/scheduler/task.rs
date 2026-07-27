@@ -1,8 +1,20 @@
 //! 可调度 Task、强类型输出和类型擦除适配器。
+//!
+//! Scheduler 只负责“何时执行”和“如何处理执行状态”，不理解 CPU、网络等业务结果。
+//! 具体 Task 直接返回值，再由 Adapter 选择 Channel、Callback 或标准 Proto 上报出口：
+//!
+//! ```text
+//! Scheduler -> ScheduledTask::execute -> ReportingTask::run
+//!           -> TaskResult -> ReportingAdapter -> TaskReportSink
+//! ```
+//!
+//! `ScheduledTask` 和 `TaskRunResult` 是内部类型擦除边界。它们让 Scheduler 可以把不同
+//! 输出类型的 Task 存在同一 Job Map 中，同时保留“Task 失败”和“结果交付失败”的区别。
 
 use super::{JobId, RunId};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use smalux_protocol::agent::v1::{TaskReport, TaskResult};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -82,6 +94,7 @@ pub enum CallbackError {
 /// }
 /// ```
 #[async_trait]
+#[allow(dead_code)]
 pub trait ActionTask: Send + Sync + 'static {
     /// 执行一次任务；返回值决定成功、重试或永久停用。
     async fn run(&self, context: TaskContext) -> Result<(), TaskError>;
@@ -103,7 +116,8 @@ pub trait ActionTask: Send + Sync + 'static {
 ///
 /// 值必须通过 Channel 或 Callback 适配器消费，Scheduler 事件本身不携带业务值。
 #[async_trait]
-pub trait ValueTask: Send + Sync + 'static {
+#[allow(dead_code)]
+pub(crate) trait ValueTask: Send + Sync + 'static {
     /// 单次执行产生的业务值类型。
     type Output: Send + Sync + 'static;
 
@@ -121,10 +135,48 @@ pub trait ValueTask: Send + Sync + 'static {
     }
 }
 
+/// 每次执行返回标准 Proto [`TaskResult`] 的采集或探测任务。
+#[async_trait]
+pub trait ReportingTask: Send + Sync + 'static {
+    /// 执行一次任务并返回可直接上报的协议结果。
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError>;
+
+    /// 返回用于诊断和 TaskFactory 映射的稳定类型名称。
+    fn kind(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    /// 返回 Task 的协作取消或不可取消语义。
+    fn cancellation_mode(&self) -> TaskCancellationMode {
+        TaskCancellationMode::Cooperative
+    }
+}
+
+/// 把标准 Task 结果交给持久化、Channel 或连接层的异步出口。
+///
+/// Sink 只负责交付已经完成的结果，不应重新执行原 Task。临时交付错误只影响本次报告，
+/// 永久交付错误则会由 Scheduler 按 [`TaskRunResult::CallbackPermanent`] 停用 Job。
+pub trait TaskReportSink: Send + Sync + 'static {
+    /// 消费一次带 Job revision 和执行身份的完整报告。
+    fn report(&self, report: TaskReport) -> CallbackFuture;
+}
+
+impl<F, Fut> TaskReportSink for F
+where
+    F: Fn(TaskReport) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), CallbackError>> + Send + 'static,
+{
+    fn report(&self, report: TaskReport) -> CallbackFuture {
+        Box::pin((self)(report))
+    }
+}
+
+/// 为不同闭包返回类型提供统一 ABI 的异步交付 Future。
 type CallbackFuture = Pin<Box<dyn Future<Output = Result<(), CallbackError>> + Send>>;
 
 /// 类型擦除后的异步 Callback。
-pub trait AsyncCallback<T>: Send + Sync + 'static {
+#[allow(dead_code)]
+pub(crate) trait AsyncCallback<T>: Send + Sync + 'static {
     /// 异步消费一次 Task 输出，不应在失败时自行重新运行原 Task。
     fn call(&self, context: TaskContext, value: T) -> CallbackFuture;
 }
@@ -151,7 +203,8 @@ where
 ///         .map_err(CallbackError::Transient)
 /// });
 /// ```
-pub fn async_callback<T, F, Fut>(callback: F) -> F
+#[allow(dead_code)]
+pub(crate) fn async_callback<T, F, Fut>(callback: F) -> F
 where
     T: Send + 'static,
     F: Fn(TaskContext, T) -> Fut + Send + Sync + 'static,
@@ -163,6 +216,7 @@ where
 /// 调度器内部统一执行结果。
 pub(crate) enum TaskRunResult {
     /// ActionTask 成功完成。
+    #[allow(dead_code)]
     Completed,
     /// ValueTask 的结果已成功送入 Channel 或 Callback。
     OutputDelivered,
@@ -175,6 +229,7 @@ pub(crate) enum TaskRunResult {
     /// Callback 返回永久错误。
     CallbackPermanent(String),
     /// Value 输出 Channel 的接收端已经关闭。
+    #[allow(dead_code)]
     ChannelClosed,
 }
 
@@ -188,7 +243,7 @@ pub(crate) trait ScheduledTask: Send + Sync + 'static {
 
 /// 已完成类型擦除、可存入 Job Map 的 Task。
 #[derive(Clone)]
-pub struct TaskBinding {
+pub(crate) struct TaskBinding {
     /// 类型擦除后的实际 Task 适配器，仅供 Scheduler 内部执行。
     pub(crate) inner: Arc<dyn ScheduledTask>,
     /// Scheduler 在超时、删除和关闭时应遵循的执行语义。
@@ -197,6 +252,7 @@ pub struct TaskBinding {
 
 impl TaskBinding {
     /// 把不产生业务值的 [`ActionTask`] 注册为统一 Task。
+    #[allow(dead_code)]
     pub fn action<T>(task: Arc<T>) -> Self
     where
         T: ActionTask,
@@ -211,6 +267,7 @@ impl TaskBinding {
     /// 把 [`ValueTask`] 输出发送到有界 Tokio Channel。
     ///
     /// Channel 满时发送会异步等待，并受 Trigger timeout 和取消控制；接收端关闭会自动删除 Job。
+    #[allow(dead_code)]
     pub fn channel<T>(task: Arc<T>, sender: mpsc::Sender<T::Output>) -> Self
     where
         T: ValueTask,
@@ -225,6 +282,7 @@ impl TaskBinding {
     /// 把 [`ValueTask`] 输出交给异步 Callback。
     ///
     /// Callback 临时失败不会重新运行 Task，避免重复采集或重复副作用。
+    #[allow(dead_code)]
     pub fn callback<T, C>(task: Arc<T>, callback: C) -> Self
     where
         T: ValueTask,
@@ -240,9 +298,30 @@ impl TaskBinding {
         }
     }
 
-    /// 返回注册中实际 Task 的诊断名称。
-    pub fn kind(&self) -> &'static str {
-        self.inner.kind()
+    /// 绑定标准上报 Task 与结果出口。
+    pub fn reporting<T, S>(task: Arc<T>, job_revision: u64, sink: Arc<S>) -> Self
+    where
+        T: ReportingTask,
+        S: TaskReportSink + ?Sized,
+    {
+        let cancellation_mode = task.cancellation_mode();
+        Self {
+            inner: Arc::new(ReportingAdapter {
+                task,
+                job_revision,
+                sink,
+            }),
+            cancellation_mode,
+        }
+    }
+
+    /// 把标准 Proto 结果发送到有界 Tokio Channel。
+    #[allow(dead_code)]
+    pub fn reporting_channel<T>(task: Arc<T>, sender: mpsc::Sender<TaskResult>) -> Self
+    where
+        T: ReportingTask,
+    {
+        Self::reporting(task, 0, Arc::new(ReportChannelSink { sender }))
     }
 
     /// 返回注册 Task 的取消和超时语义。
@@ -251,6 +330,89 @@ impl TaskBinding {
     }
 }
 
+#[allow(dead_code)]
+struct ReportChannelSink {
+    /// 只转发报告中的业务结果；容量和背压由调用方创建 Channel 时决定。
+    sender: mpsc::Sender<TaskResult>,
+}
+
+impl TaskReportSink for ReportChannelSink {
+    fn report(&self, report: TaskReport) -> CallbackFuture {
+        // clone 仅复制 Sender 句柄，使返回 Future 不借用 self。
+        let sender = self.sender.clone();
+        Box::pin(async move {
+            // reporting_channel 的公开语义是传 TaskResult，缺失结果属于不可恢复的协议错误。
+            let result = report.result.ok_or_else(|| {
+                CallbackError::Permanent(anyhow::anyhow!("task report result is missing"))
+            })?;
+            sender.send(result).await.map_err(|_| {
+                CallbackError::Permanent(anyhow::anyhow!("task report channel is closed"))
+            })
+        })
+    }
+}
+
+struct ReportingAdapter<T, S>
+where
+    T: ReportingTask,
+    S: TaskReportSink + ?Sized,
+{
+    /// 返回标准 Proto 结果的具体采集 Task。
+    task: Arc<T>,
+    /// Server 的业务配置版本；不能使用 TaskContext 中的 Scheduler generation 替代。
+    job_revision: u64,
+    /// 接收完整 TaskReport 的共享异步出口。
+    sink: Arc<S>,
+}
+
+#[async_trait]
+impl<T, S> ScheduledTask for ReportingAdapter<T, S>
+where
+    T: ReportingTask,
+    S: TaskReportSink + ?Sized,
+{
+    fn kind(&self) -> &'static str {
+        self.task.kind()
+    }
+
+    async fn execute(&self, context: TaskContext) -> TaskRunResult {
+        // 先运行 Task；Task 失败时没有业务结果，因此不会调用 Sink。
+        let result = match self.task.run(context.clone()).await {
+            Ok(result) => result,
+            Err(error) => return map_task_error(error),
+        };
+        // Adapter 在统一位置补充 Job、Run、尝试次数和时间信息，采集器无需重复组装。
+        let report = TaskReport {
+            job_id: context.job_id.as_bytes().to_vec(),
+            job_revision: self.job_revision,
+            run_id: context.run_id.as_bytes().to_vec(),
+            attempt: context.attempt,
+            scheduled_at: Some(timestamp(context.scheduled_at)),
+            started_at: Some(timestamp(context.started_at)),
+            result: Some(result),
+        };
+        // 交付结果与 Task 执行结果分开映射，防止交付失败触发昂贵采集的重复执行。
+        match self.sink.report(report).await {
+            Ok(()) => TaskRunResult::OutputDelivered,
+            Err(CallbackError::Transient(error)) => {
+                TaskRunResult::CallbackTransient(format!("{error:#}"))
+            }
+            Err(CallbackError::Permanent(error)) => {
+                TaskRunResult::CallbackPermanent(format!("{error:#}"))
+            }
+        }
+    }
+}
+
+fn timestamp(value: DateTime<Utc>) -> prost_types::Timestamp {
+    // chrono 纳秒部分保证落在 Prost Timestamp 要求的 0..1_000_000_000 范围内。
+    prost_types::Timestamp {
+        seconds: value.timestamp(),
+        nanos: value.timestamp_subsec_nanos() as i32,
+    }
+}
+
+#[allow(dead_code)]
 struct ActionAdapter<T> {
     /// 被类型擦除的 ActionTask。
     task: Arc<T>,
@@ -275,6 +437,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 struct ChannelAdapter<T>
 where
     T: ValueTask,
@@ -308,6 +471,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 struct CallbackAdapter<T, C>
 where
     T: ValueTask,

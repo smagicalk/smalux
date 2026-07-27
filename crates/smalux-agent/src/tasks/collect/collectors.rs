@@ -3,7 +3,6 @@
 //! `HostMetricsCollector` 长期持有 `sysinfo` 的刷新状态。CPU 和 IO 都依赖前后两次
 //! 采样，因此不要为每次采样重新创建采集器。
 
-use serde::Serialize;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::tasks::collect::CollectionMode;
@@ -19,7 +18,7 @@ pub mod socket;
 pub(crate) mod system;
 
 /// 一次完整的本机指标快照。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SystemSnapshot {
     /// Unix 时间戳，单位毫秒。
     pub sampled_at_ms: u64,
@@ -219,7 +218,10 @@ mod tests {
         let snapshot = collector.collect();
 
         assert!(snapshot.sampled_at_ms > 0);
-        assert_eq!(snapshot.cpu.logical_cpu_count, snapshot.cpu.cpus.len());
+        assert_eq!(
+            snapshot.cpu.logical_cpu_count as usize,
+            snapshot.cpu.cpus.len()
+        );
         assert!(snapshot.memory.total_bytes >= snapshot.memory.used_bytes);
         assert!(snapshot.load.one.is_finite());
         assert_eq!(
@@ -261,15 +263,15 @@ mod tests {
 
         assert!(!first_disk.warmed_up);
         assert!(!first_network.warmed_up);
-        assert!(matches!(
-            local_ip.public_ipv4,
-            ip::PublicIpState::NotRequested
-        ));
-        assert!(matches!(
-            local_ip.public_ipv6,
-            ip::PublicIpState::NotRequested
-        ));
-        assert_eq!(cpu.logical_cpu_count, cpu.cpus.len());
+        assert_eq!(
+            local_ip.public_ipv4.expect("IPv4 state").status,
+            ip::PublicIpStatus::NotRequested as i32
+        );
+        assert_eq!(
+            local_ip.public_ipv6.expect("IPv6 state").status,
+            ip::PublicIpStatus::NotRequested as i32
+        );
+        assert_eq!(cpu.logical_cpu_count as usize, cpu.cpus.len());
         assert!(memory.total_bytes >= memory.used_bytes);
         assert!(load.one.is_finite());
         assert!(!host.hostname.is_empty());

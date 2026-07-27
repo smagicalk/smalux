@@ -79,7 +79,7 @@ mod tests {
         let (cpu, memory) = collector.collect_cpu_and_memory_at(Instant::now());
 
         assert!(!cpu.warmed_up);
-        assert_eq!(cpu.logical_cpu_count, cpu.cpus.len());
+        assert_eq!(cpu.logical_cpu_count as usize, cpu.cpus.len());
         assert!(memory.total_bytes >= memory.used_bytes);
     }
 }

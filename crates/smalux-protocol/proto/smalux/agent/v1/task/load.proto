@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// Load Task 当前无配置；保留独立消息以便后续兼容扩展。
+message LoadTaskConfig {}
+
+// 操作系统平均负载快照。
+message LoadSnapshot {
+  // 当前平台是否支持负载指标；false 时数值字段仅为占位零值。
+  bool supported = 1;
+  // 最近 1 分钟平均负载。
+  double one = 2;
+  // 最近 5 分钟平均负载。
+  double five = 3;
+  // 最近 15 分钟平均负载。
+  double fifteen = 4;
+}

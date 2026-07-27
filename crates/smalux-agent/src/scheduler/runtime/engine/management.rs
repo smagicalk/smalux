@@ -6,6 +6,9 @@ impl SchedulerActor {
     /// 校验 Job 数量、Trigger 和策略，生成唯一 JobId 并安排首次运行。
     pub(super) fn add_job(
         &mut self,
+        requested_id: Option<JobId>,
+        generation: u64,
+        enabled: bool,
         trigger: Trigger,
         task: TaskBinding,
         options: JobOptions,
@@ -16,10 +19,17 @@ impl SchedulerActor {
         validate_trigger(&trigger, &options, &self.config)?;
         validate_task_cancellation_mode(&trigger, task.cancellation_mode())?;
         let now = Utc::now();
-        let id = loop {
-            let id = JobId::new_v4();
-            if !self.jobs.contains_key(&id) {
-                break id;
+        let id = if let Some(id) = requested_id {
+            if self.jobs.contains_key(&id) {
+                return Err(SchedulerError::JobAlreadyExists(id));
+            }
+            id
+        } else {
+            loop {
+                let id = JobId::new_v4();
+                if !self.jobs.contains_key(&id) {
+                    break id;
+                }
             }
         };
         let (coalescing, capacity) = effective_queue_policies(&trigger, &options);
@@ -28,7 +38,7 @@ impl SchedulerActor {
             id,
             JobEntry {
                 id,
-                version: 0,
+                version: generation,
                 task: task.inner,
                 cancellation_mode: task.cancellation_mode,
                 trigger,
@@ -39,7 +49,13 @@ impl SchedulerActor {
                 capacity,
                 retry: options.retry,
                 failure: options.failure,
-                state: JobState::Enabled,
+                state: if enabled {
+                    JobState::Enabled
+                } else {
+                    JobState::Disabled {
+                        reason: "installed disabled".to_owned(),
+                    }
+                },
                 normal_timer_key: None,
                 next_run_at: None,
                 blocked: VecDeque::new(),
@@ -53,10 +69,12 @@ impl SchedulerActor {
                 updated_at: now,
             },
         );
-        self.schedule_normal(id, next_run, TimerKind::Normal);
+        if enabled {
+            self.schedule_normal(id, next_run, TimerKind::Normal);
+        }
         self.emit(SchedulerEventKind::JobAdded {
             job_id: id,
-            version: 0,
+            version: generation,
         });
         Ok(id)
     }

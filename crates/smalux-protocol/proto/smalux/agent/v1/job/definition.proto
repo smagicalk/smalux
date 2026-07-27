@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/duration.proto";
+import "smalux/agent/v1/job/schedule.proto";
+import "smalux/agent/v1/task/common.proto";
+
+// Server 或本地调用方提交给 Scheduler 的完整 Job 配置。
+message JobDefinition {
+  // 调用方分配的 UUID，固定为 16 字节。
+  bytes job_id = 1;
+
+  // 配置版本，从 1 开始；更新必须严格增大。
+  uint64 revision = 2;
+
+  // false 表示保存定义但不生成新的计划执行。
+  bool enabled = 3;
+
+  // 完整触发规则。
+  JobTrigger trigger = 4;
+
+  // 执行、队列和失败策略；缺失时使用 Agent 安全默认值。
+  JobOptions options = 5;
+
+  // 固定 Task 类型及其配置。
+  TaskDefinition task = 6;
+}
+
+// 单个 Job 的执行与队列策略。
+message JobOptions {
+  // 单 Job 并发；缺失时继承 Scheduler 默认值。
+  optional uint32 concurrency = 1;
+
+  // 单 Job Pending 上限；缺失时继承 Scheduler 默认值。
+  optional uint32 max_pending = 2;
+
+  // 0 到 10，数值越大越优先；缺失配置时使用 5。
+  optional uint32 priority = 3;
+
+  // 未指定时由 Trigger 类型选择安全默认值。
+  TriggerCoalescing coalescing = 4;
+
+  // 未指定时由 Trigger 类型选择安全默认值。
+  CapacityPolicy capacity = 5;
+
+  // Task 失败后的重试策略；缺失表示不重试。
+  RetryPolicy retry = 6;
+
+  // 连续失败后的自动停用规则；缺失时使用 Agent 默认值。
+  FailurePolicy failure = 7;
+}
+
+enum TriggerCoalescing {
+  // 未覆盖 Scheduler 默认策略。
+  TRIGGER_COALESCING_UNSPECIFIED = 0;
+  // 保留每个到达的触发，适合不能丢采样的场景，但可能积压。
+  TRIGGER_COALESCING_KEEP_ALL = 1;
+  // 等待队列中只保留最新触发，适合高频监控采样。
+  TRIGGER_COALESCING_KEEP_LATEST = 2;
+}
+
+// Job 达到 Pending 容量时的处理方式。
+enum CapacityPolicy {
+  // 未覆盖 Scheduler 默认策略。
+  CAPACITY_POLICY_UNSPECIFIED = 0;
+  // 延迟接收新触发，直到队列重新有容量。
+  CAPACITY_POLICY_BACKPRESSURE = 1;
+  // 保留现有 Pending，丢弃最新到达的触发。
+  CAPACITY_POLICY_SKIP_NEWEST = 2;
+  // 删除最旧 Pending，并用最新触发替代。
+  CAPACITY_POLICY_REPLACE_OLDEST_TRIGGER = 3;
+}
+
+// 完整重试配置。
+message RetryPolicy {
+  oneof policy {
+    // 明确禁用重试。
+    NoRetry no_retry = 1;
+
+    // 有上限的指数退避。
+    ExponentialRetry exponential = 2;
+  }
+}
+
+// 显式表达“不重试”；空消息用于 oneof 分支判别。
+message NoRetry {}
+
+// 指数退避重试参数。
+message ExponentialRetry {
+  // 包含首次执行在内的最大尝试次数，必须大于零。
+  uint32 max_attempts = 1;
+  // 第一次重试前的等待时长；允许为零。
+  google.protobuf.Duration initial_delay = 2;
+  // 退避等待上限，必须大于零。
+  google.protobuf.Duration max_delay = 3;
+  // 哪些失败类型允许进入重试；缺失等同全部 false。
+  RetryCondition retry_on = 4;
+}
+
+// 可重试失败类型开关。
+message RetryCondition {
+  // Task 返回临时错误时重试。
+  bool transient_error = 1;
+  // Scheduler 判定执行超时时重试。
+  bool timeout = 2;
+  // Task Future panic 被捕获时重试。
+  bool panic = 3;
+}
+
+// 连续失败达到阈值后的自动停用策略。
+message FailurePolicy {
+  // 自动停用阈值；缺失表示不因连续失败自动停用，出现时必须大于零。
+  optional uint32 disable_after_consecutive_failures = 1;
+  // true 时把超时计入连续失败。
+  bool count_timeout = 2;
+  // true 时把 panic 计入连续失败。
+  bool count_panic = 3;
+}

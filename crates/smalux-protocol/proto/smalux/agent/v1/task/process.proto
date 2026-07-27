@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "smalux/agent/v1/task/selection.proto";
+
+// 进程采集的成本、筛选和结果数量配置。
+message ProcessTaskConfig {
+  // SUMMARY/BASIC/DETAILED 控制是否枚举进程及读取昂贵详情。
+  CollectionMode mode = 1;
+  // PID 与名称白名单/黑名单；缺失或列表为空时选择全部进程。
+  ProcessSelection selection = 2;
+  // 明细排序方式；影响 max_entries 截断后保留哪些进程。
+  ProcessRanking ranking = 3;
+  // 最多返回的进程条目数；缺失时使用 Agent 默认上限。
+  optional uint32 max_entries = 4;
+}
+
+// 进程筛选规则；任一 include 非空时白名单优先，exclude 最终优先。
+message ProcessSelection {
+  // 要保留的 PID 精确列表。
+  repeated uint32 include_pids = 1;
+  // 要保留的进程名精确列表。
+  repeated string include_names = 2;
+  // 要排除的进程名精确列表。
+  repeated string exclude_names = 3;
+}
+
+// 进程明细排序方式。
+enum ProcessRanking {
+  // 未指定；Agent 使用稳定默认排序。
+  PROCESS_RANKING_UNSPECIFIED = 0;
+  // 按 PID 排序，适合稳定分页和诊断。
+  PROCESS_RANKING_PID = 1;
+  // 按 CPU 使用率从高到低保留高消耗进程。
+  PROCESS_RANKING_CPU_USAGE = 2;
+  // 按物理内存占用从高到低保留高消耗进程。
+  PROCESS_RANKING_MEMORY = 3;
+}
+
+// 进程总量、状态分布和可选明细快照。
+message ProcessSnapshot {
+  // Agent 实际采用的采集成本模式。
+  CollectionMode mode = 1;
+  // 操作系统可见的全部进程数，不受 selection 影响。
+  uint32 total_processes = 2;
+  // 通过 selection 的进程数，不受 max_entries 截断影响。
+  uint32 matched_processes = 3;
+  // 匹配进程按状态聚合的数量。
+  repeated ProcessStateCount states = 4;
+  // BASIC/DETAILED 返回的进程明细；SUMMARY 为空。
+  repeated ProcessEntry entries = 5;
+  // true 表示匹配进程数超过 max_entries，entries 只包含排序后的前 N 项。
+  bool truncated = 6;
+  // 是否已有前一 CPU 样本，可计算可靠的进程 CPU 使用率。
+  bool cpu_warmed_up = 7;
+}
+
+// 某一种进程状态的聚合数量。
+message ProcessStateCount {
+  // 标准化后的进程状态。
+  ProcessState state = 1;
+  // 处于该状态的匹配进程数量。
+  uint32 count = 2;
+}
+
+// 跨平台标准化的进程状态。
+enum ProcessState {
+  // 未指定，仅作为 Proto 零值。
+  PROCESS_STATE_UNSPECIFIED = 0;
+  // 空闲。
+  PROCESS_STATE_IDLE = 1;
+  // 正在运行。
+  PROCESS_STATE_RUNNING = 2;
+  // 可中断睡眠。
+  PROCESS_STATE_SLEEPING = 3;
+  // 已停止。
+  PROCESS_STATE_STOPPED = 4;
+  // 僵尸进程。
+  PROCESS_STATE_ZOMBIE = 5;
+  // 正被跟踪或调试。
+  PROCESS_STATE_TRACING = 6;
+  // 已死亡但尚未清理。
+  PROCESS_STATE_DEAD = 7;
+  // Linux wakekill 状态。
+  PROCESS_STATE_WAKEKILL = 8;
+  // Linux waking 状态。
+  PROCESS_STATE_WAKING = 9;
+  // Linux parked 状态。
+  PROCESS_STATE_PARKED = 10;
+  // 等待锁阻塞。
+  PROCESS_STATE_LOCK_BLOCKED = 11;
+  // 不可中断磁盘睡眠。
+  PROCESS_STATE_UNINTERRUPTIBLE_DISK_SLEEP = 12;
+  // 平台报告的挂起状态。
+  PROCESS_STATE_SUSPENDED = 13;
+  // Agent 无法映射的平台特有状态。
+  PROCESS_STATE_UNKNOWN = 14;
+}
+
+// 单个进程基础信息及可选昂贵详情。
+message ProcessEntry {
+  // 进程 ID。
+  uint32 pid = 1;
+  // 父进程 ID；平台不提供或父进程已退出时缺失。
+  optional uint32 parent_pid = 2;
+  // 进程名称。
+  string name = 3;
+  // 标准化运行状态。
+  ProcessState state = 4;
+  // 进程启动时刻的 Unix 秒时间戳。
+  uint64 started_at_seconds = 5;
+  // DETAILED 模式下的资源与命令信息；其他模式缺失。
+  optional ProcessDetails details = 6;
+}
+
+// 读取成本较高的单进程资源与启动信息。
+message ProcessDetails {
+  // 进程 CPU 使用率，可能超过 100 以表示多核使用。
+  float cpu_usage_percent = 1;
+  // 当前物理内存占用，单位字节。
+  uint64 memory_bytes = 2;
+  // 当前虚拟内存占用，单位字节。
+  uint64 virtual_memory_bytes = 3;
+  // 本采样区间读取增量，单位字节。
+  uint64 read_bytes = 4;
+  // 本采样区间写入增量，单位字节。
+  uint64 written_bytes = 5;
+  // 操作系统计数器报告的累计读取字节。
+  uint64 total_read_bytes = 6;
+  // 操作系统计数器报告的累计写入字节。
+  uint64 total_written_bytes = 7;
+  // 可执行文件绝对路径；权限不足时缺失。
+  optional string executable = 8;
+  // 完整命令行参数；权限不足时为空列表。
+  repeated string command = 9;
+}

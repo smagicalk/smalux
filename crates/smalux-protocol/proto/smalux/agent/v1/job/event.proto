@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Scheduler 生命周期事件。按 kind 解释其余可选元数据字段。
+message JobEvent {
+  // Agent 进程内单调递增序号，用于发现事件缺口；重启后可重新开始。
+  uint64 sequence = 1;
+  // Agent 生成事件的 UTC 时间。
+  google.protobuf.Timestamp emitted_at = 2;
+  // 事件类型；决定其余可选上下文字段如何解释。
+  JobEventKind kind = 3;
+  // 相关 Job UUID；Scheduler 全局事件中可以为空。
+  bytes job_id = 4;
+  // 事件发生时的 Job 业务 revision。
+  uint64 revision = 5;
+  // 相关逻辑执行 UUID；非执行事件中可以为空。
+  bytes run_id = 6;
+  // 当前执行尝试次数，从 1 开始；非执行事件为零。
+  uint32 attempt = 7;
+  // Trigger 原计划时间；与触发或执行相关时存在。
+  optional google.protobuf.Timestamp scheduled_at = 8;
+  // 实际或重试计划运行时间；不适用时缺失。
+  optional google.protobuf.Timestamp run_at = 9;
+  // 已完成执行或交付的耗时，单位毫秒；不适用时为零。
+  uint64 duration_ms = 10;
+  // 面向诊断的说明或错误链，不应用于机器分支判断。
+  string message = 11;
+  // 当前失败是否已经安排重试。
+  bool will_retry = 12;
+  // 事件发生后的 Job Pending 数量。
+  uint32 pending_count = 13;
+}
+
+// Scheduler、Job、Trigger、执行和结果交付的生命周期事件。
+enum JobEventKind {
+  // 未指定，仅作为 Proto 零值。
+  JOB_EVENT_KIND_UNSPECIFIED = 0;
+  // Scheduler 运行循环已经启动。
+  JOB_EVENT_KIND_SCHEDULER_STARTED = 1;
+  // Scheduler 全局配置已经更新。
+  JOB_EVENT_KIND_SCHEDULER_CONFIG_UPDATED = 2;
+  // Scheduler 开始有序停止，不再接受新工作。
+  JOB_EVENT_KIND_SCHEDULER_STOPPING = 3;
+  // Scheduler 已完成停止。
+  JOB_EVENT_KIND_SCHEDULER_STOPPED = 4;
+  // Scheduler 发生无法继续运行的故障。
+  JOB_EVENT_KIND_SCHEDULER_FAILED = 5;
+  // 新 Job 已安装。
+  JOB_EVENT_KIND_JOB_ADDED = 10;
+  // Job 配置或 generation 已更新。
+  JOB_EVENT_KIND_JOB_UPDATED = 11;
+  // Job 已停用。
+  JOB_EVENT_KIND_JOB_DISABLED = 12;
+  // Job 已从 Scheduler 删除。
+  JOB_EVENT_KIND_JOB_DELETED = 13;
+  // 一个 Trigger 已进入时间计划。
+  JOB_EVENT_KIND_TRIGGER_SCHEDULED = 20;
+  // Trigger 因 Misfire、容量或状态策略被跳过。
+  JOB_EVENT_KIND_TRIGGER_SKIPPED = 21;
+  // 一次执行已进入 Pending 队列。
+  JOB_EVENT_KIND_EXECUTION_QUEUED = 30;
+  // 一次执行尝试已经开始。
+  JOB_EVENT_KIND_EXECUTION_STARTED = 31;
+  // Task 与结果交付均成功完成。
+  JOB_EVENT_KIND_EXECUTION_SUCCEEDED = 32;
+  // Task 或结果交付返回错误。
+  JOB_EVENT_KIND_EXECUTION_FAILED = 33;
+  // Scheduler 超时已触发。
+  JOB_EVENT_KIND_EXECUTION_TIMED_OUT = 34;
+  // Task panic 已被执行边界捕获。
+  JOB_EVENT_KIND_EXECUTION_PANICKED = 35;
+  // 执行因删除、停用、关闭或取消令牌而结束。
+  JOB_EVENT_KIND_EXECUTION_CANCELLED = 36;
+  // 同一 run_id 的下一次 attempt 已安排。
+  JOB_EVENT_KIND_RETRY_SCHEDULED = 40;
+  // TaskReport 已由 Sink 确认接收。
+  JOB_EVENT_KIND_REPORT_DELIVERED = 50;
+  // TaskReport Sink 返回临时或永久错误。
+  JOB_EVENT_KIND_REPORT_DELIVERY_FAILED = 51;
+  // 容量策略用新 Trigger 替换了最旧 Pending。
+  JOB_EVENT_KIND_PENDING_REPLACED = 60;
+  // 容量策略对新 Trigger 应用了背压。
+  JOB_EVENT_KIND_BACKPRESSURE_APPLIED = 61;
+}

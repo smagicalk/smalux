@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// CPU Task 当前没有业务配置，保留消息便于兼容扩展。
+message CpuTaskConfig {}
+
+message CpuSnapshot {
+  // false 表示首次采样尚无前一计数器，使用率可能只适合展示而不适合告警。
+  bool warmed_up = 1;
+  // 操作系统可提供时的物理 CPU 核心数。
+  optional uint32 physical_cpu_count = 2;
+  // 操作系统报告的逻辑 CPU 数量。
+  uint32 logical_cpu_count = 3;
+  // 全部逻辑 CPU 的总体使用率，范围 0..100。
+  float global_usage_percent = 4;
+  // 每个逻辑 CPU 的独立信息。
+  repeated CpuCoreSnapshot cpus = 5;
+}
+
+// 单个逻辑 CPU 的静态信息和当前使用率。
+message CpuCoreSnapshot {
+  // 操作系统中的逻辑 CPU 名称。
+  string name = 1;
+  // 处理器品牌描述。
+  string brand = 2;
+  // CPU 厂商标识。
+  string vendor_id = 3;
+  // 当前或报告频率，单位 MHz。
+  uint64 frequency_mhz = 4;
+  // 当前使用率，范围 0..100。
+  float usage_percent = 5;
+}

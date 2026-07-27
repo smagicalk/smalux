@@ -128,6 +128,9 @@ pub enum SchedulerError {
     /// 指定 JobId 不存在或已被删除。
     #[error("job `{0}` was not found")]
     JobNotFound(JobId),
+    /// 调用方指定的 JobId 已存在。
+    #[error("job `{0}` already exists")]
+    JobAlreadyExists(JobId),
     /// Job 的期望版本与当前版本不一致。
     #[error("job `{job_id}` version conflict: expected {expected}, actual {actual}")]
     VersionConflict {

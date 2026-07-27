@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/duration.proto";
+
+// 一次运行中对多个远端节点进行网络探测的配置。
+message ProbeTaskConfig {
+  // 同时执行的节点数量上限，必须大于零。
+  uint32 concurrency = 1;
+  // 待探测节点列表；每个节点可独立选择协议、次数和超时。
+  repeated ProbeNodeConfig nodes = 2;
+}
+
+// 单个探测节点及协议参数。
+message ProbeNodeConfig {
+  // Server 分配的人类可读节点名，在结果中原样返回。
+  string name = 1;
+  // ICMP/TCP 使用的主机名或 IP；HTTP 也保留该字段用于统一展示。
+  string host = 2;
+  // 本次 Task 对该节点的尝试次数，必须大于零。
+  uint32 attempts = 3;
+  // 每次尝试的独立超时，必须大于零。
+  google.protobuf.Duration timeout = 4;
+  // 相邻尝试之间的等待时长，可以为零。
+  google.protobuf.Duration interval = 5;
+
+  // 探测协议；必须设置一个分支。
+  oneof target {
+    // 发送 ICMP Echo Request 并等待 Echo Reply。
+    IcmpEchoTarget icmp_echo = 10;
+    // 建立 TCP 连接，连接成功即认为探测成功。
+    TcpConnectTarget tcp_connect = 11;
+    // 发起 HTTP 请求并校验响应状态码。
+    HttpTarget http = 12;
+  }
+}
+
+// ICMP Echo 当前无额外字段；权限不足会作为节点尝试错误返回。
+message IcmpEchoTarget {}
+
+// TCP Connect 探测目标。
+message TcpConnectTarget {
+  // 目标 TCP 端口，范围 1..65535。
+  uint32 port = 1;
+}
+
+// HTTP 探测目标和成功条件。
+message HttpTarget {
+  // 完整 HTTP/HTTPS URL；host 字段不替代 URL 中的主机。
+  string url = 1;
+  // 视为成功的最小 HTTP 状态码，包含边界。
+  uint32 expected_status_min = 2;
+  // 视为成功的最大 HTTP 状态码，包含边界。
+  uint32 expected_status_max = 3;
+  // 是否自动跟随 3xx 重定向。
+  bool follow_redirects = 4;
+}
+
+// 一次 Probe Task 的聚合结果。
+message ProbeSnapshot {
+  // 配置并实际处理的节点数量。
+  uint32 total_nodes = 1;
+  // 至少一次尝试成功且满足协议条件的节点数量。
+  uint32 healthy_nodes = 2;
+  // 每个节点的详细结果，顺序与实现调度无关。
+  repeated ProbeNodeSnapshot nodes = 3;
+}
+
+// 单个节点的统计与逐次尝试结果。
+message ProbeNodeSnapshot {
+  // 配置中的节点名。
+  string name = 1;
+  // 配置中的主机名或 IP。
+  string host = 2;
+  // 实际执行的探测协议。
+  ProbeProtocol protocol = 3;
+  // TCP 探测端口；其他协议缺失。
+  optional uint32 port = 4;
+  // HTTP 探测 URL；其他协议缺失。
+  optional string url = 5;
+  // DNS 解析后实际使用的 IP；解析前失败时缺失。
+  optional string resolved_ip = 6;
+  // 实际发起的尝试次数，取消或提前失败时可能小于配置值。
+  uint32 attempted = 7;
+  // 成功尝试次数。
+  uint32 succeeded = 8;
+  // 失败次数占 attempted 的百分比，范围 0..100。
+  double failure_percent = 9;
+  // 成功尝试中的最小延迟，单位毫秒；没有成功尝试时缺失。
+  optional double min_latency_ms = 10;
+  // 成功尝试中的平均延迟，单位毫秒；没有成功尝试时缺失。
+  optional double avg_latency_ms = 11;
+  // 成功尝试中的最大延迟，单位毫秒；没有成功尝试时缺失。
+  optional double max_latency_ms = 12;
+  // 每次尝试的原始结果。
+  repeated ProbeAttemptSnapshot attempts = 13;
+}
+
+// 单次协议尝试的结果。
+message ProbeAttemptSnapshot {
+  // 节点内尝试序号，从 1 开始。
+  uint32 sequence = 1;
+  // 是否在超时内满足协议成功条件。
+  bool success = 2;
+  // 成功完成协议交互的耗时，单位毫秒。
+  optional double latency_ms = 3;
+  // HTTP 响应状态码；非 HTTP 或未收到响应时缺失。
+  optional uint32 status_code = 4;
+  // 失败原因；成功时缺失。
+  optional string error = 5;
+}
+
+// Agent 支持的固定探测协议。
+enum ProbeProtocol {
+  // 未指定，仅作为 Proto 零值。
+  PROBE_PROTOCOL_UNSPECIFIED = 0;
+  // ICMP Echo 请求/响应。
+  PROBE_PROTOCOL_ICMP_ECHO = 1;
+  // TCP 三次握手建立连接。
+  PROBE_PROTOCOL_TCP_CONNECT = 2;
+  // HTTP 请求与状态码校验。
+  PROBE_PROTOCOL_HTTP = 3;
+}

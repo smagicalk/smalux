@@ -1,13 +1,14 @@
 //! 系统平均负载周期采集任务。
 
 use async_trait::async_trait;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::load::{self, LoadSnapshot},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::load,
 };
 
-use super::{MetricSample, blocking::CollectState};
+use super::blocking::CollectState;
 
 /// 采集平台平均负载的调度任务。
 pub struct LoadTask {
@@ -33,11 +34,16 @@ impl Default for LoadTask {
 }
 
 #[async_trait]
-impl ValueTask for LoadTask {
-    type Output = MetricSample<LoadSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
-        self.state.collect(context, |_| load::collect()).await
+impl ReportingTask for LoadTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
+        let output = self.state.collect(context, |_| load::collect()).await?;
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::Load(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -51,7 +57,7 @@ impl ValueTask for LoadTask {
 
 #[cfg(test)]
 mod tests {
-    use crate::{scheduler::ValueTask, tasks::collect::context};
+    use crate::{scheduler::ReportingTask, tasks::collect::context};
 
     use super::LoadTask;
 
@@ -61,8 +67,12 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), LoadTask::KIND);
-        assert!(output.snapshot.one.is_finite());
-        assert!(output.snapshot.five.is_finite());
-        assert!(output.snapshot.fifteen.is_finite());
+        let Some(smalux_protocol::agent::v1::task_result::Result::Load(snapshot)) = output.result
+        else {
+            panic!("Load task must return TaskResult.load");
+        };
+        assert!(snapshot.one.is_finite());
+        assert!(snapshot.five.is_finite());
+        assert!(snapshot.fifteen.is_finite());
     }
 }

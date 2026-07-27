@@ -52,6 +52,10 @@ reqwest = { version = "0.13.4", features = ["multipart", "hickory-dns"] }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 # 项目公共基础库，复用日志、工具和跨 crate 类型。
 smalux-core = { path = "../smalux-core" }
+# Agent/Server 共用的 Job、Task 配置和强类型结果模型。
+smalux-protocol = { path = "../smalux-protocol" }
+# 读取和构造生成消息中的 Timestamp、Duration。
+prost-types = "0.14.4"
 # Tokio 原生异步 ICMPv4/ICMPv6，实现多节点 Ping 且支持 Linux 非特权 DGRAM socket。
 surge-ping = "0.9.0"
 

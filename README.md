@@ -58,7 +58,7 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 
 - **[smalux-protocol](crates/smalux-protocol/README.md)**
   Owns the versioned gRPC schema and generated Tonic types shared by Agent and Server.
-  Concrete reporting, Job, authentication, and streaming RPCs are still being designed.
+  Job definitions, control commands, typed task results, authentication, and streaming RPCs share one wire model.
 
 - **smalux-plus**
   Contains optional feature crates, such as the reserved Restic backup integration, so optional
@@ -67,11 +67,11 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 - **assets**  
   Static assets such as project icons, diagrams, and documentation resources.
 
-当前实现中，Agent 的底层系统采集器与 Snapshot 位于 `tasks/collect/collectors/`，具体
-采集 `ValueTask` 位于 `tasks/collect/`，触发、队列、并发、重试和生命周期位于
-`scheduler/`。原有 JSON Job 解析层已经移除，后续 Job 配置与控制消息统一使用
-`smalux-protocol` 中 Agent 与 Server 共用的版本化 Proto 定义和生成类型。模块入口只
-负责组织和导出，具体实现按职责存放。
+当前实现中，Agent 的底层系统采集器位于 `tasks/collect/collectors/`，固定采集任务位于
+`tasks/collect/`，触发、队列、并发、重试和生命周期位于 `scheduler/`。所有采集任务都
+实现 `ReportingTask`，直接返回 Proto `TaskResult`；`TaskReportSink` 决定结果写入本地、
+Channel 或连接层。`job_control` 负责把 `JobDefinition` 校验并装配为调度任务，同时处理
+`JobCommand` 的幂等、catalog revision 和远程 Job 所有权。原有 JSON Job 解析层已经移除。
 
 ---
 

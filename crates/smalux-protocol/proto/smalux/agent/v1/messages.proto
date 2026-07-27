@@ -3,20 +3,29 @@ syntax = "proto3";
 // 所有消息均属于同一个版本化 package，并由 transport.proto 的 SecureMessage 引用。
 package smalux.agent.v1;
 
-// 首次 XXpsk3 注册成功建立密文通道后的 Token 请求/响应封装。
-message TokenMessage {
-  // 请求和响应互斥，空 body 属于无效消息。
+// 首次 XXpsk3 建立密文通道后的可靠注册状态机。
+//
+// Server 必须先持久化 pending 注册再发送 prepared；Agent 必须先持久化身份材料再发送
+// commit；Server 激活 Agent 并消费 Token 后发送 committed。四个阶段均可安全地因断线重试。
+message RegistrationMessage {
+  // 同一帧只能承载一个注册阶段，空 body 属于无效消息。
   oneof body {
     // Agent 发给 Server 的一次性 Token 注册请求。
-    TokenRequest request = 1;
+    RegistrationRequest request = 1;
 
-    // Server 完成注册持久化后返回的成功结果。
-    TokenResponse response = 2;
+    // Server 已保存 pending 注册，但尚未激活 Agent 或最终消费 Token。
+    RegistrationPrepared prepared = 2;
+
+    // Agent 已保存本地身份、公钥和 pending 注册事务，请求 Server 提交。
+    RegistrationCommit commit = 3;
+
+    // Server 已激活 Agent 并最终消费 Token，首次注册至此完成。
+    RegistrationCommitted committed = 4;
   }
 }
 
 // Agent 在已加密 XXpsk3 会话中提交的注册资料。
-message TokenRequest {
+message RegistrationRequest {
   // 一次性注册 Token；只能位于 Noise 密文中，Server 验证成功后应将其消费。
   string token = 1;
 
@@ -24,10 +33,25 @@ message TokenRequest {
   string agent_name = 2;
 }
 
-// Server 已成功保存 Agent 公钥和业务身份后的注册响应。
-message TokenResponse {
-  // Server 分配的稳定业务 ID，Agent 应与双方 Noise 公钥一同持久化。
-  string agent_id = 1;
+// Server 已持久化 pending 注册后返回的准备结果。
+message RegistrationPrepared {
+  // Server 生成的注册事务 UUID，固定 16 字节；所有重试必须复用同一个值。
+  bytes registration_id = 1;
+
+  // Server 分配的稳定业务 ID，Agent 应与双方 Noise 公钥和事务 ID 一同持久化。
+  string agent_id = 2;
+}
+
+// Agent 确认本地已经保存本次注册所需全部身份材料。
+message RegistrationCommit {
+  // 必须匹配对应 RegistrationPrepared.registration_id。
+  bytes registration_id = 1;
+}
+
+// Server 确认注册已经提交，Agent 可以把本地 pending 状态标记为完成。
+message RegistrationCommitted {
+  // 必须匹配对应 RegistrationCommit.registration_id。
+  bytes registration_id = 1;
 }
 
 // 已授权会话中通用业务请求和响应的封装。

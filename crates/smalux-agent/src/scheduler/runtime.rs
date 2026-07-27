@@ -4,9 +4,10 @@ mod engine;
 mod timing;
 
 use super::event::SchedulerEvent;
-use super::task::{ActionTask, AsyncCallback, TaskBinding, ValueTask};
+use super::task::{ActionTask, AsyncCallback, ReportingTask, TaskBinding, ValueTask};
 use super::*;
 use engine::SchedulerActor;
+use smalux_protocol::agent::v1::TaskResult;
 use std::sync::Arc;
 use std::time::Duration;
 use timing::validate_config;
@@ -172,7 +173,8 @@ impl Scheduler {
     ///     )
     ///     .await?;
     /// ```
-    pub async fn add_action<T>(
+    #[allow(dead_code)]
+    pub(crate) async fn add_action<T>(
         &self,
         trigger: Trigger,
         task: Arc<T>,
@@ -187,7 +189,8 @@ impl Scheduler {
     /// 注册 ValueTask，并把每次成功输出发送到有界 Channel。
     ///
     /// 接收端关闭会触发 `OutputChannelClosed` 并自动删除 Job。
-    pub async fn add_value_channel<T>(
+    #[allow(dead_code)]
+    pub(crate) async fn add_value_channel<T>(
         &self,
         trigger: Trigger,
         task: Arc<T>,
@@ -204,7 +207,8 @@ impl Scheduler {
     /// 注册 ValueTask，并使用异步 Callback 消费每次成功输出。
     ///
     /// Callback 临时失败只记录交付失败，不会重新运行已经成功的 Task。
-    pub async fn add_value_callback<T, C>(
+    #[allow(dead_code)]
+    pub(crate) async fn add_value_callback<T, C>(
         &self,
         trigger: Trigger,
         task: Arc<T>,
@@ -219,7 +223,28 @@ impl Scheduler {
             .await
     }
 
+    /// 注册标准上报 Task，并把每次 Proto 结果发送到有界 Channel。
+    #[allow(dead_code)]
+    pub(crate) async fn add_reporting_channel<T>(
+        &self,
+        trigger: Trigger,
+        task: Arc<T>,
+        sender: mpsc::Sender<TaskResult>,
+        options: JobOptions,
+    ) -> Result<JobId, SchedulerError>
+    where
+        T: ReportingTask,
+    {
+        self.add(
+            trigger,
+            TaskBinding::reporting_channel(task, sender),
+            options,
+        )
+        .await
+    }
+
     /// 将三种公开注册方式统一为类型擦除后的 Add 命令。
+    #[allow(dead_code)]
     async fn add(
         &self,
         trigger: Trigger,
@@ -227,6 +252,31 @@ impl Scheduler {
         options: JobOptions,
     ) -> Result<JobId, SchedulerError> {
         self.request(|response| Command::Add {
+            job_id: None,
+            generation: 0,
+            enabled: true,
+            trigger,
+            task,
+            options,
+            response,
+        })
+        .await
+    }
+
+    /// 使用调用方 UUID 和私有 generation 安装已校验 Job。
+    pub(crate) async fn install(
+        &self,
+        job_id: JobId,
+        generation: u64,
+        enabled: bool,
+        trigger: Trigger,
+        task: TaskBinding,
+        options: JobOptions,
+    ) -> Result<JobId, SchedulerError> {
+        self.request(|response| Command::Add {
+            job_id: Some(job_id),
+            generation,
+            enabled,
             trigger,
             task,
             options,
@@ -238,7 +288,7 @@ impl Scheduler {
     /// 使用 expected_version 原子更新 Job，并返回更新后快照。
     ///
     /// Patch 校验失败不会修改原 Job；版本冲突时调用方应重新 get 后决定是否重试。
-    pub async fn update(
+    pub(crate) async fn update(
         &self,
         job_id: JobId,
         expected_version: u64,
@@ -254,20 +304,21 @@ impl Scheduler {
     }
 
     /// 查询单个 Job 的一致性快照；不存在时返回 `Ok(None)`。
-    pub async fn get(&self, job_id: JobId) -> Result<Option<JobSnapshot>, SchedulerError> {
+    pub(crate) async fn get(&self, job_id: JobId) -> Result<Option<JobSnapshot>, SchedulerError> {
         self.request(|response| Command::Get { job_id, response })
             .await
     }
 
     /// 返回 Actor 当前保存的全部 Job 快照，顺序不保证稳定。
-    pub async fn list(&self) -> Result<Vec<JobSnapshot>, SchedulerError> {
+    #[allow(dead_code)]
+    pub(crate) async fn list(&self) -> Result<Vec<JobSnapshot>, SchedulerError> {
         self.request(|response| Command::List { response }).await
     }
 
     /// 启用 Disabled 或 Completed Job，并重新安排首次 Trigger。
     ///
     /// 对已经 Enabled 的同版本 Job 为幂等操作，不增加版本。
-    pub async fn enable(
+    pub(crate) async fn enable(
         &self,
         job_id: JobId,
         expected_version: u64,
@@ -281,7 +332,7 @@ impl Scheduler {
     }
 
     /// 停用 Job、清理 Pending/Retry，并取消该版本正在执行的实例。
-    pub async fn disable(
+    pub(crate) async fn disable(
         &self,
         job_id: JobId,
         expected_version: u64,
@@ -297,7 +348,11 @@ impl Scheduler {
     }
 
     /// 删除 Job 并取消该版本正在执行的实例。
-    pub async fn delete(&self, job_id: JobId, expected_version: u64) -> Result<(), SchedulerError> {
+    pub(crate) async fn delete(
+        &self,
+        job_id: JobId,
+        expected_version: u64,
+    ) -> Result<(), SchedulerError> {
         self.request(|response| Command::Delete {
             job_id,
             expected_version,
@@ -347,6 +402,9 @@ impl Scheduler {
 enum Command {
     /// 注册新 Job。
     Add {
+        job_id: Option<JobId>,
+        generation: u64,
+        enabled: bool,
         trigger: Trigger,
         task: TaskBinding,
         options: JobOptions,
@@ -365,6 +423,7 @@ enum Command {
         response: oneshot::Sender<Result<Option<JobSnapshot>, SchedulerError>>,
     },
     /// 查询全部 Job。
+    #[allow(dead_code)]
     List {
         response: oneshot::Sender<Result<Vec<JobSnapshot>, SchedulerError>>,
     },

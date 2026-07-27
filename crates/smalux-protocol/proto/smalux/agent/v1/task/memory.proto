@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// Memory Task 当前无配置；保留独立消息以便后续兼容扩展。
+message MemoryTaskConfig {}
+
+// 物理内存与交换区快照，容量单位均为字节。
+message MemorySnapshot {
+  // 操作系统可管理的物理内存总量。
+  uint64 total_bytes = 1;
+  // 当前已使用的物理内存。
+  uint64 used_bytes = 2;
+  // 可立即供应用使用的估算内存。
+  uint64 available_bytes = 3;
+  // 完全空闲的物理内存。
+  uint64 free_bytes = 4;
+  // 物理内存使用率，范围 0..100。
+  double usage_percent = 5;
+  // 交换区总容量。
+  uint64 swap_total_bytes = 6;
+  // 当前已使用交换区容量。
+  uint64 swap_used_bytes = 7;
+  // 当前空闲交换区容量。
+  uint64 swap_free_bytes = 8;
+  // 交换区使用率，范围 0..100；无交换区时为 0。
+  double swap_usage_percent = 9;
+}

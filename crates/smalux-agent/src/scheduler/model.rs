@@ -68,6 +68,7 @@ pub struct Trigger {
     pub timeout: Option<Duration>,
 }
 
+#[allow(dead_code)] // 旧调度器单元测试仍用便捷构造；正式 Job 从 Proto 编译。
 impl Trigger {
     /// 创建一次性 Trigger，默认超时 30 秒。
     ///
@@ -334,9 +335,9 @@ pub enum RescheduleMode {
 
 /// Job 部分更新。
 #[derive(Default)]
-pub struct JobPatch {
+pub(crate) struct JobPatch {
     /// 替换 Task 注册；`None` 保持原 Task。
-    pub task: Option<TaskBinding>,
+    pub(crate) task: Option<TaskBinding>,
     /// 替换 Trigger；`None` 保持原 Trigger。
     pub trigger: Option<Trigger>,
     /// 修改或恢复继承单 Job 并发限制。

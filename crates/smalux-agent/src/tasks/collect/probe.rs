@@ -10,25 +10,32 @@ use std::{sync::Arc, time::Instant};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+pub use smalux_protocol::agent::v1::ProbeTaskConfig;
+use smalux_protocol::agent::v1::{
+    ProbeAttemptSnapshot, ProbeNodeSnapshot, ProbeProtocol, ProbeSnapshot, SampleMetadata,
+    TaskResult, task_result,
+};
 use tokio::sync::Mutex;
 
-use crate::scheduler::{TaskContext, TaskError, ValueTask};
+use crate::scheduler::{ReportingTask, TaskContext, TaskError};
 
-use super::{
-    MetricSample,
-    sample::{duration_ms, unix_timestamp_ms},
-};
+use super::sample::{duration_ms, unix_timestamp_ms};
 use http::HttpClients;
 use icmp_echo::IcmpClients;
 
-pub use model::{
-    HttpStatusRange, ProbeAttemptSnapshot, ProbeConfigError, ProbeNodeConfig, ProbeNodeSnapshot,
-    ProbeProtocol, ProbeSnapshot, ProbeTarget, ProbeTaskConfig,
+pub use model::ProbeConfigError;
+#[cfg(test)]
+use model::{HttpStatusRange, ProbeNodeConfig};
+use model::{
+    ProbeAttemptSnapshot as CollectedAttempt, ProbeNodeSnapshot as CollectedNode,
+    ProbeProtocol as CollectedProtocol, ProbeSnapshot as CollectedSnapshot, ProbeTarget,
+    ProbeTaskConfig as CompiledProbeTaskConfig, compile_config,
 };
 
 /// 并发执行多个网络节点探测的调度任务。
 pub struct ProbeTask {
     config: ProbeTaskConfig,
+    compiled: CompiledProbeTaskConfig,
     last_sampled_at: Mutex<Option<Instant>>,
 }
 
@@ -38,9 +45,10 @@ impl ProbeTask {
 
     /// 校验配置并创建 Probe Task。
     pub fn try_with_config(config: ProbeTaskConfig) -> Result<Self, ProbeConfigError> {
-        config.validate()?;
+        let compiled = compile_config(&config)?;
         Ok(Self {
             config,
+            compiled,
             last_sampled_at: Mutex::new(None),
         })
     }
@@ -52,10 +60,8 @@ impl ProbeTask {
 }
 
 #[async_trait]
-impl ValueTask for ProbeTask {
-    type Output = MetricSample<ProbeSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
+impl ReportingTask for ProbeTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let cancellation = context.cancellation;
         let sampled_at = Instant::now();
         let sampled_at_ms = unix_timestamp_ms();
@@ -69,13 +75,13 @@ impl ValueTask for ProbeTask {
             }
         };
         let icmp_clients = self
-            .config
+            .compiled
             .nodes
             .iter()
             .any(|node| matches!(node.target, ProbeTarget::IcmpEcho))
             .then(|| Arc::new(IcmpClients::new()));
         let http_clients = self
-            .config
+            .compiled
             .nodes
             .iter()
             .any(|node| matches!(node.target, ProbeTarget::Http { .. }))
@@ -87,7 +93,7 @@ impl ValueTask for ProbeTask {
             .map(Arc::new);
         let identifier_seed =
             u16::from_le_bytes([context.run_id.as_bytes()[0], context.run_id.as_bytes()[1]]);
-        let work = stream::iter(self.config.nodes.iter().cloned().enumerate().map(
+        let work = stream::iter(self.compiled.nodes.iter().cloned().enumerate().map(
             |(index, node)| {
                 let cancellation = cancellation.clone();
                 let clients = icmp_clients.clone();
@@ -121,7 +127,7 @@ impl ValueTask for ProbeTask {
                 }
             },
         ))
-        .buffer_unordered(self.config.concurrency.get())
+        .buffer_unordered(self.compiled.concurrency.get())
         .collect::<Vec<_>>();
         let mut results = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -137,20 +143,74 @@ impl ValueTask for ProbeTask {
             .into_iter()
             .map(|(_, result)| result.expect("cancelled results returned above"))
             .collect::<Vec<_>>();
-        let snapshot = ProbeSnapshot {
+        let snapshot = CollectedSnapshot {
             total_nodes: nodes.len(),
             healthy_nodes: nodes.iter().filter(|node| node.succeeded > 0).count(),
             nodes,
         };
-        Ok(MetricSample::new(
-            sampled_at_ms,
-            sample_interval_ms,
-            snapshot,
-        ))
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms,
+                sample_interval_ms,
+            }),
+            result: Some(task_result::Result::Probe(into_proto_snapshot(snapshot))),
+        })
     }
 
     fn kind(&self) -> &'static str {
         Self::KIND
+    }
+}
+
+fn into_proto_snapshot(snapshot: CollectedSnapshot) -> ProbeSnapshot {
+    ProbeSnapshot {
+        total_nodes: snapshot.total_nodes.try_into().unwrap_or(u32::MAX),
+        healthy_nodes: snapshot.healthy_nodes.try_into().unwrap_or(u32::MAX),
+        nodes: snapshot.nodes.into_iter().map(into_proto_node).collect(),
+    }
+}
+
+fn into_proto_node(node: CollectedNode) -> ProbeNodeSnapshot {
+    ProbeNodeSnapshot {
+        name: node.name,
+        host: node.host,
+        protocol: match node.protocol {
+            CollectedProtocol::IcmpEcho => ProbeProtocol::IcmpEcho as i32,
+            CollectedProtocol::TcpConnect => ProbeProtocol::TcpConnect as i32,
+            CollectedProtocol::Http => ProbeProtocol::Http as i32,
+        },
+        port: node.port.map(u32::from),
+        url: node.url,
+        resolved_ip: node.resolved_ip,
+        attempted: node.attempted.into(),
+        succeeded: node.succeeded.into(),
+        failure_percent: node.failure_percent,
+        min_latency_ms: node.min_latency_ms,
+        avg_latency_ms: node.avg_latency_ms,
+        max_latency_ms: node.max_latency_ms,
+        attempts: node.attempts.into_iter().map(into_proto_attempt).collect(),
+    }
+}
+
+fn into_proto_attempt(attempt: CollectedAttempt) -> ProbeAttemptSnapshot {
+    ProbeAttemptSnapshot {
+        sequence: attempt.sequence.into(),
+        success: attempt.success,
+        latency_ms: attempt.latency_ms,
+        status_code: attempt.status_code.map(u32::from),
+        error: attempt.error,
+    }
+}
+
+#[cfg(test)]
+impl ProbeTask {
+    fn from_compiled_for_test(compiled: CompiledProbeTaskConfig) -> Result<Self, ProbeConfigError> {
+        compiled.validate()?;
+        Ok(Self {
+            config: ProbeTaskConfig::default(),
+            compiled,
+            last_sampled_at: Mutex::new(None),
+        })
     }
 }
 
@@ -168,7 +228,7 @@ mod tests {
     };
 
     use crate::{
-        scheduler::{TaskError, ValueTask},
+        scheduler::{ReportingTask, TaskError},
         tasks::collect::context,
     };
 
@@ -247,7 +307,7 @@ mod tests {
         let closed_port = closed_listener.local_addr().unwrap().port();
         drop(closed_listener);
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let task = ProbeTask::try_with_config(ProbeTaskConfig {
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
             concurrency: NonZeroUsize::new(2).unwrap(),
             nodes: vec![tcp_node("open", open_port), tcp_node("closed", closed_port)],
         })
@@ -256,13 +316,16 @@ mod tests {
         let output = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), ProbeTask::KIND);
-        assert_eq!(output.snapshot.total_nodes, 2);
-        assert_eq!(output.snapshot.healthy_nodes, 1);
-        assert_eq!(output.snapshot.nodes[0].name, "open");
-        assert_eq!(output.snapshot.nodes[0].succeeded, 1);
-        assert_eq!(output.snapshot.nodes[1].name, "closed");
-        assert_eq!(output.snapshot.nodes[1].succeeded, 0);
-        assert_eq!(output.snapshot.nodes[1].failure_percent, 100.0);
+        let Some(task_result::Result::Probe(snapshot)) = output.result else {
+            panic!("probe task must return TaskResult.probe");
+        };
+        assert_eq!(snapshot.total_nodes, 2);
+        assert_eq!(snapshot.healthy_nodes, 1);
+        assert_eq!(snapshot.nodes[0].name, "open");
+        assert_eq!(snapshot.nodes[0].succeeded, 1);
+        assert_eq!(snapshot.nodes[1].name, "closed");
+        assert_eq!(snapshot.nodes[1].succeeded, 0);
+        assert_eq!(snapshot.nodes[1].failure_percent, 100.0);
         accept.await.unwrap();
     }
 
@@ -270,7 +333,7 @@ mod tests {
     async fn task_records_http_status_and_applies_expected_range() {
         let (healthy_url, healthy_server) = http_endpoint(204).await;
         let (failing_url, failing_server) = http_endpoint(503).await;
-        let task = ProbeTask::try_with_config(ProbeTaskConfig {
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
             concurrency: NonZeroUsize::new(2).unwrap(),
             nodes: vec![
                 http_node("healthy", healthy_url.clone()),
@@ -281,23 +344,20 @@ mod tests {
 
         let output = task.run(context()).await.unwrap();
 
-        assert_eq!(output.snapshot.healthy_nodes, 1);
-        assert_eq!(output.snapshot.nodes[0].protocol, ProbeProtocol::Http);
-        assert_eq!(
-            output.snapshot.nodes[0].url.as_deref(),
-            Some(healthy_url.as_str())
-        );
-        assert_eq!(output.snapshot.nodes[0].attempts[0].status_code, Some(204));
-        assert!(output.snapshot.nodes[0].attempts[0].success);
-        assert_eq!(
-            output.snapshot.nodes[1].url.as_deref(),
-            Some(failing_url.as_str())
-        );
-        assert_eq!(output.snapshot.nodes[1].attempts[0].status_code, Some(503));
-        assert!(!output.snapshot.nodes[1].attempts[0].success);
-        assert_eq!(output.snapshot.nodes[1].min_latency_ms, None);
-        assert_eq!(output.snapshot.nodes[1].avg_latency_ms, None);
-        assert_eq!(output.snapshot.nodes[1].max_latency_ms, None);
+        let Some(task_result::Result::Probe(snapshot)) = output.result else {
+            panic!("probe task must return TaskResult.probe");
+        };
+        assert_eq!(snapshot.healthy_nodes, 1);
+        assert_eq!(snapshot.nodes[0].protocol, ProbeProtocol::Http as i32);
+        assert_eq!(snapshot.nodes[0].url.as_deref(), Some(healthy_url.as_str()));
+        assert_eq!(snapshot.nodes[0].attempts[0].status_code, Some(204));
+        assert!(snapshot.nodes[0].attempts[0].success);
+        assert_eq!(snapshot.nodes[1].url.as_deref(), Some(failing_url.as_str()));
+        assert_eq!(snapshot.nodes[1].attempts[0].status_code, Some(503));
+        assert!(!snapshot.nodes[1].attempts[0].success);
+        assert_eq!(snapshot.nodes[1].min_latency_ms, None);
+        assert_eq!(snapshot.nodes[1].avg_latency_ms, None);
+        assert_eq!(snapshot.nodes[1].max_latency_ms, None);
         healthy_server.await.unwrap();
         failing_server.await.unwrap();
     }
@@ -311,7 +371,7 @@ mod tests {
             expected_status: HttpStatusRange { min: 200, max: 299 },
             follow_redirects: true,
         };
-        let task = ProbeTask::try_with_config(ProbeTaskConfig {
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
             concurrency: NonZeroUsize::new(1).unwrap(),
             nodes: vec![node],
         })
@@ -319,15 +379,18 @@ mod tests {
 
         let output = task.run(context()).await.unwrap();
 
-        assert_eq!(output.snapshot.healthy_nodes, 1);
-        assert_eq!(output.snapshot.nodes[0].attempts[0].status_code, Some(204));
-        assert!(output.snapshot.nodes[0].attempts[0].success);
+        let Some(task_result::Result::Probe(snapshot)) = output.result else {
+            panic!("probe task must return TaskResult.probe");
+        };
+        assert_eq!(snapshot.healthy_nodes, 1);
+        assert_eq!(snapshot.nodes[0].attempts[0].status_code, Some(204));
+        assert!(snapshot.nodes[0].attempts[0].success);
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn task_honors_pre_cancelled_context() {
-        let task = ProbeTask::try_with_config(ProbeTaskConfig {
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
             concurrency: NonZeroUsize::new(1).unwrap(),
             nodes: vec![tcp_node("cancelled", 9)],
         })

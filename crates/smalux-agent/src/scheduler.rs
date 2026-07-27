@@ -8,19 +8,19 @@ pub mod event;
 mod model;
 mod queue;
 mod runtime;
-pub mod task;
+mod task;
 
 pub use config::{
     SchedulerConfig, SchedulerConfigPatch, SchedulerConfigSnapshot, SchedulerError, SchedulerStatus,
 };
 pub use event::{SchedulerEvent, SchedulerEventKind};
-pub use model::{
+pub(crate) use model::{
     CapacityPolicy, ExecutionRetryPolicy, FailurePolicy, JobId, JobOptions, JobPatch, JobPriority,
     JobSnapshot, JobState, MisfirePolicy, PatchValue, RescheduleMode, RetryCondition, RunId,
     Schedule, Trigger, TriggerCoalescing,
 };
 pub use runtime::{Scheduler, SchedulerRuntime};
+pub(crate) use task::TaskBinding;
 pub use task::{
-    ActionTask, CallbackError, TaskBinding, TaskCancellationMode, TaskContext, TaskError,
-    ValueTask, async_callback,
+    CallbackError, ReportingTask, TaskCancellationMode, TaskContext, TaskError, TaskReportSink,
 };

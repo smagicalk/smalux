@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// Host Task 当前无配置；保留独立消息以便后续兼容扩展。
+message HostTaskConfig {}
+
+// 主机身份、操作系统和启动信息快照。
+message HostSnapshot {
+  // 操作系统报告的主机名。
+  string hostname = 1;
+  // 操作系统名称，例如 Windows 或 Linux。
+  string os_name = 2;
+  // 操作系统发行版或产品版本。
+  string os_version = 3;
+  // 当前内核版本。
+  string kernel_version = 4;
+  // 当前进程看到的硬件架构，例如 x86_64。
+  string architecture = 5;
+  // 自系统启动以来的秒数。
+  uint64 uptime_seconds = 6;
+  // 系统启动时刻的 Unix 秒时间戳。
+  uint64 boot_time_seconds = 7;
+}

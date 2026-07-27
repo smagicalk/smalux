@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "google/protobuf/duration.proto";
+import "smalux/agent/v1/task/selection.proto";
+
+// 本地网卡地址采集配置。
+message LocalIpTaskConfig {
+  // 网卡名筛选；缺失或列表为空时选择全部网卡。
+  InterfaceSelection interfaces = 1;
+}
+
+// 公网 IP 探测配置。
+message PublicIpTaskConfig {
+  // 每个外部解析请求的超时，必须大于零。
+  google.protobuf.Duration timeout = 1;
+  // 要解析 IPv4、IPv6 或两者。
+  IpFamilySelection family = 2;
+}
+
+// 系统组合采集中使用的本地地址与可选公网地址状态。
+message IpSnapshot {
+  // 选中网卡上的全部本地地址。
+  repeated InterfaceAddress local = 1;
+  // 公网 IPv4 状态；未执行外部探测时为 NOT_REQUESTED。
+  PublicIpState public_ipv4 = 2;
+  // 公网 IPv6 状态；未执行外部探测时为 NOT_REQUESTED。
+  PublicIpState public_ipv6 = 3;
+}
+
+// 独立公网 IP Task 的结果。
+message PublicIpSnapshot {
+  // IPv4 解析状态和结果。
+  PublicIpState ipv4 = 1;
+  // IPv6 解析状态和结果。
+  PublicIpState ipv6 = 2;
+}
+
+// 网卡上的一个 IP 地址。
+message InterfaceAddress {
+  // 地址所属的完整网卡名称。
+  string interface = 1;
+  // 标准文本格式 IPv4 或 IPv6 地址，不含端口。
+  string address = 2;
+  // CIDR 前缀长度，例如 IPv4 `/24` 写为 24。
+  uint32 prefix_length = 3;
+  // 根据地址范围判断的可达作用域。
+  IpScope scope = 4;
+}
+
+// 本地 IP 地址作用域。
+enum IpScope {
+  // 未指定，仅作为 Proto 零值。
+  IP_SCOPE_UNSPECIFIED = 0;
+  // 回环地址，例如 127.0.0.1 或 ::1。
+  IP_SCOPE_LOOPBACK = 1;
+  // 私有网络地址。
+  IP_SCOPE_PRIVATE = 2;
+  // 链路本地地址。
+  IP_SCOPE_LINK_LOCAL = 3;
+  // 可全局路由地址。
+  IP_SCOPE_GLOBAL = 4;
+  // 无法归入以上类别的地址。
+  IP_SCOPE_OTHER = 5;
+}
+
+// 单个公网协议族的解析状态。
+message PublicIpState {
+  // 是否请求、成功或失败。
+  PublicIpStatus status = 1;
+  // 成功解析后的标准文本地址。
+  optional string address = 2;
+  // 失败时的人类可读原因，不用于机器分支判断。
+  optional string message = 3;
+}
+
+// 公网 IP 解析结果状态。
+enum PublicIpStatus {
+  // 未指定，仅作为 Proto 零值。
+  PUBLIC_IP_STATUS_UNSPECIFIED = 0;
+  // 配置未要求探测该协议族。
+  PUBLIC_IP_STATUS_NOT_REQUESTED = 1;
+  // 已成功获得公网地址。
+  PUBLIC_IP_STATUS_RESOLVED = 2;
+  // 请求、解析或地址校验失败。
+  PUBLIC_IP_STATUS_FAILED = 3;
+}

@@ -8,9 +8,9 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::{
     agent::v1::{
-        ProtocolFrame, SecureErrorCode, SecureMessage, TokenMessage,
-        agent_transport_client::AgentTransportClient, protocol_frame, secure_message,
-        token_message,
+        ProtocolFrame, RegistrationCommit, RegistrationMessage, RegistrationRequest,
+        SecureErrorCode, SecureMessage, agent_transport_client::AgentTransportClient,
+        protocol_frame, registration_message, secure_message,
     },
     noise::{ClientIkHandshake, ClientXxHandshake, NoiseIdentity, NoisePublicKey},
 };
@@ -18,15 +18,80 @@ use crate::{
 use super::{TonicNoiseSession, TransportError};
 
 /// 首次注册成功后，业务层需要处理和持久化的完整结果。
-pub struct EnrollmentOutcome {
-    /// Server 在加密 TokenResponse 中确认的 Agent 业务 ID。
+pub struct AgentRegistration {
+    /// Server 在加密 RegistrationPrepared 中分配的 Agent 业务 ID。
     pub agent_id: String,
     /// 本次注册使用的 Agent 长期 Noise 身份；含私钥。
     pub agent_identity: NoiseIdentity,
     /// XXpsk3 认证后学到的 Server 静态公钥，后续 IK 必须固定它。
     pub server_public_key: NoisePublicKey,
-    /// 注册完成后仍然可用的当前加密流；调用方也可以直接丢弃并改用 IK 重连。
+    /// Server 分配的注册事务 ID；可用于诊断或持久化审计记录。
+    pub registration_id: [u8; 16],
+    /// 注册完成后仍然可用的当前加密流；首次业务应直接复用，断线后再改用 IK 重连。
     pub session: TonicNoiseSession,
+}
+
+/// Server 已准备注册、等待 Agent 完成本地持久化并提交确认的阶段。
+///
+/// 调用方取得本对象后，应先保存 `agent_identity`、`server_public_key`、`agent_id` 和
+/// `registration_id`，保存成功后再调用 [`Self::commit`]。如果保存失败，直接丢弃本对象；
+/// 下一次用相同 Token 和 Agent 公钥重新注册时，Server 应返回相同 pending 事务。
+pub struct AgentPendingRegistration {
+    /// Server 分配的稳定业务 ID。
+    pub agent_id: String,
+    /// 本次注册使用的 Agent 长期 Noise 身份；含私钥。
+    pub agent_identity: NoiseIdentity,
+    /// XXpsk3 认证后学到的 Server 静态公钥。
+    pub server_public_key: NoisePublicKey,
+    /// Server 分配的 16 字节幂等注册事务 ID。
+    pub registration_id: [u8; 16],
+    /// 等待最终提交确认的当前 XXpsk3 加密流。
+    session: TonicNoiseSession,
+    /// 等待最终确认的时间上限。
+    confirmation_timeout: Duration,
+}
+
+impl AgentPendingRegistration {
+    /// 通知 Server 本地身份已经保存，并等待最终 `RegistrationCommitted`。
+    pub async fn commit(mut self) -> Result<AgentRegistration, TransportError> {
+        self.session
+            .send(SecureMessage {
+                body: Some(secure_message::Body::RegistrationMessage(
+                    RegistrationMessage {
+                        body: Some(registration_message::Body::Commit(RegistrationCommit {
+                            registration_id: self.registration_id.to_vec(),
+                        })),
+                    },
+                )),
+            })
+            .await?;
+        let response = timeout(self.confirmation_timeout, self.session.receive())
+            .await
+            .map_err(|_| TransportError::Timeout("waiting for registration commit"))??
+            .ok_or(TransportError::Closed)?;
+        match response.body {
+            Some(secure_message::Body::RegistrationMessage(RegistrationMessage {
+                body: Some(registration_message::Body::Committed(committed)),
+            })) if committed.registration_id == self.registration_id => {}
+            Some(secure_message::Body::Error(error)) => {
+                let code =
+                    SecureErrorCode::try_from(error.code).unwrap_or(SecureErrorCode::Unspecified);
+                return Err(TransportError::RemoteSecure(code, error.message));
+            }
+            _ => {
+                return Err(TransportError::Protocol(
+                    "expected matching encrypted RegistrationCommitted".to_owned(),
+                ));
+            }
+        }
+        Ok(AgentRegistration {
+            agent_id: self.agent_id,
+            agent_identity: self.agent_identity,
+            server_public_key: self.server_public_key,
+            registration_id: self.registration_id,
+            session: self.session,
+        })
+    }
 }
 
 /// Agent 建立正式 `AgentTransport/OpenSession` 的高层入口。
@@ -59,17 +124,35 @@ impl AgentProtocolClient {
         self.grpc_prefix = Some(prefix.into());
     }
 
-    /// 首次注册：执行 XXpsk3，发送加密 TokenRequest，并等待加密 TokenResponse。
+    /// 首次注册便捷入口：依次执行 prepare 和 commit，直到收到最终加密确认。
     ///
-    /// Client 不需要预置 Server 公钥。只有返回 `EnrollmentOutcome` 后，调用方才应持久化
+    /// Client 不需要预置 Server 公钥。只有返回 [`AgentRegistration`] 后，调用方才应持久化
     /// `server_public_key` 并把 Agent 标记为注册成功。
-    pub async fn enroll(
+    pub async fn register_agent(
         &self,
         identity: NoiseIdentity,
         psk: &[u8],
         token: String,
         agent_name: String,
-    ) -> Result<EnrollmentOutcome, TransportError> {
+    ) -> Result<AgentRegistration, TransportError> {
+        self.prepare_registration(identity, psk, token, agent_name)
+            .await?
+            .commit()
+            .await
+    }
+
+    /// 首次注册的准备阶段：完成 XXpsk3、发送注册请求并等待 Server 的 pending 结果。
+    ///
+    /// 本方法不会发送最终 commit。调用方必须先持久化返回对象中的身份材料，再调用
+    /// [`AgentPendingRegistration::commit`]。不需要控制持久化时序的简单程序可直接使用
+    /// [`Self::register_agent`] 完成两步调用。
+    pub async fn prepare_registration(
+        &self,
+        identity: NoiseIdentity,
+        psk: &[u8],
+        token: String,
+        agent_name: String,
+    ) -> Result<AgentPendingRegistration, TransportError> {
         // 第一步只生成 XXpsk3 message 1；此时尚未信任任何 Server 静态公钥。
         let (waiting, first) = ClientXxHandshake::start(&identity, psk)?;
         // 打开 gRPC 双向流，并把 message 1 作为首帧发送。
@@ -88,18 +171,24 @@ impl AgentProtocolClient {
         // Token 放在 Noise transport 密文中；TLS/CDN 只能看到 ciphertext 帧。
         session
             .send(SecureMessage {
-                body: Some(secure_message::Body::TokenMessage(TokenMessage {
-                    body: Some(token_message::Body::Request(
-                        crate::agent::v1::TokenRequest { token, agent_name },
-                    )),
-                })),
+                body: Some(secure_message::Body::RegistrationMessage(
+                    RegistrationMessage {
+                        body: Some(registration_message::Body::Request(RegistrationRequest {
+                            token,
+                            agent_name,
+                        })),
+                    },
+                )),
             })
             .await?;
-        // 注册只有收到加密 TokenResponse 才算成功；中途关闭不会返回 EnrollmentOutcome。
-        let response = session.receive().await?.ok_or(TransportError::Closed)?;
+        // 这里仅等待 Server 持久化 pending；最终成功还需要 Agent commit 和 Server committed。
+        let response = timeout(self.handshake_timeout, session.receive())
+            .await
+            .map_err(|_| TransportError::Timeout("waiting for registration preparation"))??
+            .ok_or(TransportError::Closed)?;
         let response = match response.body {
-            Some(secure_message::Body::TokenMessage(TokenMessage {
-                body: Some(token_message::Body::Response(response)),
+            Some(secure_message::Body::RegistrationMessage(RegistrationMessage {
+                body: Some(registration_message::Body::Prepared(response)),
             })) => response,
             Some(secure_message::Body::Error(error)) => {
                 let code =
@@ -108,15 +197,20 @@ impl AgentProtocolClient {
             }
             _ => {
                 return Err(TransportError::Protocol(
-                    "expected encrypted TokenResponse".to_owned(),
+                    "expected encrypted RegistrationPrepared".to_owned(),
                 ));
             }
         };
-        Ok(EnrollmentOutcome {
+        let registration_id: [u8; 16] = response.registration_id.try_into().map_err(|_| {
+            TransportError::Protocol("registration ID must contain exactly 16 bytes".to_owned())
+        })?;
+        Ok(AgentPendingRegistration {
             agent_id: response.agent_id,
             agent_identity: identity,
             server_public_key,
+            registration_id,
             session,
+            confirmation_timeout: self.handshake_timeout,
         })
     }
 

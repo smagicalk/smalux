@@ -5,7 +5,7 @@ use std::{net::IpAddr, time::Duration};
 use anyhow::{Context, ensure};
 use futures_util::stream::{self, StreamExt};
 
-use super::{PublicIpSnapshot, PublicIpState};
+use super::{PublicIpSnapshot, PublicIpState, PublicIpStatus, public_ip_not_requested};
 
 /// 单个地址族同时进行的公网 IP 请求数。
 ///
@@ -102,9 +102,13 @@ pub async fn fetch_public_ips(
 /// ```ignore
 /// let snapshot = collect_public(Duration::from_secs(3)).await;
 /// match snapshot.ipv4 {
-///     PublicIpState::Resolved { address } => println!("{address}"),
-///     PublicIpState::Failed { message } => eprintln!("{message}"),
-///     PublicIpState::NotRequested => {}
+///     Some(state) if state.status == PublicIpStatus::Resolved as i32 => {
+///         println!("{}", state.address.as_deref().unwrap_or_default());
+///     }
+///     Some(state) if state.status == PublicIpStatus::Failed as i32 => {
+///         eprintln!("{}", state.message.as_deref().unwrap_or_default());
+///     }
+///     _ => {}
 /// }
 /// ```
 pub async fn collect_public(timeout: Duration) -> PublicIpSnapshot {
@@ -124,25 +128,25 @@ pub(crate) async fn collect_public_families(
                 fetch_from_endpoints(&client, IPV6_ENDPOINTS, timeout)
             );
             PublicIpSnapshot {
-                ipv4: into_public_ip_state(ipv4),
-                ipv6: into_public_ip_state(ipv6),
+                ipv4: Some(into_public_ip_state(ipv4)),
+                ipv6: Some(into_public_ip_state(ipv6)),
             }
         }
         (true, false) => PublicIpSnapshot {
-            ipv4: into_public_ip_state(
+            ipv4: Some(into_public_ip_state(
                 fetch_from_endpoints(&client, IPV4_ENDPOINTS, timeout).await,
-            ),
-            ipv6: PublicIpState::NotRequested,
+            )),
+            ipv6: Some(public_ip_not_requested()),
         },
         (false, true) => PublicIpSnapshot {
-            ipv4: PublicIpState::NotRequested,
-            ipv6: into_public_ip_state(
+            ipv4: Some(public_ip_not_requested()),
+            ipv6: Some(into_public_ip_state(
                 fetch_from_endpoints(&client, IPV6_ENDPOINTS, timeout).await,
-            ),
+            )),
         },
         (false, false) => PublicIpSnapshot {
-            ipv4: PublicIpState::NotRequested,
-            ipv6: PublicIpState::NotRequested,
+            ipv4: Some(public_ip_not_requested()),
+            ipv6: Some(public_ip_not_requested()),
         },
     }
 }
@@ -150,9 +154,15 @@ pub(crate) async fn collect_public_families(
 /// 把端点查询结果转换为可序列化的稳定状态模型。
 fn into_public_ip_state(result: anyhow::Result<IpAddr>) -> PublicIpState {
     match result {
-        Ok(address) => PublicIpState::Resolved { address },
-        Err(error) => PublicIpState::Failed {
-            message: error.to_string(),
+        Ok(address) => PublicIpState {
+            status: PublicIpStatus::Resolved as i32,
+            address: Some(address.to_string()),
+            message: None,
+        },
+        Err(error) => PublicIpState {
+            status: PublicIpStatus::Failed as i32,
+            address: None,
+            message: Some(error.to_string()),
         },
     }
 }
@@ -259,8 +269,14 @@ mod tests {
     async fn unrequested_public_ip_families_do_not_start_requests() {
         let snapshot = collect_public_families(Duration::from_secs(1), false, false).await;
 
-        assert!(matches!(snapshot.ipv4, PublicIpState::NotRequested));
-        assert!(matches!(snapshot.ipv6, PublicIpState::NotRequested));
+        assert_eq!(
+            snapshot.ipv4.expect("IPv4 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
+        assert_eq!(
+            snapshot.ipv6.expect("IPv6 state").status,
+            PublicIpStatus::NotRequested as i32
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ syntax = "proto3";
 package smalux.agent.v1;
 
 import "smalux/agent/v1/errors.proto";
+import "smalux/agent/v1/job/command.proto";
 import "smalux/agent/v1/messages.proto";
+import "smalux/agent/v1/task/common.proto";
 
 // Agent 与 Server 的版本化 gRPC 入口。
 //
@@ -82,8 +84,8 @@ message NoiseHandshake {
 message SecureMessage {
   // 每条密文只承载一种业务或控制消息。
   oneof body {
-    // 首次注册阶段的 Token 请求或成功响应。
-    TokenMessage token_message = 1;
+    // 首次注册阶段的 request/prepared/commit/committed 状态消息。
+    RegistrationMessage registration_message = 1;
 
     // 已授权会话中的通用请求和响应消息。
     Messages messages = 2;
@@ -96,5 +98,14 @@ message SecureMessage {
 
     // Agent 或 Server 长期静态身份密钥轮换消息。
     KeyRotationMessage key_rotation = 5;
+
+    // Server 主动下发的 Job 配置或运行命令。
+    JobCommand job_command = 6;
+
+    // Agent 应用 JobCommand 后返回的结构化结果。
+    JobCommandResult job_command_result = 7;
+
+    // Agent 中 ReportingTask 的强类型执行结果。
+    TaskReport task_report = 8;
   }
 }

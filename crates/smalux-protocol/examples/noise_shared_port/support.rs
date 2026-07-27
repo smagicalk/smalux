@@ -71,36 +71,57 @@ pub fn public_key_hex(public_key: &[u8]) -> String {
 }
 
 /// 把 64 位十六进制注册 Token 解码成 Noise 要求的 32 字节 PSK。
-pub fn parse_enrollment_psk(value: &str) -> Result<[u8; 32], EnrollmentTokenError> {
+pub fn parse_registration_psk(value: &str) -> Result<[u8; 32], RegistrationTokenError> {
     if value.len() != NOISE_PUBLIC_KEY_LEN * 2 {
-        return Err(EnrollmentTokenError);
+        return Err(RegistrationTokenError);
     }
     let mut key = [0_u8; NOISE_PUBLIC_KEY_LEN];
     for index in (0..value.len()).step_by(2) {
         key[index / 2] =
-            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| EnrollmentTokenError)?;
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| RegistrationTokenError)?;
     }
     Ok(key)
 }
 
 /// Server 为首次注册临时发放的 Token 与已授权 Agent 的映射。
 #[derive(Debug)]
-pub struct EnrollmentRegistry {
+pub struct AgentRegistry {
     data: Mutex<RegistryData>,
 }
 
 #[derive(Debug)]
 struct RegistryData {
-    token: Option<String>,
+    token: String,
     agents: HashMap<Vec<u8>, String>,
+    registrations: HashMap<Vec<u8>, RegistrationRecord>,
     agents_dir: PathBuf,
+    registrations_dir: PathBuf,
 }
 
-impl EnrollmentRegistry {
+#[derive(Clone, Debug)]
+struct RegistrationRecord {
+    registration_id: [u8; 16],
+    token: String,
+    agent_id: String,
+    public_key: Vec<u8>,
+    committed: bool,
+}
+
+/// `prepare` 返回给网络层的稳定注册事务信息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRegistration {
+    pub registration_id: [u8; 16],
+    pub agent_id: String,
+    pub already_committed: bool,
+}
+
+impl AgentRegistry {
     /// 从 `agents/*.key` 恢复 Agent 公钥；本次启动提供一个新的单次注册 Token。
     pub fn load(token: String, data_dir: &Path) -> ExampleResult<Self> {
         let agents_dir = data_dir.join("agents");
+        let registrations_dir = data_dir.join("registrations");
         fs::create_dir_all(&agents_dir)?;
+        fs::create_dir_all(&registrations_dir)?;
         let mut agents = HashMap::new();
 
         for entry in fs::read_dir(&agents_dir)? {
@@ -126,13 +147,137 @@ impl EnrollmentRegistry {
             }
         }
 
+        let mut registrations = HashMap::new();
+        for entry in fs::read_dir(&registrations_dir)? {
+            let directory = entry?.path();
+            if !directory.is_dir() {
+                continue;
+            }
+            let agent_id = fs::read_to_string(directory.join("agent-id.txt"))?;
+            if !valid_agent_name(&agent_id) {
+                return Err("invalid pending Agent name".into());
+            }
+            let token = fs::read_to_string(directory.join("token.txt"))?;
+            let public_key = fs::read(directory.join("public.key"))?;
+            validate_public_key(&public_key)?;
+            let registration_id: [u8; 16] = fs::read(directory.join("registration-id.bin"))?
+                .try_into()
+                .map_err(|_| "registration ID must contain 16 bytes")?;
+            let committed = directory.join("committed").exists();
+            let record = RegistrationRecord {
+                registration_id,
+                token,
+                agent_id,
+                public_key: public_key.clone(),
+                committed,
+            };
+            if registrations.insert(public_key, record).is_some() {
+                return Err("duplicated persisted registration public key".into());
+            }
+        }
+
         Ok(Self {
             data: Mutex::new(RegistryData {
-                token: Some(token),
+                token,
                 agents,
+                registrations,
                 agents_dir,
+                registrations_dir,
             }),
         })
+    }
+
+    /// 验证请求并持久化 pending 注册；完全相同的重试返回同一事务 ID。
+    pub fn prepare(
+        &self,
+        token: &str,
+        agent_name: &str,
+        public_key: &[u8],
+    ) -> Result<PreparedRegistration, RegistrationError> {
+        if !valid_agent_name(agent_name) {
+            return Err(RegistrationError::InvalidAgentName);
+        }
+        validate_public_key(public_key).map_err(|_| RegistrationError::InvalidPublicKey)?;
+        let mut data = self.data.lock().map_err(|_| RegistrationError::Storage)?;
+        if let Some(existing) = data.registrations.get(public_key) {
+            if existing.token == token && existing.agent_id == agent_name {
+                return Ok(PreparedRegistration {
+                    registration_id: existing.registration_id,
+                    agent_id: existing.agent_id.clone(),
+                    already_committed: existing.committed,
+                });
+            }
+            return Err(RegistrationError::AgentAlreadyRegistered);
+        }
+        if data.token != token {
+            return Err(RegistrationError::InvalidToken);
+        }
+        if data
+            .registrations
+            .values()
+            .any(|record| record.token == token)
+        {
+            return Err(RegistrationError::TokenAlreadyUsed);
+        }
+        if data.agents.values().any(|name| name == agent_name)
+            || data
+                .registrations
+                .values()
+                .any(|record| record.agent_id == agent_name)
+        {
+            return Err(RegistrationError::AgentAlreadyRegistered);
+        }
+
+        let mut registration_id = [0_u8; 16];
+        getrandom::fill(&mut registration_id).map_err(|_| RegistrationError::Storage)?;
+        let record = RegistrationRecord {
+            registration_id,
+            token: token.to_owned(),
+            agent_id: agent_name.to_owned(),
+            public_key: public_key.to_vec(),
+            committed: false,
+        };
+        persist_registration(&data.registrations_dir, &record)
+            .map_err(|_| RegistrationError::Storage)?;
+        data.registrations.insert(public_key.to_vec(), record);
+        Ok(PreparedRegistration {
+            registration_id,
+            agent_id: agent_name.to_owned(),
+            already_committed: false,
+        })
+    }
+
+    /// 把匹配事务从 pending 激活为可用于 IK 的 Agent；重复提交保持成功。
+    pub fn commit(
+        &self,
+        registration_id: [u8; 16],
+        public_key: &[u8],
+    ) -> Result<String, RegistrationError> {
+        let mut data = self.data.lock().map_err(|_| RegistrationError::Storage)?;
+        let record = data
+            .registrations
+            .get(public_key)
+            .cloned()
+            .ok_or(RegistrationError::UnknownRegistration)?;
+        if record.registration_id != registration_id {
+            return Err(RegistrationError::InvalidRegistrationId);
+        }
+        if !record.committed {
+            fs::write(
+                data.agents_dir.join(format!("{}.key", record.agent_id)),
+                public_key,
+            )
+            .map_err(|_| RegistrationError::Storage)?;
+            let directory = data.registrations_dir.join(&record.agent_id);
+            fs::write(directory.join("committed"), b"committed")
+                .map_err(|_| RegistrationError::Storage)?;
+            data.agents
+                .insert(public_key.to_vec(), record.agent_id.clone());
+            if let Some(stored) = data.registrations.get_mut(public_key) {
+                stored.committed = true;
+            }
+        }
+        Ok(record.agent_id)
     }
 
     /// 验证 Token 后绑定 Agent 名称和 XX 握手中得到的静态公钥。
@@ -141,54 +286,28 @@ impl EnrollmentRegistry {
         token: &str,
         agent_name: &str,
         public_key: &[u8],
-    ) -> Result<String, EnrollmentError> {
-        if !valid_agent_name(agent_name) {
-            return Err(EnrollmentError::InvalidAgentName);
-        }
-        validate_public_key(public_key).map_err(|_| EnrollmentError::InvalidPublicKey)?;
-
-        let mut data = self.data.lock().map_err(|_| EnrollmentError::Storage)?;
-        match data.token.as_deref() {
-            Some(expected) if expected == token => {}
-            Some(_) => return Err(EnrollmentError::InvalidToken),
-            None => return Err(EnrollmentError::TokenAlreadyUsed),
-        }
-        if data.agents.values().any(|name| name == agent_name) {
-            return Err(EnrollmentError::AgentAlreadyRegistered);
-        }
-        if data.agents.contains_key(public_key) {
-            return Err(EnrollmentError::AgentAlreadyRegistered);
-        }
-
-        fs::write(
-            data.agents_dir.join(format!("{agent_name}.key")),
-            public_key,
-        )
-        .map_err(|_| EnrollmentError::Storage)?;
-        data.agents
-            .insert(public_key.to_vec(), agent_name.to_owned());
-        // 公钥已经成功持久化后才消费 Token，避免写入失败导致 Token 丢失。
-        data.token = None;
-        Ok(agent_name.to_owned())
+    ) -> Result<String, RegistrationError> {
+        let prepared = self.prepare(token, agent_name, public_key)?;
+        self.commit(prepared.registration_id, public_key)
     }
 
     /// IK 握手后用 Client 静态公钥查找业务身份。
-    pub fn authenticate(&self, public_key: &[u8]) -> Result<String, EnrollmentError> {
+    pub fn authenticate(&self, public_key: &[u8]) -> Result<String, RegistrationError> {
         self.data
             .lock()
-            .map_err(|_| EnrollmentError::Storage)?
+            .map_err(|_| RegistrationError::Storage)?
             .agents
             .get(public_key)
             .cloned()
-            .ok_or(EnrollmentError::UnknownAgent)
+            .ok_or(RegistrationError::UnknownAgent)
     }
 
     /// 返回当前已登记的 Agent 名称，供示例控制台观察注册表状态。
-    pub fn registered_agents(&self) -> Result<Vec<String>, EnrollmentError> {
+    pub fn registered_agents(&self) -> Result<Vec<String>, RegistrationError> {
         let mut agents = self
             .data
             .lock()
-            .map_err(|_| EnrollmentError::Storage)?
+            .map_err(|_| RegistrationError::Storage)?
             .agents
             .values()
             .cloned()
@@ -198,62 +317,72 @@ impl EnrollmentRegistry {
     }
 
     /// 删除内存和磁盘内的 Agent 公钥，下一次 IK 会话会被拒绝。
-    pub fn revoke(&self, agent_name: &str) -> Result<bool, EnrollmentError> {
-        let mut data = self.data.lock().map_err(|_| EnrollmentError::Storage)?;
+    pub fn revoke(&self, agent_name: &str) -> Result<bool, RegistrationError> {
+        let mut data = self.data.lock().map_err(|_| RegistrationError::Storage)?;
         let before = data.agents.len();
         data.agents.retain(|_, name| name != agent_name);
         let path = data.agents_dir.join(format!("{agent_name}.key"));
         if path.exists() {
-            fs::remove_file(path).map_err(|_| EnrollmentError::Storage)?;
+            fs::remove_file(path).map_err(|_| RegistrationError::Storage)?;
         }
+        let registration_path = data.registrations_dir.join(agent_name);
+        if registration_path.exists() {
+            fs::remove_dir_all(registration_path).map_err(|_| RegistrationError::Storage)?;
+        }
+        data.registrations
+            .retain(|_, record| record.agent_id != agent_name);
         Ok(before != data.agents.len())
     }
 }
 
 /// 注册表给网络层的稳定错误分类。
 #[derive(Debug, PartialEq, Eq)]
-pub enum EnrollmentError {
+pub enum RegistrationError {
     InvalidToken,
     TokenAlreadyUsed,
     InvalidAgentName,
     InvalidPublicKey,
     AgentAlreadyRegistered,
+    UnknownRegistration,
+    InvalidRegistrationId,
     UnknownAgent,
     Storage,
 }
 
-impl fmt::Display for EnrollmentError {
+impl fmt::Display for RegistrationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidToken => "invalid enrollment token",
-            Self::TokenAlreadyUsed => "enrollment token already used",
+            Self::InvalidToken => "invalid registration token",
+            Self::TokenAlreadyUsed => "registration token already used",
             Self::InvalidAgentName => "invalid Agent name",
             Self::InvalidPublicKey => "invalid Noise public key",
             Self::AgentAlreadyRegistered => "Agent is already registered",
+            Self::UnknownRegistration => "registration transaction does not exist",
+            Self::InvalidRegistrationId => "registration transaction ID does not match",
             Self::UnknownAgent => "Agent Noise public key is not registered",
             Self::Storage => "registration storage failed",
         })
     }
 }
 
-impl std::error::Error for EnrollmentError {}
+impl std::error::Error for RegistrationError {}
 
 /// 注册 Token 不能转换为 Noise PSK。
 #[derive(Debug, Clone, Copy)]
-pub struct EnrollmentTokenError;
+pub struct RegistrationTokenError;
 
-impl fmt::Display for EnrollmentTokenError {
+impl fmt::Display for RegistrationTokenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("enrollment token must contain 32 bytes of hexadecimal text")
+        formatter.write_str("registration token must contain 32 bytes of hexadecimal text")
     }
 }
 
-impl std::error::Error for EnrollmentTokenError {}
+impl std::error::Error for RegistrationTokenError {}
 
 /// 生成 256 位随机 Token，供测试验证生产实现应采用的格式。
 ///
-/// 当前可运行示例为了便于手工操作使用 `FIXED_ENROLLMENT_TOKEN`，不会调用此函数。
-pub fn random_enrollment_token() -> io::Result<String> {
+/// 当前可运行示例为了便于手工操作使用 `FIXED_REGISTRATION_TOKEN`，不会调用此函数。
+pub fn random_registration_token() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
     Ok(public_key_hex(&bytes))
@@ -275,13 +404,27 @@ fn valid_agent_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+/// 用一个目录保存注册事务的独立字段，避免示例引入额外序列化依赖。
+fn persist_registration(directory: &Path, record: &RegistrationRecord) -> io::Result<()> {
+    let transaction = directory.join(&record.agent_id);
+    fs::create_dir_all(&transaction)?;
+    fs::write(
+        transaction.join("registration-id.bin"),
+        record.registration_id,
+    )?;
+    fs::write(transaction.join("token.txt"), &record.token)?;
+    fs::write(transaction.join("agent-id.txt"), &record.agent_id)?;
+    fs::write(transaction.join("public.key"), &record.public_key)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        EnrollmentError, EnrollmentRegistry, NOISE_XX_PSK3, parse_enrollment_psk,
-        random_enrollment_token,
+        AgentRegistry, NOISE_XX_PSK3, RegistrationError, parse_registration_psk,
+        random_registration_token,
     };
 
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -299,23 +442,82 @@ mod tests {
     #[test]
     fn registration_is_persisted_and_available_after_restart() {
         let directory = temp_directory();
-        let registry = EnrollmentRegistry::load("token".to_owned(), &directory).unwrap();
+        let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
         let key = vec![7; 32];
         registry.register("token", "example-agent", &key).unwrap();
 
-        let reloaded = EnrollmentRegistry::load("next".to_owned(), &directory).unwrap();
+        let reloaded = AgentRegistry::load("next".to_owned(), &directory).unwrap();
         assert_eq!(reloaded.authenticate(&key), Ok("example-agent".to_owned()));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registration_prepare_and_commit_are_idempotent() {
+        let directory = temp_directory();
+        let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
+        let key = vec![8; 32];
+
+        let first = registry.prepare("token", "example-agent", &key).unwrap();
+        let retried = registry.prepare("token", "example-agent", &key).unwrap();
+        assert_eq!(first.registration_id, retried.registration_id);
+        assert_eq!(
+            registry.authenticate(&key),
+            Err(RegistrationError::UnknownAgent)
+        );
+
+        registry.commit(first.registration_id, &key).unwrap();
+        assert_eq!(registry.authenticate(&key), Ok("example-agent".to_owned()));
+        let completed_retry = registry.prepare("token", "example-agent", &key).unwrap();
+        assert_eq!(first.registration_id, completed_retry.registration_id);
+        assert!(completed_retry.already_committed);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_registration_recovers_across_server_restarts() {
+        let directory = temp_directory();
+        let key = vec![9; 32];
+        let first = AgentRegistry::load("token".to_owned(), &directory).unwrap();
+        let prepared = first.prepare("token", "restart-agent", &key).unwrap();
+        drop(first);
+
+        let reloaded = AgentRegistry::load("token".to_owned(), &directory).unwrap();
+        let recovered = reloaded.prepare("token", "restart-agent", &key).unwrap();
+        assert_eq!(recovered.registration_id, prepared.registration_id);
+        assert!(!recovered.already_committed);
+        reloaded.commit(recovered.registration_id, &key).unwrap();
+        drop(reloaded);
+
+        let completed = AgentRegistry::load("token".to_owned(), &directory).unwrap();
+        let recovered = completed.prepare("token", "restart-agent", &key).unwrap();
+        assert_eq!(recovered.registration_id, prepared.registration_id);
+        assert!(recovered.already_committed);
+        assert_eq!(completed.authenticate(&key), Ok("restart-agent".to_owned()));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registration_token_cannot_be_rebound_to_another_public_key() {
+        let directory = temp_directory();
+        let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
+        registry.prepare("token", "first-agent", &[1; 32]).unwrap();
+
+        assert_eq!(
+            registry.prepare("token", "second-agent", &[2; 32]),
+            Err(RegistrationError::TokenAlreadyUsed)
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn invalid_token_does_not_consume_the_valid_token() {
         let directory = temp_directory();
-        let registry = EnrollmentRegistry::load("token".to_owned(), &directory).unwrap();
+        let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
 
         assert_eq!(
             registry.register("wrong", "example-agent", &[1; 32]),
-            Err(EnrollmentError::InvalidToken)
+            Err(RegistrationError::InvalidToken)
         );
         assert!(
             registry
@@ -328,14 +530,14 @@ mod tests {
     #[test]
     fn revocation_denies_the_next_ik_session() {
         let directory = temp_directory();
-        let registry = EnrollmentRegistry::load("token".to_owned(), &directory).unwrap();
+        let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
         let key = vec![3; 32];
         registry.register("token", "example-agent", &key).unwrap();
 
         assert!(registry.revoke("example-agent").unwrap());
         assert_eq!(
             registry.authenticate(&key),
-            Err(EnrollmentError::UnknownAgent)
+            Err(RegistrationError::UnknownAgent)
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -343,7 +545,7 @@ mod tests {
     #[test]
     fn registered_agents_are_sorted_and_revocation_removes_the_name() {
         let first_directory = temp_directory();
-        let first = EnrollmentRegistry::load("first-token".to_owned(), &first_directory).unwrap();
+        let first = AgentRegistry::load("first-token".to_owned(), &first_directory).unwrap();
         first.register("first-token", "z-agent", &[4; 32]).unwrap();
 
         let second_directory = temp_directory();
@@ -354,8 +556,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(second_directory.join("agents/a-agent.key"), [5; 32]).unwrap();
-        let second =
-            EnrollmentRegistry::load("second-token".to_owned(), &second_directory).unwrap();
+        let second = AgentRegistry::load("second-token".to_owned(), &second_directory).unwrap();
 
         assert_eq!(
             second.registered_agents().unwrap(),
@@ -372,10 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_token_parser_requires_exact_256_bit_hex() {
-        assert_eq!(parse_enrollment_psk(&"00".repeat(32)).unwrap(), [0; 32]);
-        assert!(parse_enrollment_psk("00").is_err());
-        assert!(parse_enrollment_psk(&"zz".repeat(32)).is_err());
+    fn registration_token_parser_requires_exact_256_bit_hex() {
+        assert_eq!(parse_registration_psk(&"00".repeat(32)).unwrap(), [0; 32]);
+        assert!(parse_registration_psk("00").is_err());
+        assert!(parse_registration_psk(&"zz".repeat(32)).is_err());
     }
 
     #[test]
@@ -439,8 +640,8 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_token_is_256_bit_hex() {
-        let token = random_enrollment_token().unwrap();
+    fn registration_token_is_256_bit_hex() {
+        let token = random_registration_token().unwrap();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }

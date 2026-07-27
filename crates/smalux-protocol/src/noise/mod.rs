@@ -34,7 +34,7 @@ pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandshakeMode {
     /// 首次注册：双方用 32 字节 PSK 认证，Client 事先不知道 Server 公钥。
-    EnrollmentXxPsk3,
+    RegistrationXxPsk3,
     /// 后续连接：双方通过已经保存的长期静态公钥互相认证。
     AuthenticatedIk,
 }
@@ -76,7 +76,8 @@ fn validate_handshake(frame: &NoiseHandshake, expected: HandshakeType) -> Result
 #[cfg(test)]
 mod tests {
     use crate::agent::v1::{
-        SecureMessage, TokenMessage, TokenRequest, secure_message, token_message,
+        RegistrationMessage, RegistrationRequest, SecureMessage, registration_message,
+        secure_message,
     };
 
     use super::{
@@ -106,12 +107,14 @@ mod tests {
         let (mut client, mut server_session) = establish_xx(&client, &server, &psk, &psk).unwrap();
         assert_eq!(client.remote_static_key, server.public_key());
         let message = SecureMessage {
-            body: Some(secure_message::Body::TokenMessage(TokenMessage {
-                body: Some(token_message::Body::Request(TokenRequest {
-                    token: "token".to_owned(),
-                    agent_name: "agent".to_owned(),
-                })),
-            })),
+            body: Some(secure_message::Body::RegistrationMessage(
+                RegistrationMessage {
+                    body: Some(registration_message::Body::Request(RegistrationRequest {
+                        token: "token".to_owned(),
+                        agent_name: "agent".to_owned(),
+                    })),
+                },
+            )),
         };
         let frame = client.session.encrypt(&message).unwrap();
         assert_eq!(server_session.session.decrypt(frame).unwrap(), message);
@@ -189,12 +192,14 @@ mod tests {
         let mut client = waiting.receive_message2(second).unwrap();
 
         let before = SecureMessage {
-            body: Some(secure_message::Body::TokenMessage(TokenMessage {
-                body: Some(token_message::Body::Request(TokenRequest {
-                    token: "before".to_owned(),
-                    agent_name: "agent".to_owned(),
-                })),
-            })),
+            body: Some(secure_message::Body::RegistrationMessage(
+                RegistrationMessage {
+                    body: Some(registration_message::Body::Request(RegistrationRequest {
+                        token: "before".to_owned(),
+                        agent_name: "agent".to_owned(),
+                    })),
+                },
+            )),
         };
         let frame = client.session.encrypt(&before).unwrap();
         assert_eq!(server.session.decrypt(frame).unwrap(), before);
@@ -210,12 +215,14 @@ mod tests {
         client.session.finish_rekey(1);
 
         let after = SecureMessage {
-            body: Some(secure_message::Body::TokenMessage(TokenMessage {
-                body: Some(token_message::Body::Request(TokenRequest {
-                    token: "after".to_owned(),
-                    agent_name: "agent".to_owned(),
-                })),
-            })),
+            body: Some(secure_message::Body::RegistrationMessage(
+                RegistrationMessage {
+                    body: Some(registration_message::Body::Request(RegistrationRequest {
+                        token: "after".to_owned(),
+                        agent_name: "agent".to_owned(),
+                    })),
+                },
+            )),
         };
         let frame = client.session.encrypt(&after).unwrap();
         assert_eq!(server.session.decrypt(frame).unwrap(), after);

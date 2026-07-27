@@ -1,20 +1,15 @@
 //! 磁盘容量与 IO 周期采集任务。
 
 use async_trait::async_trait;
+pub use smalux_protocol::agent::v1::DiskIoTaskConfig;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 
 use crate::{
-    scheduler::{TaskContext, TaskError, ValueTask},
-    tasks::collect::collectors::io::{DiskIoCollector, DiskIoSnapshot},
+    scheduler::{ReportingTask, TaskContext, TaskError},
+    tasks::collect::collectors::io::DiskIoCollector,
 };
 
-use super::{DiskSelection, MetricSample, blocking::CollectState, selection::filter_disk};
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// 磁盘 IO Task 的采集配置。
-pub struct DiskIoTaskConfig {
-    /// 按设备名称或挂载点筛选输出；默认选择全部磁盘。
-    pub disks: DiskSelection,
-}
+use super::{blocking::CollectState, selection::filter_disk};
 
 /// 独立维护磁盘 IO 增量基线的调度任务。
 pub struct DiskIoTask {
@@ -52,16 +47,22 @@ impl Default for DiskIoTask {
 }
 
 #[async_trait]
-impl ValueTask for DiskIoTask {
-    type Output = MetricSample<DiskIoSnapshot>;
-
-    async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError> {
+impl ReportingTask for DiskIoTask {
+    async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let mut output = self
             .state
             .collect(context, DiskIoCollector::collect)
             .await?;
-        filter_disk(&mut output.snapshot, &self.config.disks);
-        Ok(output)
+        if let Some(selection) = self.config.disks.as_ref() {
+            filter_disk(&mut output.snapshot, selection);
+        }
+        Ok(TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: output.sampled_at_ms,
+                sample_interval_ms: output.sample_interval_ms,
+            }),
+            result: Some(task_result::Result::DiskIo(output.snapshot)),
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -75,7 +76,7 @@ impl ValueTask for DiskIoTask {
 
 #[cfg(test)]
 mod tests {
-    use crate::{scheduler::ValueTask, tasks::collect::context};
+    use crate::{scheduler::ReportingTask, tasks::collect::context};
 
     use super::{DiskIoTask, DiskIoTaskConfig};
     use crate::tasks::collect::DiskSelection;
@@ -88,25 +89,53 @@ mod tests {
         let second = task.run(context()).await.unwrap();
 
         assert_eq!(task.kind(), DiskIoTask::KIND);
-        assert!(!first.snapshot.warmed_up);
-        assert!(second.snapshot.warmed_up);
-        assert!(second.sample_interval_ms.is_some());
+        let Some(smalux_protocol::agent::v1::task_result::Result::DiskIo(first)) = first.result
+        else {
+            panic!("disk task must return TaskResult.disk_io");
+        };
+        let Some(smalux_protocol::agent::v1::task_result::Result::DiskIo(second_snapshot)) =
+            second.result
+        else {
+            panic!("disk task must return TaskResult.disk_io");
+        };
+        assert!(!first.warmed_up);
+        assert!(second_snapshot.warmed_up);
+        assert!(
+            second
+                .sample
+                .as_ref()
+                .expect("sample metadata is required")
+                .sample_interval_ms
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn configured_disk_task_returns_empty_zero_snapshot_when_nothing_matches() {
         let task = DiskIoTask::with_config(DiskIoTaskConfig {
-            disks: DiskSelection {
+            disks: Some(DiskSelection {
                 include_names: vec!["smalux-missing-disk".to_owned()],
                 ..DiskSelection::default()
-            },
+            }),
         });
 
         let output = task.run(context()).await.unwrap();
 
-        assert_eq!(task.config().disks.include_names.len(), 1);
-        assert!(output.snapshot.devices.is_empty());
-        assert_eq!(output.snapshot.read_bytes, 0);
-        assert_eq!(output.snapshot.written_bytes, 0);
+        assert_eq!(
+            task.config()
+                .disks
+                .as_ref()
+                .expect("selection is configured")
+                .include_names
+                .len(),
+            1
+        );
+        let Some(smalux_protocol::agent::v1::task_result::Result::DiskIo(snapshot)) = output.result
+        else {
+            panic!("disk task must return TaskResult.disk_io");
+        };
+        assert!(snapshot.devices.is_empty());
+        assert_eq!(snapshot.read_bytes, 0);
+        assert_eq!(snapshot.written_bytes, 0);
     }
 }

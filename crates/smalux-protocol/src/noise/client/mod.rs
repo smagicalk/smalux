@@ -71,7 +71,7 @@ impl ClientXxAwaitMessage2 {
         Ok((
             EstablishedNoise {
                 session: SecureSession::new(transport),
-                mode: HandshakeMode::EnrollmentXxPsk3,
+                mode: HandshakeMode::RegistrationXxPsk3,
                 remote_static_key: remote,
                 responder_key_id: key_id,
             },

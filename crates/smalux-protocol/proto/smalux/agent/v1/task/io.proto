@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "smalux/agent/v1/task/selection.proto";
+
+// 磁盘 IO 采集配置。
+message DiskIoTaskConfig {
+  // 设备名/挂载点筛选；缺失或所有列表为空时选择全部磁盘。
+  DiskSelection disks = 1;
+}
+
+// 网卡 IO 采集配置。
+message NetworkIoTaskConfig {
+  // 网卡名筛选；缺失或列表为空时选择全部网卡。
+  InterfaceSelection interfaces = 1;
+}
+
+// 选中磁盘的容量、累计 IO 与区间速率快照。
+message DiskIoSnapshot {
+  // 是否已经拥有前一次样本，可计算可靠的区间速率。
+  bool warmed_up = 1;
+  // 每个选中磁盘或挂载设备的明细。
+  repeated DiskDeviceSnapshot devices = 2;
+  // 本采样区间内全部选中设备读取字节增量。
+  uint64 read_bytes = 3;
+  // 本采样区间内全部选中设备写入字节增量。
+  uint64 written_bytes = 4;
+  // 聚合读取速率，单位 bytes/s；首次采样缺失。
+  optional double read_bytes_per_second = 5;
+  // 聚合写入速率，单位 bytes/s；首次采样缺失。
+  optional double written_bytes_per_second = 6;
+}
+
+// 单个磁盘设备或挂载点的采样明细。
+message DiskDeviceSnapshot {
+  // 操作系统设备名称。
+  string name = 1;
+  // 文件系统挂载点。
+  string mount_point = 2;
+  // 文件系统类型，例如 NTFS、ext4。
+  string file_system = 3;
+  // 设备类型，例如 SSD、HDD、Unknown。
+  string kind = 4;
+  // 文件系统总容量，单位字节。
+  uint64 total_space_bytes = 5;
+  // 文件系统可用容量，单位字节。
+  uint64 available_space_bytes = 6;
+  // 本采样区间读取增量，单位字节。
+  uint64 read_bytes = 7;
+  // 本采样区间写入增量，单位字节。
+  uint64 written_bytes = 8;
+  // 操作系统计数器报告的累计读取字节。
+  uint64 total_read_bytes = 9;
+  // 操作系统计数器报告的累计写入字节。
+  uint64 total_written_bytes = 10;
+  // 本区间读取速率，单位 bytes/s；首次采样缺失。
+  optional double read_bytes_per_second = 11;
+  // 本区间写入速率，单位 bytes/s；首次采样缺失。
+  optional double written_bytes_per_second = 12;
+}
+
+// 选中网卡的流量、包计数与错误快照。
+message NetworkIoSnapshot {
+  // 是否已经拥有前一次样本，可计算可靠的区间速率。
+  bool warmed_up = 1;
+  // 每个选中网卡的明细。
+  repeated NetworkInterfaceSnapshot interfaces = 2;
+  // 本采样区间全部选中网卡接收字节增量。
+  uint64 received_bytes = 3;
+  // 本采样区间全部选中网卡发送字节增量。
+  uint64 transmitted_bytes = 4;
+  // 聚合接收速率，单位 bytes/s；首次采样缺失。
+  optional double received_bytes_per_second = 5;
+  // 聚合发送速率，单位 bytes/s；首次采样缺失。
+  optional double transmitted_bytes_per_second = 6;
+}
+
+// 单个网卡的采样明细。
+message NetworkInterfaceSnapshot {
+  // 操作系统中的完整网卡名称。
+  string interface = 1;
+  // 标准文本格式 MAC 地址；平台不提供时为空字符串。
+  string mac_address = 2;
+  // 最大传输单元，单位字节；平台不提供时为零。
+  uint64 mtu = 3;
+  // 本采样区间接收字节增量。
+  uint64 received_bytes = 4;
+  // 本采样区间发送字节增量。
+  uint64 transmitted_bytes = 5;
+  // 操作系统计数器报告的累计接收字节。
+  uint64 total_received_bytes = 6;
+  // 操作系统计数器报告的累计发送字节。
+  uint64 total_transmitted_bytes = 7;
+  // 本区间接收速率，单位 bytes/s；首次采样缺失。
+  optional double received_bytes_per_second = 8;
+  // 本区间发送速率，单位 bytes/s；首次采样缺失。
+  optional double transmitted_bytes_per_second = 9;
+  // 操作系统计数器报告的累计接收包数。
+  uint64 received_packets = 10;
+  // 操作系统计数器报告的累计发送包数。
+  uint64 transmitted_packets = 11;
+  // 操作系统计数器报告的累计接收错误数。
+  uint64 receive_errors = 12;
+  // 操作系统计数器报告的累计发送错误数。
+  uint64 transmit_errors = 13;
+}

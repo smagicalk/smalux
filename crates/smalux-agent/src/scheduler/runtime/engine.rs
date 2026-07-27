@@ -267,12 +267,16 @@ impl SchedulerActor {
     fn handle_command(&mut self, command: Command) -> Result<bool, SchedulerError> {
         match command {
             Command::Add {
+                job_id,
+                generation,
+                enabled,
                 trigger,
                 task,
                 options,
                 response,
             } => {
-                let _ = response.send(self.add_job(trigger, task, options));
+                let _ = response
+                    .send(self.add_job(job_id, generation, enabled, trigger, task, options));
             }
             Command::Update {
                 job_id,
