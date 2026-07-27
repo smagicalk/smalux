@@ -35,6 +35,20 @@ smalux/
 Collector 应尽量只返回领域数据或明确错误；Task 负责配置、采样状态和 Proto 结果；Scheduler 不理解 CPU、
 Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 
+判断修改归属时可以按问题提问：
+
+| 问题 | 应修改 |
+| --- | --- |
+| “操作系统原始数据怎么读？” | Collector。 |
+| “配置如何筛选、排序并变成结果？” | Task。 |
+| “什么时候执行、拥堵如何处理？” | Scheduler/JobDefinition。 |
+| “Server 如何创建、更新或删除定义？” | JobController 与 Job Proto。 |
+| “消息如何跨 Agent/Server 传输？” | Protocol。 |
+| “结果如何保存、查询和展示？” | Server 应用与存储层。 |
+
+同一需求跨越多层时，先稳定 Proto 契约，再分别实现两端；不要让数据库模型、生成的 Rust 类型或平台 API
+结构直接渗透到所有层。
+
 ## Protocol 修改位置
 
 | 需求 | 位置 |
@@ -47,6 +61,10 @@ Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 | 修改后台 Driver | `src/tonic_transport/driver.rs` |
 
 生成的 Rust 文件位于 Cargo `OUT_DIR`，不要手动修改或提交。
+
+Protocol 的高层 API 与底层 Noise 状态机有意同时保留。普通应用修改应优先落在高层 Client/Acceptor/
+Driver；只有增加传输适配或验证加密状态机时才直接操作底层 handshake/session，避免出现两个 owner 同时
+推进 nonce。
 
 ## 推荐开发循环
 
@@ -88,3 +106,12 @@ cargo test -p smalux-protocol
 4. 网站对应章节。
 
 网站是面向使用者的整理层，不替代源码契约。
+
+## 提交前自查
+
+- 新公开类型是否有 Rustdoc，Proto 新字段是否有字段注释；
+- 配置错误是否在创建阶段返回，而不是每次运行重复失败；
+- 新增状态是否有恢复路径、超时和取消行为；
+- 日志是否可能泄露 Token、私钥、命令行或业务载荷；
+- Example 是否仍使用公开 API，而不是复制内部实现；
+- 网站“已实现/示例/待完成”的描述是否同步更新。

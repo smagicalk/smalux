@@ -14,6 +14,17 @@ description: Smalux workspace 的平台依赖、构建产物与构建模式。
 | 平台 C/C++ 链接环境 | 编译部分系统与加密依赖。Windows 推荐 MSVC 工具链。 |
 | Git | 获取源码和维护版本。 |
 
+确认工具链：
+
+```powershell
+rustc --version
+cargo --version
+rustup show active-toolchain
+```
+
+Windows 使用 MSVC target 时还需要 Visual Studio Build Tools 的 C++ build tools 与 Windows SDK。若链接
+阶段提示找不到 `link.exe`，应先修复工具链安装或从 Developer PowerShell 运行，不是修改 Rust 源码。
+
 Protocol crate 使用 `protoc-bin-vendored`，构建脚本会选择当前平台对应的 `protoc`，避免要求开发机
 预装全局 Proto 编译器。
 
@@ -57,6 +68,18 @@ cargo build -p smalux-protocol
 
 使用 `-p` 只选择目标 package，Cargo 仍会自动构建其 workspace 依赖。
 
+主要二进制位于：
+
+```text
+target/debug/smalux-agent.exe
+target/debug/smalux-server.exe
+target/release/smalux-agent.exe
+target/release/smalux-server.exe
+```
+
+Protocol crate 主要提供 library 和 examples，不会因为 `cargo build -p smalux-protocol` 自动产生正式
+Agent/Server 服务进程。要运行协议演示，请使用命令速查中的独立 Server/Client example。
+
 ## 常见问题
 
 ### RustRover 找不到生成的 gRPC 模块
@@ -74,3 +97,13 @@ cargo check -p smalux-protocol
 
 Agent 和 Server 含 Tokio、Reqwest、Tonic、SeaORM 等依赖，首次构建需要建立完整依赖图。不要同时
 启动多个首次 Cargo 构建，它们会争用 package cache 和 build directory 锁。
+
+### Cargo 等待 build directory 锁
+
+先检查是否已有 IDE、测试或 Example 正在编译同一 workspace。正常情况下等待现有 Cargo 结束即可；不要
+在不清楚进程用途时强制停止或删除 `target`，否则会丢失增量构建缓存并可能中断正在运行的验证。
+
+### 端口 8080 被占用
+
+协议 Example 与正式 Server 默认都可能使用 `127.0.0.1:8080`。先确认占用进程身份，再通过
+`SMALUX_EXAMPLE_ADDR` 为 Example 选择其他端口；不要直接停止与 Smalux 无关的本机服务。

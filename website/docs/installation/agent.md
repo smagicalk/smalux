@@ -8,6 +8,13 @@ description: 当前 Agent 的构建、权限和运行准备事项。
 `smalux-agent` 是部署在被观测主机上的探针。目前仓库提供源码和可执行 crate，尚未提供正式安装包、
 systemd unit、Windows Service 包装或自动升级器。
 
+:::warning 当前运行状态
+
+正式 Agent 的 `main()` 当前为空，只声明 `cli`、`job_control`、`scheduler` 和 `tasks` 模块后退出。
+采集器、Scheduler 和 JobController 已经可以在测试或后续应用装配中使用，但尚未组成常驻 Agent 进程。
+
+:::
+
 ## 构建
 
 ```powershell
@@ -16,6 +23,25 @@ cargo build -p smalux-agent --release
 
 Windows 产物通常位于 `target/release/smalux-agent.exe`，Linux 产物位于
 `target/release/smalux-agent`。
+
+直接运行当前产物会立即正常退出且不采集数据：
+
+```powershell
+target/release/smalux-agent.exe
+```
+
+这不是崩溃。正式启动流程仍需装配：
+
+```text
+读取本地配置和身份
+  -> 启动 SchedulerRuntime
+  -> 恢复本地/远程 Job
+  -> 建立 Protocol Session
+  -> 启动 SessionDriver
+  -> 接收 JobCommand
+  -> 将 TaskReport 写入本地队列或长流
+  -> 处理关闭与重连
+```
 
 ## 运行前考虑
 
@@ -45,6 +71,16 @@ Windows 产物通常位于 `target/release/smalux-agent.exe`，Linux 产物位�
 Protocol Example 使用普通文件展示这些字段，但不是生产安全存储实现。私钥文件应限制访问权限，
 必要时接入系统密钥库、TPM、HSM 或加密数据库。
 
+建议把状态分成三个事务边界：
+
+| 状态组 | 内容 | 更新要求 |
+| --- | --- | --- |
+| 身份 | Agent 私钥、Server 公钥、注册事务 | commit 前先原子保存 pending。 |
+| Job catalog | Proto `JobDefinition` 和 catalog revision | Scheduler 应用成功后才推进版本。 |
+| 上报队列 | TaskReport、重试次数、过期时间 | 先落盘再发送，ACK 后再删除。 |
+
+不要把三组状态写进一个不断整体覆盖的大 JSON 文件；高频上报会放大写入，身份和 Job 也更难独立恢复。
+
 ## 断网行为
 
 当前 `JobController` 不会因为 Session 断开自动删除远程 Job，因此 Agent 可以在网络抖动期间继续运行。
@@ -52,3 +88,13 @@ Protocol Example 使用普通文件展示这些字段，但不是生产安全存
 
 TaskReport 当前没有跨重连 ACK。要求不丢数据时，应先写本地有界队列，再由连接层发送；队列必须配置容量、
 过期时间、磁盘上限和丢弃策略，防止 Server 长期不可用拖垮 Agent。
+
+## 后续正式安装应包含
+
+- 独立运行用户和数据目录；
+- 数据目录权限检查和私钥安全写入；
+- Windows Service 或 systemd 服务定义；
+- 环境变量/配置文件 schema 与启动校验；
+- 结构化日志和退出码；
+- 优雅关闭、升级前 drain 和回滚；
+- 卸载时“保留身份”与“彻底清除身份”的显式选项。

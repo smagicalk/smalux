@@ -61,6 +61,20 @@ baseUrl = /smalux/
 
 第一次使用前，在仓库 **Settings → Pages → Build and deployment** 中把 Source 设置为 **GitHub Actions**。
 
+当前 `.github/workflows/docs-pages.yml` 把构建和部署拆为两个 Job：build 安装锁定依赖、执行 typecheck 和
+Docusaurus build，再上传 `website/build`；deploy 依赖 build，并通过 `github-pages` environment 发布。
+这与 [GitHub Pages 自定义 Workflow 的官方流程](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)
+一致。
+
+### 首次发布检查
+
+1. 确认仓库已启用 Actions，并允许使用仓库中的 Actions。
+2. Settings → Pages 的 Source 选择 GitHub Actions。
+3. Actions 中手动运行 workflow，分支选择包含文档最新提交的分支。
+4. build Job 成功后检查 artifact 上传步骤，再检查 deploy Job。
+5. 在 deployment 输出中打开实际 `page_url`，不要根据仓库名猜地址。
+6. 首次 DNS/CDN 缓存生效后，再验证刷新和直接访问二级页面。
+
 ## 启用自动发布
 
 workflow 中保留了被注释的 `push: branches: [master]`。需要自动发布时取消对应注释即可。建议继续保留
@@ -68,3 +82,17 @@ workflow 中保留了被注释的 `push: branches: [master]`。需要自动发�
 
 PR 阶段可以后续增加独立的 build-only workflow，只执行 `pnpm install --frozen-lockfile`、typecheck 和 build，
 不授予 `pages: write`。
+
+## 常见故障
+
+| 问题 | 检查项 |
+| --- | --- |
+| Actions 页面没有 Run workflow | workflow 是否在 GitHub 已存在的分支上，且包含 `workflow_dispatch`。 |
+| build 找不到依赖 | Node/pnpm 版本、`website/pnpm-lock.yaml` 和 frozen lockfile 是否一致。 |
+| 首页正常、资源 404 | `url`、`baseUrl` 与项目 Pages 路径是否匹配。 |
+| 二级页面刷新 404 | artifact 是否完整，链接是否使用 Docusaurus base URL。 |
+| deploy 权限失败 | workflow 是否有 `pages: write` 和 `id-token: write`。 |
+| 自定义域名仍跳旧地址 | GitHub Pages 域名设置、DNS 和 Docusaurus `url/baseUrl` 是否同时更新。 |
+
+GitHub Pages 的自定义 workflow 需要上传 Pages artifact，并由 `deploy-pages` 在 `github-pages` environment
+中部署。失败时先查看对应 workflow run 的 build/deploy 分界，不要通过提交 `website/build/` 绕过问题。

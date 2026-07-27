@@ -40,6 +40,10 @@ TaskReportSink
 Collector 不负责调度，也不决定结果发往哪里。Task 把配置和一次执行封装为稳定单元；Scheduler
 只管理执行时序；Sink 决定输出。这种拆分让同一个 Task 可以用于周期 Job、Cron Job、手动执行或测试。
 
+一次远程任务的职责分配是：Server 负责生成配置与版本，Protocol 负责可靠传递，JobController 负责
+校验和安装，Scheduler 负责运行，Task 负责产生结果，Sink/连接层负责上报。每层只确认自己已经完成的
+动作；例如 gRPC 发送成功不等于 Server 已持久化 TaskReport。
+
 ## Job 与 Task 的区别
 
 - **Task** 描述一次具体操作，例如采集 CPU、统计 Socket、执行 TCP 探测。
@@ -74,3 +78,9 @@ Smalux 当前适合继续开发和验证以下场景：
 - Axum REST、WebSocket 和 gRPC 共用端口的集成验证。
 
 在生产部署前仍需补齐正式持久化、权限管理、安装升级、上报队列、审计、限流和可观测性策略。
+
+## 当前边界如何影响开发
+
+可以直接基于 crate 编写和测试新的 Collector、Task、Job 或 Protocol 行为，也可以运行 Example 验证
+Axum/Tonic/Noise 调用链。但正式 Agent/Server 入口还不是完整产品进程，部署文档中的数据库、重连、
+离线队列和授权要求属于接入正式应用时必须补齐的工程边界。

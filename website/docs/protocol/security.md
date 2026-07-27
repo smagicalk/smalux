@@ -79,7 +79,33 @@ RPC 和 Noise 状态，失败 Session 不能复用。
 - 多实例 Server 必须同步 keyring 和注册表，否则同一 Agent 连到不同实例会随机认证失败。
 - 日志只记录 key ID、rotation ID 和安全错误分类，不记录 PSK、Token、私钥或完整业务载荷。
 
+建议把持久化接口按业务事务拆开，而不是让 Protocol 直接依赖数据库：
+
+| 方法语义 | 必须原子保存的内容 |
+| --- | --- |
+| 保存注册 pending | Agent identity、Server 公钥、Agent ID、transaction ID。 |
+| 提交注册 | pending 状态转换为 committed，并记录注册 ID。 |
+| 保存 Agent 轮换 | current、pending、previous identity 和 rotation ID snapshot。 |
+| 保存 Server 轮换 | current、next、previous identity 和确认进度。 |
+| 保存固定 Server key | current、pending、previous 公钥和 rotation ID。 |
+
+每次都应先保存“下一状态”再发送会让对端推进的确认消息。进程崩溃后从 snapshot 恢复状态机，而不是仅凭
+日志推断密钥位置。
+
+## 故障与恢复
+
+| 故障 | 允许的恢复方式 | 禁止做法 |
+| --- | --- | --- |
+| 私钥文件损坏或丢失 | 从受保护备份恢复，或吊销旧身份后重新注册。 | 伪造同一公钥对应的新私钥。 |
+| 轮换中断 | 加载 snapshot，使用 current/pending/previous 候选继续。 | 只保留最新公钥并立即删除 previous。 |
+| 注册 Token 泄露 | 立即撤销并审计使用记录，签发新 Token。 | 继续复用泄露 Token。 |
+| Server key 不匹配 | 检查受信任轮换公告或重新注册流程。 | 自动接受网络上任意新公钥。 |
+| Noise 解密失败 | 关闭整个 Session，重新 IK。 | 复用已经推进 nonce 的加密状态。 |
+
 ## 威胁边界
 
 Noise 能防止中间代理读取或修改业务消息，但不能修复终端被入侵、弱 Token、错误授权、私钥泄露、流量分析、
 拒绝服务或应用把秘密主动写入日志的问题。安全设计必须同时覆盖端点、存储、权限、审计和限流。
+
+Noise 也不替代 Server 业务授权。一次 IK 成功只证明对端持有登记公钥；Server 每次建立会话仍要检查该
+Agent 是否 active、是否被吊销、属于哪个租户，以及当前允许接收哪些 Job。

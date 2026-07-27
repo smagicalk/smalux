@@ -8,6 +8,21 @@ description: 使用 Proto JobDefinition 配置 Agent 调度任务。
 Smalux 不再维护 JSON Job 模型。Server、本地存储和 Agent 之间共享的配置以 Proto
 `JobDefinition` 为准，连接层收到 `JobCommand` 后可直接交给 `JobController::apply`。
 
+完整执行链如下：
+
+```text
+Server 构造 JobCommand
+  -> Protocol 会话发送命令
+  -> Agent 的 JobController 校验 revision 和幂等键
+  -> JobFactory 把 Proto Task 配置转换为可执行 Task
+  -> Scheduler 根据 Trigger 产生执行实例
+  -> Task 返回 TaskResult
+  -> Agent 包装 TaskReport 并通过会话上报
+```
+
+`JobController` 负责远程目录和命令语义，`Scheduler` 负责时间、队列与并发，Task 只负责一次业务执行。
+不要让 Task 自己发送网络消息，否则 Task 会同时依赖采集、连接状态和重试策略，难以测试和复用。
+
 ## JobDefinition
 
 一个完整 Job 包含：
@@ -70,6 +85,30 @@ timezone   = "Asia/Shanghai"
 高频系统指标的常见组合是 `KEEP_LATEST + REPLACE_OLDEST_TRIGGER`，它优先保持数据新鲜度；不能丢失
 每次执行的操作则应使用 `KEEP_ALL + BACKPRESSURE`，并严格限制 Pending 和上游提交速度。
 
+### Scheduler 默认保护值
+
+当前实现提供以下默认上限。Server 生成 Job 时仍应显式设置关键参数，不应把实现默认值当作永久协议：
+
+| 项目 | 当前默认值 | 作用 |
+| --- | --- | --- |
+| 全局运行并发 | 逻辑 CPU 数 × 4 | 限制整个 Scheduler 同时执行的 Task。 |
+| 单 Job 并发 | 1 | 避免同一采集任务默认重叠执行。 |
+| 全局 Pending | 8192 | 限制全部等待触发的总量。 |
+| 单 Job Pending | 1024 | 防止单个 Job 占满队列。 |
+| 最小 Interval | 100 ms | 拒绝异常高频的周期配置。 |
+| 最大 Job 数 | 1024 | 限制单 Agent 目录规模。 |
+| 关闭等待时间 | 30 s | 为正在执行的 Task 留出退出窗口。 |
+| 最大连续补跑数 | 1000 | 限制 `CATCH_UP` 恢复风暴。 |
+
+### 常见策略组合
+
+| 目标 | 推荐组合 | 原因 |
+| --- | --- | --- |
+| CPU、内存等最新状态 | `concurrency=1`、`KEEP_LATEST`、替换最旧 Pending | 旧采样价值低，优先保留最新状态。 |
+| 一次性诊断命令 | `KEEP_ALL`、`BACKPRESSURE`、有限重试 | 每次请求都有独立业务意义。 |
+| 外部网络探测 | 有限 Pending、指数退避、统计超时 | 防止故障期间持续放大流量。 |
+| 进程或 Socket 详情 | `concurrency=1`、低频、较小 Pending | 平台扫描成本和结果体积较高。 |
+
 ## 远程控制命令
 
 | 命令 | 用途 |
@@ -90,6 +129,10 @@ session_handle.send_job_command_result(result).await?;
 `catalog_revision` 表示整个远程 Job 集合版本。增量命令必须恰好等于 Agent 当前版本加一，否则 Agent
 返回 `RESYNC_REQUIRED`，Server 应发送新的 `ReplaceAllJobs`，不能继续盲目追加增量。
 
+一次典型对账过程是：Server 先读取 Agent 报告的目录版本；版本一致时继续发送下一条增量命令，版本
+缺失或断档时发送完整 `ReplaceAllJobs`。Agent 只有在完整目录校验并应用成功后才能提交新的
+`catalog_revision`，不能先更新版本再逐项写入，否则中途失败会留下无法解释的半更新状态。
+
 ## 本地 Job 与远程 Job
 
 本地 Job 由 Agent 本地配置或内置策略创建，远程 Job 由 `JobController` 管理。两者可以共用 Scheduler，
@@ -97,3 +140,18 @@ session_handle.send_job_command_result(result).await?;
 
 连接断开后远程 Job 会继续运行。若希望只离线执行一段时间，应由 Agent 连接管理层记录断开时间，超过
 策略窗口后显式暂停远程 Job；这不是 Scheduler 根据 socket 状态自行判断的职责。
+
+## TaskReport
+
+Task 的直接返回值由运行层转换为 `TaskReport`。Server 消费结果时至少应区分：
+
+| 信息 | 用途 |
+| --- | --- |
+| Job ID 与 revision | 判断结果属于哪一版配置。 |
+| 计划时间与实际开始时间 | 计算排队和 misfire 延迟。 |
+| 完成时间与耗时 | 判断超时、性能退化和采集开销。 |
+| 执行结果或错误 | 解码具体 `TaskResult`，或记录结构化失败。 |
+| 尝试次数 | 区分首次成功与重试后成功。 |
+
+配置 revision 更新后，旧执行实例可能仍在完成。Server 不应只按 `job_id` 覆盖结果，还要保留或检查
+revision，防止旧配置的迟到结果污染新配置序列。

@@ -49,6 +49,9 @@ cargo check -p smalux-protocol
 cargo test -p smalux-protocol --all-targets
 ```
 
+因为 `build.rs` 递归扫描 v1 目录，新建子目录中的 `.proto` 也会自动参与编译。所有文件先稳定排序，再交给
+`tonic-prost-build`，以减少文件系统遍历顺序造成的无意义差异。生成代码不会写入仓库源目录。
+
 ## 兼容规则
 
 已发布字段必须遵守：
@@ -77,6 +80,19 @@ message ExampleResult {
 
 然后分别加入 `TaskDefinition.oneof task` 和 `TaskResult.oneof result`。字段号在各自 oneof 中保持稳定，
 并为 round-trip、缺失配置和 Agent 不支持能力补测试。
+
+## 修改检查表
+
+1. 在正确领域文件中增加消息或字段，并补全字段级注释。
+2. 检查 import 路径和 package 都是 `smalux.agent.v1`。
+3. 为删除字段添加 `reserved`，确认没有复用历史编号。
+4. 更新聚合 `oneof` 和 Agent 工厂映射。
+5. 更新结果消费端，明确旧端遇到未知分支时的行为。
+6. 增加编码 round-trip、空 oneof、非法枚举值和边界值测试。
+7. 运行 protocol 与 agent 全目标测试，并更新网站实现状态。
+
+`prost` 枚举字段在 wire 上只是整数，Rust 消费端不能假设一定是已知枚举值。进入领域逻辑前应使用生成的
+转换接口校验，未知值返回稳定协议错误，而不是 `unwrap` 或默认为零值。
 
 ## 不应放进 Proto 的内容
 

@@ -63,3 +63,22 @@ Server 必须依据 Agent 上报的 capability 下发任务；未启用的 Agent
 
 当 Plus 模块成熟后，再决定它是静态链接进 Agent、独立子进程还是受控插件。当前阶段优先静态类型和明确
 工厂映射，避免过早引入动态加载和任意代码执行风险。
+
+## 推荐生命周期
+
+```text
+validate -> authorized -> queued -> running -> succeeded/failed/cancelled
+                         \-> recovering（进程重启后）
+```
+
+每次状态转换都应使用稳定业务 run ID 持久化。`authorized` 表示本地策略允许远程请求，不等于底层命令已
+开始；`recovering` 必须查询实际外部状态或以可证明幂等的方式恢复，不能盲目重新执行。
+
+## 本地授权边界
+
+Server Job 只能引用 Agent 预先配置的资源 ID。Agent 本地策略决定该资源允许的操作、目录范围、最大
+并发、带宽、运行窗口和凭据。这样即使 Server 账户被误用，也不能通过 Proto 任意扩大到 Agent 文件系统
+或执行任意命令。
+
+对于更新、脚本等更高风险能力，建议独立 capability 和显式本地开关，并让默认状态为关闭。只读采集与
+有副作用 Plus Task 不应共享同一宽泛权限。

@@ -8,6 +8,15 @@ description: gRPC、Proto、Noise 和业务授权的分层边界。
 `smalux-protocol` 是 Agent 与 Server 共用的版本化协议 crate。它同时提供 `.proto`、生成的 Tonic
 类型、Noise 状态机和高层 Session API。
 
+它分为四层，调用方通常只接触最上面两层：
+
+| 层 | 主要类型 | 职责 |
+| --- | --- | --- |
+| 业务消息 | `JobCommand`、`TaskReport`、`SecureMessage` | 定义稳定的跨进程数据契约。 |
+| 会话适配 | `AgentProtocolClient`、`ServerSessionAcceptor`、`SessionDriver` | 管理 gRPC 流、握手阶段和强类型事件。 |
+| Noise 状态机 | XXpsk3、IK、`SecureSession` | 身份握手、加解密、nonce 和 rekey。 |
+| 传输 | Tonic/Axum/HTTP/2 | 建立双向字节流并处理网络反压。 |
+
 ## 服务与路径
 
 Proto package 为 `smalux.agent.v1`，gRPC service 为 `AgentTransport`：
@@ -36,6 +45,10 @@ Proto package 为 `smalux.agent.v1`，gRPC service 为 `AgentTransport`：
 
 Token、Job、TaskReport、授权错误和业务负载不应直接放在外层 Frame。握手完成后，ciphertext 解密为
 `SecureMessage`，再根据 `oneof body` 分类为注册、通用消息、Job、TaskReport、Session 控制或换钥消息。
+
+接收端的处理顺序固定为：先验证 `ProtocolFrame` 当前阶段是否允许，再让 Noise 解密，然后校验
+`SecureMessage.oneof`，最后才进入 Job 或上报业务。握手阶段收到 ciphertext、业务阶段再次收到握手帧，
+都属于协议状态错误，不能尝试猜测或降级解析。
 
 ## 为什么同时使用 gRPC 和 Noise
 
@@ -86,3 +99,12 @@ Protocol 不负责：
 
 它会返回需要持久化的 identity、public key、transaction ID 和 rotation snapshot，但保存位置和事务
 边界由应用决定。
+
+## Proto 与 Rust 类型
+
+`build.rs` 会递归编译 `proto/smalux/agent/v1/` 下全部 `.proto`，生成文件只存在于 Cargo `OUT_DIR`。
+Rust 代码统一从 `smalux_protocol::agent::v1` 引用生成类型；IDE 若暂时标红，应先重新加载 Cargo 和执行
+一次 `cargo check -p smalux-protocol`，不要复制生成文件到 `src/`。
+
+Proto 的版本号体现在 package `v1`。在同一 `v1` 内只能做 wire 兼容扩展；需要破坏性语义变化时应新建
+版本 package，并在能力协商或连接入口中明确选择，不能让同一字段在新旧端表示不同含义。

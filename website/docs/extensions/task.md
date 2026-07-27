@@ -66,6 +66,18 @@ Task::NewType(config)   -> NewTypeTask
 
 未知、未编译或未启用的分支必须返回稳定的 `UNSUPPORTED_TASK` 类错误，不能静默忽略或降级成其他 Task。
 
+一次完整扩展通常会触及：
+
+| 修改点 | 内容 |
+| --- | --- |
+| Protocol task Proto | Config、Result 与 oneof 分支。 |
+| Protocol 测试 | 编解码、未知/缺失字段和兼容性。 |
+| Agent Task 模块 | 配置转换、一次执行和结果构造。 |
+| Collector（可选） | 平台读取与可测试接口。 |
+| TaskFactory | 固定 Proto 分支到 Task 的映射。 |
+| Agent 测试 | 校验、取消、超时、平台错误和边界数据。 |
+| 文档与 Example | 配置字段、结果语义和调用示例。 |
+
 ## 5. 测试
 
 至少覆盖：
@@ -83,3 +95,7 @@ Task::NewType(config)   -> NewTypeTask
 不同 Agent 构建可能支持不同 Task。正式连接协议应上报 Agent 版本、协议版本、Task 类型和配置版本；Server
 只向声明支持的 Agent 下发 Job。当前能力协商仍是待完善边界，新增 Plus Task 时尤其不能假设所有 Agent
 已经包含它。
+
+在能力协商完成前，Server 应把 `UNSUPPORTED_TASK` 视为明确的兼容结果并停止重复下发，而不是不断重试。
+Task 配置本身若需要独立演进，可以增加配置版本或新的 oneof 分支；不要让同一字段随 Agent 版本静默改变
+含义。
