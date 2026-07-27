@@ -16,6 +16,151 @@ Protobuf 字段定义以 `proto/smalux/agent/v1/` 为准，API 详细说明见�
 Noise 底层握手和密钥状态仍然公开。调用方可以使用高层流程，也可以自行组合小方法，
 但同一个会话只能由一种方式驱动，不能同时交给手动循环和 Driver。
 
+## 快速代码导读
+
+下面的代码省略 `use`、日志和具体数据库类型，只展示协议调用的先后关系。
+其中 `store.*` 代表调用方自己的数据库或本地文件操作，不是 `smalux-protocol` 提供的方法。
+
+### Agent 首次注册
+
+```rust
+// 1. Agent 本地生成长期身份；私钥不会发送给 Server。
+let identity = NoiseIdentity::generate()?;
+
+// 2. 创建协议 Client。endpoint 可以是 h2c，也可以是经过 CF/Nginx 的 HTTPS。
+let mut client = AgentProtocolClient::new("https://agent.example.com");
+client.set_grpc_prefix("/api/v1/grpc");
+client.set_handshake_timeout(Duration::from_secs(5));
+
+// 3. XXpsk3 建立首次可信会话，并等待 Server 保存 pending 注册记录。
+//    此时 Agent 不需要预先知道 Server 静态公钥。
+let pending = client
+    .prepare_registration(
+        identity,
+        &registration_psk,
+        registration_token,
+        "agent-01".to_owned(),
+    )
+    .await?;
+
+// 4. 必须先保存 pending 中的长期材料，成功后才能通知 Server 提交。
+store.save_pending(
+    &pending.agent_identity,
+    &pending.server_public_key,
+    &pending.agent_id,
+    pending.registration_id,
+)?;
+
+// 5. commit 通知 Server 激活 Agent，并等待 RegistrationCommitted。
+let registered = pending.commit().await?;
+store.mark_committed(registered.registration_id)?;
+
+// 6. 注册用的 XX 会话已经是可用的加密业务会话，不需要立即断开再建 IK。
+let session = registered.session;
+```
+
+关键边界是 `save_pending()` 必须发生在 `commit()` 前。进程在两者之间退出时，Agent 能恢复
+相同身份继续注册；Server 也能根据 Token、Agent 公钥和事务 ID 返回原 pending 事务。
+
+### Agent 后续重连
+
+```rust
+// 1. 从本地恢复首次注册时保存的 Agent 私钥和 Server 固定公钥。
+let identity = store.load_agent_identity()?;
+let server_key = store.load_server_public_key()?;
+
+// 2. IK 在两条握手消息内完成双方静态身份认证。
+let mut client = AgentProtocolClient::new("https://agent.example.com");
+client.set_grpc_prefix("/api/v1/grpc");
+let session = client.connect(&identity, server_key).await?;
+
+// 3. 后续只在当前会话上收发业务消息，不再提交注册 Token。
+let mut running = SessionDriver::spawn(session, SessionDriverConfig::default());
+```
+
+如果 Server 正在轮换静态密钥，可把本地仍可信的 `pending/current/previous` 公钥传给
+`connect_with_candidates()`。每个候选公钥会创建一条独立 RPC，首个 IK 成功后停止尝试。
+
+### Server 接受注册或重连
+
+```rust
+// sender 和 inbound 来自同一次 OpenSession RPC，不能跨连接混用。
+let incoming = acceptor
+    .accept_incoming(inbound, sender, &server_keyring, &registration_psk)
+    .await?;
+
+let (agent_id, session) = match incoming {
+    IncomingSession::Registration(mut registration) => {
+        // XXpsk3 已认证 Agent 公钥，但 Token 和名称仍由业务层验证。
+        let agent_key = registration.peer_public_key();
+        let request = registration.receive_request().await?;
+        let prepared = store.prepare_registration(
+            &request.token,
+            &request.agent_name,
+            agent_key.as_bytes(),
+        )?;
+
+        // Server 先保存 pending，再告诉 Agent 本次事务 ID。
+        registration
+            .prepare(prepared.registration_id, prepared.agent_id.clone())
+            .await?;
+        registration
+            .wait_for_commit(prepared.registration_id, Duration::from_secs(10))
+            .await?;
+
+        // 收到 Agent commit 后，Server 先落库激活，再发送最终确认。
+        store.commit_registration(prepared.registration_id, agent_key.as_bytes())?;
+        let session = registration.complete(prepared.registration_id).await?;
+        (prepared.agent_id, session)
+    }
+    IncomingSession::Authentication(authentication) => {
+        // IK 只证明私钥持有关系；业务层仍需检查注册、吊销和租户权限。
+        let agent_id = store.authorize_agent(authentication.peer_public_key().as_bytes())?;
+        (agent_id, authentication.authorize())
+    }
+};
+
+// 两条分支最终都得到已授权 session，后面的业务处理完全相同。
+run_business_session(agent_id, session).await?;
+```
+
+Token 无效、Agent 已吊销或落库失败时，不应调用 `authorize()` 或 `complete()`；应调用对应对象的
+`reject(secure_error)`，让对端在 Noise 密文中收到结构化拒绝原因。
+
+### Driver 收发业务
+
+```rust
+// Driver 独占 TonicNoiseSession，串行推进 Noise nonce、心跳和 rekey。
+let mut running = SessionDriver::spawn(session, SessionDriverConfig::default());
+
+// handle 可以克隆给采集任务；队列满时 send_task_report 会等待并形成反压。
+let report_sender = running.handle.clone();
+tokio::spawn(async move {
+    while let Some(report) = next_task_report().await {
+        report_sender.send_task_report(report).await?;
+    }
+    Ok::<_, TransportError>(())
+});
+
+// events 只能由一个调度循环消费。Server 下发 Job 后交给本地 JobController。
+while let Some(event) = running.events.recv().await {
+    match event? {
+        SessionEvent::JobCommand(command) => {
+            let result = job_controller.apply(command).await;
+            running.handle.send_job_command_result(result).await?;
+        }
+        other => handle_other_event(other).await?,
+    }
+}
+
+// 主动退出时先通知 Driver，再等待它释放 gRPC 流。
+running.handle.shutdown().await?;
+running.task.await?;
+```
+
+这段流程只有一个对象实际操作 `TonicNoiseSession`：`SessionDriver`。采集任务、Job 调度器和其他
+业务模块只持有 `SessionHandle`，因此不会并发修改 Noise 状态。
+
 ## 2. 外层连接
 
 Agent 首先创建 `AgentProtocolClient`：

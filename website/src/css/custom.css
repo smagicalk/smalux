@@ -1,0 +1,77 @@
+:root {
+  --ifm-color-primary: #176b56;
+  --ifm-color-primary-dark: #145f4c;
+  --ifm-color-primary-darker: #135a48;
+  --ifm-color-primary-darkest: #0f4a3b;
+  --ifm-color-primary-light: #1a7760;
+  --ifm-color-primary-lighter: #1b7c64;
+  --ifm-color-primary-lightest: #1f8c71;
+  --ifm-background-color: #ffffff;
+  --ifm-background-surface-color: #f5f7f8;
+  --ifm-code-font-size: 0.9rem;
+  --ifm-font-family-base: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ifm-font-family-monospace: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --ifm-heading-font-weight: 650;
+  --ifm-global-radius: 6px;
+  --docusaurus-highlighted-code-line-bg: rgb(23 107 86 / 10%);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #63d6b2;
+  --ifm-color-primary-dark: #47cda4;
+  --ifm-color-primary-darker: #3ac99e;
+  --ifm-color-primary-darkest: #2da782;
+  --ifm-color-primary-light: #7fdfc0;
+  --ifm-color-primary-lighter: #8ce2c7;
+  --ifm-color-primary-lightest: #b4eddb;
+  --ifm-background-color: #111416;
+  --ifm-background-surface-color: #191e21;
+  --ifm-navbar-background-color: #14181a;
+  --ifm-footer-background-color: #0d1012;
+  --docusaurus-highlighted-code-line-bg: rgb(99 214 178 / 14%);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+.navbar__logo {
+  height: 28px;
+  width: 28px;
+}
+
+.navbar__logo img {
+  height: 100%;
+  width: 100%;
+  object-fit: contain;
+}
+
+.theme-doc-markdown {
+  max-width: 880px;
+}
+
+.theme-doc-markdown > h1:first-child {
+  font-size: clamp(2rem, 5vw, 3rem);
+}
+
+.theme-doc-markdown table {
+  display: table;
+  width: 100%;
+}
+
+.theme-doc-markdown img[alt='Smalux'] {
+  display: block;
+  width: min(320px, 72vw);
+  margin: 0 auto 2rem;
+}
+
+code {
+  border: 1px solid rgb(127 127 127 / 16%);
+}
+
+@media (max-width: 700px) {
+  .theme-doc-markdown table {
+    display: block;
+    overflow-x: auto;
+  }
+}

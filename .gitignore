@@ -28,3 +28,8 @@ target
 .idea
 /**/target
 **/**/target
+
+# Docusaurus documentation site
+/website/node_modules/
+/website/.docusaurus/
+/website/build/
