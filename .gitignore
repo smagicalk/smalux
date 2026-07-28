@@ -33,3 +33,6 @@ target
 /website/node_modules/
 /website/.docusaurus/
 /website/build/
+
+.agents
+.codex
