@@ -29,7 +29,7 @@ message RegistrationRequest {
   // 一次性注册 Token；只能位于 Noise 密文中，Server 验证成功后应将其消费。
   string token = 1;
 
-  // Agent 期望使用的可读名称；Server 仍需执行长度、字符和唯一性校验。
+  // Agent 期望使用的可读展示名称；允许重复，Server 不得用它判断身份或建立关联。
   string agent_name = 2;
 }
 
@@ -140,12 +140,24 @@ message SessionControl {
 message Ping {
   // 由发送方生成的关联值；不是 AEAD nonce，也不参与密码学计算。
   uint64 nonce = 1;
+
+  // 发送方记录的 Unix 微秒时间，仅用于链路诊断；RTT 计算使用本地单调时钟。
+  uint64 sent_at_unix_micros = 2;
 }
 
 // 加密心跳响应。
 message Pong {
   // 必须原样复制对应 Ping.nonce，便于发送方关联响应。
   uint64 nonce = 1;
+
+  // 原样回显 Ping.sent_at_unix_micros，便于日志关联和跨机器诊断。
+  uint64 echoed_sent_at_unix_micros = 2;
+
+  // Responder 收到 Ping 时的 Unix 微秒时间，仅用于观测，不参与认证。
+  uint64 responder_received_at_unix_micros = 3;
+
+  // Responder 发出 Pong 前的 Unix 微秒时间，仅用于观测，不参与认证。
+  uint64 responder_sent_at_unix_micros = 4;
 }
 
 // Responder 请求 initiator 开始同步 rekey。

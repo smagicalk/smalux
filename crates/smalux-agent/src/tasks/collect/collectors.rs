@@ -99,6 +99,10 @@ impl HostMetricsCollector {
             None,
         )
         .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "socket summary collection unavailable in system snapshot"
+            );
             socket::SocketSnapshot::unavailable(CollectionMode::Summary, error.to_string())
         });
         // 固定参数由类型保证有效；Summary 不读取资源详情或 Linux threads/tasks。

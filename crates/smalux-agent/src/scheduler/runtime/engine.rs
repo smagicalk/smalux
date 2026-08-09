@@ -223,6 +223,7 @@ impl SchedulerActor {
     /// 每轮 select 前先恢复 Backpressure 并派发 ReadyQueue，确保释放槽位后尽快推进任务。
     pub(super) async fn run(mut self) -> Result<(), SchedulerError> {
         self.emit(SchedulerEventKind::SchedulerStarted);
+        tracing::info!("agent scheduler actor started");
         let mut maintenance = tokio::time::interval(TIMER_REANCHOR_INTERVAL);
         maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -231,9 +232,15 @@ impl SchedulerActor {
             self.dispatch_ready();
 
             tokio::select! {
-                _ = self.shutdown.cancelled() => break,
+                _ = self.shutdown.cancelled() => {
+                    tracing::debug!("agent scheduler actor cancellation requested");
+                    break
+                },
                 command = self.command_rx.recv() => {
-                    let Some(command) = command else { break };
+                    let Some(command) = command else {
+                        tracing::warn!("agent scheduler command channel closed");
+                        break
+                    };
                     if self.handle_command(command)? { break; }
                 }
                 completion = self.tasks.join_next(), if !self.tasks.is_empty() => {
@@ -241,7 +248,7 @@ impl SchedulerActor {
                         match result {
                             Ok(completion) => self.handle_completion(completion),
                             Err(error) => {
-                                tracing::error!(error = %error, "scheduler task wrapper failed");
+                                tracing::error!(error = %error, "agent scheduler task wrapper failed");
                             }
                         }
                     }
@@ -341,6 +348,7 @@ impl SchedulerActor {
     ///
     /// 该操作递增版本、清理全部 Timer/Pending，并取消旧版本运行实例。
     fn force_disable(&mut self, job_id: JobId, reason: String) -> Result<(), SchedulerError> {
+        tracing::warn!(job_id = %job_id, reason = %reason, "agent scheduler force-disabling job");
         let (old_version, version) = {
             let job = self
                 .jobs
@@ -375,16 +383,31 @@ impl SchedulerActor {
 
     /// 触发指定 Job 版本所有运行实例的协作取消令牌。
     fn cancel_job_version(&self, job_id: JobId, version: u64) {
+        let mut cancelled = 0usize;
         for running in self.running.values() {
             if running.job_id == job_id && running.version == version {
                 running.cancellation.cancel();
+                cancelled += 1;
             }
+        }
+        if cancelled > 0 {
+            tracing::debug!(
+                job_id = %job_id,
+                version,
+                cancelled,
+                "agent scheduler cancelled running job executions"
+            );
         }
     }
 
     /// 分配事件序号并广播调度事件；没有订阅者时允许静默丢弃。
     fn emit(&mut self, kind: SchedulerEventKind) {
         self.event_sequence = self.event_sequence.wrapping_add(1);
+        tracing::trace!(
+            sequence = self.event_sequence,
+            event = ?kind,
+            "agent scheduler event emitted"
+        );
         let event = Arc::new(SchedulerEvent {
             sequence: self.event_sequence,
             emitted_at: Utc::now(),
@@ -395,6 +418,12 @@ impl SchedulerActor {
 
     /// 清空未执行工作、取消运行实例，并在超时后强制 Abort 剩余包装任务。
     async fn graceful_shutdown(&mut self) {
+        tracing::info!(
+            jobs = self.jobs.len(),
+            running = self.running.len(),
+            pending = self.ready.len(),
+            "agent scheduler graceful shutdown started"
+        );
         let _ = self.status_tx.send(SchedulerStatus::Stopping);
         self.emit(SchedulerEventKind::SchedulerStopping);
         self.ready.clear();
@@ -412,6 +441,11 @@ impl SchedulerActor {
             }
             tokio::select! {
                 _ = &mut deadline => {
+                    tracing::error!(
+                        running = self.tasks.len(),
+                        timeout = ?self.config.shutdown_timeout,
+                        "agent scheduler shutdown timeout reached; aborting task wrappers"
+                    );
                     self.tasks.abort_all();
                     while self.tasks.join_next().await.is_some() {}
                     break;
@@ -423,6 +457,7 @@ impl SchedulerActor {
         self.total_running = 0;
         let _ = self.status_tx.send(SchedulerStatus::Stopped);
         self.emit(SchedulerEventKind::SchedulerStopped);
+        tracing::info!("agent scheduler graceful shutdown completed");
         if let Some(response) = self.shutdown_response.take() {
             let _ = response.send(Ok(()));
         }

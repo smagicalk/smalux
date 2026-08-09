@@ -32,6 +32,10 @@ let mut client = AgentProtocolClient::new("https://agent.example.com");
 client.set_grpc_prefix("/api/v1/grpc");
 client.set_handshake_timeout(Duration::from_secs(5));
 
+// registration_token 是公开 Token ID 与秘密 PSK 的组合；psk 是从秘密部分安全解码得到的 32 字节值。
+let registration_token =
+    "token-001.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+
 // 3. XXpsk3 建立首次可信会话，并等待 Server 保存 pending 注册记录。
 //    此时 Agent 不需要预先知道 Server 静态公钥。
 let pending = client
@@ -220,8 +224,8 @@ Agent                                      Server
 1. 调用 `ServerSessionAcceptor::accept_incoming()`。
 2. XXpsk3 成功后获得 `IncomingSession::Registration(ServerRegistration)`。
 3. 调用 `ServerRegistration::peer_public_key()`取得 Noise 已认证的 Agent 静态公钥。
-4. 调用 `receive_request()`取得 Token 和 Agent 名称。
-5. 业务层验证 Token、名称和公钥，并在数据库或本地存储中创建或恢复 pending 事务。
+4. 调用 `receive_request()`取得 Token 和 Agent 展示名称。
+5. 业务层验证 Token、名称格式和公钥，并在数据库或本地存储中创建或恢复 pending 事务；名称不参与身份判断。
 6. 存储成功后调用 `prepare(registration_id, agent_id)`。
 7. 调用 `wait_for_commit(registration_id, timeout)`等待 Agent 持久化确认。
 8. 收到匹配 commit 后，业务层先激活 Agent并最终消费 Token。
@@ -235,7 +239,7 @@ Token、Agent 注册表和事务存储不属于协议 crate。Server 必须先�
 Server 调用 `ServerRegistration::reject()`发送 Noise 加密的 `SecureError`。常见原因包括：
 
 - Token 无效、过期或已绑定其他公钥；
-- Agent 名称无效或已占用；
+- Agent 展示名称格式无效；
 - 注册事务 ID 不匹配；
 - Server 存储失败。
 
@@ -253,7 +257,8 @@ Server 的注册存储应以 Token、Agent 公钥和注册事务 ID保证幂等�
 | Commit 已发送，Committed 未收到 | 保留 pending 并重试 | 已提交事务仍返回原事务，重复 commit 成功。 |
 | Committed 已收到 | 使用 IK 连接 | Server 根据已登记 Agent 公钥授权。 |
 
-相同 Token 配合不同 Agent 公钥必须拒绝。pending Agent 不能使用 IK。
+相同 Token 配合不同 Agent 公钥必须拒绝。prepared 注册事务没有对应的 active Agent，不能使用 IK；
+只有 commit 原子完成后，Server 才会创建可授权的 Agent 记录。
 
 当前 XXpsk3 接收接口每次接收一个已经选定的注册 PSK。示例使用固定 PSK；生产系统如果同时存在
 多组注册 PSK，需要在上层增加可安全选择 PSK 的入口或后续扩展公开 Token 标识，不能在握手完成后
@@ -344,6 +349,8 @@ nonce 推进和网络发送。命令队列和事件队列都有容量上限，�
 | --- | --- |
 | `set_heartbeat_policy()` | 修改心跳间隔和失联超时。 |
 | `heartbeat_policy()` | 读取当前策略。 |
+| `heartbeat_stats()` | 读取 Ping/Pong 数量、丢失数和 RTT 极值。 |
+| `last_heartbeat()` | 读取最近一次成功探测的时间字段和本地 RTT。 |
 | `should_ping()` | 判断是否到达 Ping 时点。 |
 | `heartbeat_expired()` | 判断是否超过无入站上限。 |
 | `maintenance_status()` | 无副作用查询心跳、Ping 和 rekey 状态。 |
@@ -351,6 +358,9 @@ nonce 推进和网络发送。命令队列和事件队列都有容量上限，�
 | `ping()` | 手动发送指定 nonce 的加密 Ping。 |
 
 默认 30 秒发送间隔、90 秒无入站消息超时。任何成功解密的入站帧都会刷新存活时间。
+Ping/Pong 还带有可选 Unix 微秒诊断时间；真正 RTT 使用发送端本地 `Instant` 计算，避免两端
+系统时钟偏差影响链路判断。`last_heartbeat()` 可以读取最近一次 nonce、RTT、发送时间以及
+responder 接收/发送时间。
 
 ## 9. 当前连接 rekey
 

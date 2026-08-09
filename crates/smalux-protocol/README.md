@@ -57,6 +57,42 @@ smalux-protocol/
 - RPC 重试、业务消息持久化和幂等；
 - Agent 调度、采集任务或 Server 业务处理。
 
+## 协议日志
+
+协议代码只产生 tracing 事件，不负责安装全局 subscriber。宿主程序决定日志输出到
+控制台、滚动文件还是其他采集系统，并通过通用的 RUST_LOG 环境变量选择级别。
+
+日志级别按诊断粒度划分：
+
+| 级别 | 内容 |
+| --- | --- |
+| error | Driver、RPC 或会话无法继续，通常需要关闭当前连接。 |
+| warn | Token/公钥不匹配、握手超时、无效帧、未匹配 Pong、授权失败等可恢复或安全拒绝。 |
+| info | XXpsk3/IK 完成、注册阶段变化、会话建立/关闭、心跳超时、rekey 完成。 |
+| debug | 选择密钥候选、策略变更、注册准备、Driver 命令和业务阶段。 |
+| trace | 单帧收发、握手 payload 长度、Noise nonce、心跳 nonce 和 RTT 样本。 |
+
+协议日志不会记录 PSK、注册 Token、Noise 私钥或解密后的业务明文。key_id、Agent ID、
+帧长度、generation 和计数只用于关联诊断；Agent ID 和 endpoint 仍可能属于部署敏感信息，
+生产环境应按实际采集策略配置过滤和脱敏。
+
+常用过滤示例：
+
+    # 只看协议生命周期和失败原因
+    $env:RUST_LOG = "smalux_protocol=info"
+
+    # 查看握手、注册、授权和 rekey 的详细步骤
+    $env:RUST_LOG = "smalux_protocol=debug"
+
+    # 排查单帧顺序、nonce 或心跳 RTT；只建议短时间使用
+    $env:RUST_LOG = "smalux_protocol=trace"
+
+    # 同时保留应用日志，压低底层依赖噪声
+    $env:RUST_LOG = "smalux_protocol=debug,tonic=warn,h2=warn,tokio=warn"
+
+调用方可以在业务日志中使用相同的 session_id、Agent ID 或 request ID 建立关联；协议层
+不会自行生成并传播业务 request ID。
+
 ## Job 与 Task 协议
 
 `.proto` 是 Job 配置和采集结果的唯一公开模型。Agent 不再维护可从 JSON 反序列化的
@@ -343,8 +379,8 @@ ServerSessionAcceptor
 | `new(endpoint)` | 创建 Client 配置。 | `http://` 使用 h2c；`https://` 使用系统根证书验证 TLS。 |
 | `set_handshake_timeout(duration)` | 修改连接和每一步握手超时。 | 默认 5 秒，只限制建连/握手，不限制长期业务流。 |
 | `set_grpc_prefix(prefix)` | 设置 Axum/Nginx 下的统一 gRPC 前缀。 | 示例使用 `/api/v1/grpc`。 |
-| `prepare_registration(identity, psk, token, agent_name)` | 执行 XXpsk3 并等待 Server 保存 pending 注册。 | 返回后应先持久化结果，再调用 `commit()`。 |
-| `register_agent(identity, psk, token, agent_name)` | 依次执行 prepare 和 commit 的便捷方法。 | 适合测试；生产持久化应使用分步方法。 |
+| `prepare_registration(identity, psk, token, agent_name)` | 执行 XXpsk3 并等待 Server 保存 pending 注册。 | `token` 使用 `token_id.psk`；返回后应先持久化结果，再调用 `commit()`。 |
+| `register_agent(identity, psk, token, agent_name)` | 依次执行 prepare 和 commit 的便捷方法。 | 自动从 `token_id.psk` 提取 Token ID；适合测试。生产持久化应使用分步方法。 |
 | `connect(identity, server_key)` | 使用固定 Server 公钥执行 IK。 | 成功后返回可持续使用的 `TonicNoiseSession`。 |
 | `connect_with_candidates(identity, candidates)` | 依次尝试多把 Server 公钥。 | Server 换钥期间通常传 `PinnedServerKeys::connection_candidates()`。 |
 
@@ -359,6 +395,50 @@ ServerSessionAcceptor
 | `server_public_key` | XXpsk3 认证后学到的 Server 公钥。 | 是，后续 IK 必需。 |
 | `registration_id` | Server 分配的 16 字节幂等注册事务 ID。 | 是，用于恢复和审计。 |
 | `session` | 已完成注册授权的 XXpsk3 加密会话，可立即承载业务。 | 否，只在当前进程和连接内有效。 |
+
+### Session 生命周期与持久化
+
+`TonicNoiseSession` 不是可以写入数据库的业务对象。它持有当前 gRPC stream、Noise cipher
+状态、nonce 和未完成的 rekey/心跳状态，只能在当前进程内顺序使用；`SessionDriver` 也只是
+围绕该连接运行的后台任务。进程退出、连接断开或切换网络后，必须创建新的 session，不能从
+旧对象恢复密文状态。
+
+首次注册应保存的是长期材料和注册事务，而不是 session：
+
+```text
+prepare_registration()
+    -> Server 返回 pending
+    -> 原子保存 agent_identity、server_public_key、agent_id、registration_id
+    -> commit()
+    -> 原子保存 committed 状态
+    -> 直接使用返回的 registration.session
+```
+
+对应的最小调用骨架如下：
+
+```rust,ignore
+let pending = client
+    .prepare_registration(identity, &psk, token, agent_name)
+    .await?;
+
+// 这里保存四项长期材料；保存失败时不要发送 commit。
+store.save_pending_registration(
+    &pending.agent_identity,
+    &pending.server_public_key,
+    &pending.agent_id,
+    pending.registration_id,
+)?;
+
+// Server 激活 Agent 并消费 Token；成功后当前 XX session 已经可以传业务。
+let registered = pending.commit().await?;
+store.mark_registration_committed(registered.registration_id)?;
+run_business_loop(registered.session).await?;
+```
+
+如果在 `prepare` 后、`commit` 前崩溃，重启时加载保存的身份和 pending 事务，再重新执行
+注册流程即可；Server 会按 Token、Agent 公钥和事务 ID 做幂等处理。如果 `commit` 已发送但
+确认丢失，保留同一组状态并重试，不要生成新的 Agent identity。只有后续建立连接时，才从
+持久化的 `agent_identity` 和 `server_public_key` 调用 `connect()` 执行 IK。
 
 ### 首次注册调用流程
 
@@ -387,9 +467,10 @@ let pending = client
         identity,
         // PSK 只参与首次握手，不用于后续 IK。
         &psk,
-        // Token 放在 Noise ciphertext 内，不进入 URL、日志或 gRPC metadata。
-        "one-time-token".to_owned(),
-        // Agent 名称是业务注册标识，不代替静态公钥认证。
+        // Token 使用公开 ID 加秘密 PSK 的格式；完整值只进入加密注册请求。
+        "token-001.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_owned(),
+        // Agent 名称只是允许重复的展示字段，不参与身份判断。
         "agent-001".to_owned(),
     )
     // 成功只表示 Server 已保存 pending，还不能使用 IK。
@@ -562,6 +643,8 @@ messages_loop(&mut session, &agent_id).await?;
 | `set_heartbeat_policy(policy)` | 两端 | 修改 Ping 间隔和失联超时。 |
 | `set_rekey_policy(policy)` | 两端 | 修改自动 rekey 的时间、帧数和开关。 |
 | `heartbeat_policy()` | 两端 | 读取当前心跳策略。 |
+| `heartbeat_stats()` | 两端 | 读取发送数、匹配 Pong 数、丢失数和 RTT 极值。 |
+| `last_heartbeat()` | 两端 | 读取最近一次成功心跳的 nonce、RTT 和诊断时间。 |
 | `should_ping()` | 两端 | 判断距离上次发送是否超过心跳间隔。 |
 | `heartbeat_expired()` | 两端 | 判断距离上次接收是否超过失联上限。 |
 | `should_rekey()` | 两端 | 判断自动 rekey 的时间或帧数条件是否满足。 |
@@ -583,7 +666,9 @@ messages_loop(&mut session, &agent_id).await?;
 | `announce_server_key(prepared)` | Server | 宣布下一把 Server 静态公钥。 |
 | `acknowledge_server_key(rotation_id, key_id)` | Agent | 确认已保存 Server 新公钥。 |
 
-`HeartbeatPolicy::default()` 是 30 秒发送间隔、90 秒无入站消息超时。
+`HeartbeatPolicy::default()` 是 30 秒发送间隔、90 秒无入站消息超时。每个 Ping 会记录 nonce 和
+发送时间，Pong 会回显发送时间并附带 responder 的接收/发送时间；`heartbeat_stats()` 使用本地
+单调时钟计算 RTT，不依赖两台机器的系统时钟同步。
 `RekeyPolicy::default()` 是 1 小时或 `2^20` 个加密帧后自动 rekey，且 `automatic = true`。
 
 `receive()` 的返回值含义：
@@ -605,8 +690,8 @@ rekey 等待 Ack 时提前到达的业务消息会被缓存，并在换钥完成
 返回 `RunningSession { handle, events, task }`。
 
 `SessionHandle` 提供 `send`、`send_messages`、`send_task_report`、`send_job_command`、
-`send_job_command_result`、`ping`、`request_rekey`、`require_rekey`、四个静态密钥轮换发送方法和
-幂等 `shutdown`。所有请求经过有界队列，真正的 Prost 编码、Noise 加密、rekey 和 nonce 推进只发生
+`send_job_command_result`、`ping`、`request_rekey`、`require_rekey`、`heartbeat_stats`、四个静态密钥
+轮换发送方法和幂等 `shutdown`。所有请求经过有界队列，真正的 Prost 编码、Noise 加密、rekey 和 nonce 推进只发生
 在 Driver task 中。事件队列同样有界，消费过慢会形成反压而不是静默丢包。
 
 手动 rekey 流程：

@@ -40,6 +40,7 @@ impl SchedulerActor {
             return;
         }
         let task = job.task.clone();
+        let task_kind = task.kind();
         let cancellation_mode = job.cancellation_mode;
         let timeout = job.trigger.timeout;
         let started_at = Utc::now();
@@ -63,6 +64,16 @@ impl SchedulerActor {
             attempt: pending.attempt,
             scheduled_at: pending.scheduled_at,
         });
+        tracing::debug!(
+            task_kind,
+            job_id = %pending.job_id,
+            version = pending.version,
+            run_id = %pending.run_id,
+            attempt = pending.attempt,
+            timeout = ?timeout,
+            cancellation_mode = ?cancellation_mode,
+            "agent scheduler execution started"
+        );
 
         self.tasks.spawn(async move {
             let context = TaskContext {
@@ -127,8 +138,20 @@ impl SchedulerActor {
             .get(&completion.job_id)
             .is_some_and(|job| job.version == completion.version);
         if !current {
+            tracing::debug!(
+                job_id = %completion.job_id,
+                version = completion.version,
+                run_id = %completion.run_id,
+                attempt = completion.attempt,
+                "agent scheduler ignored stale execution completion"
+            );
             return;
         }
+        let task_kind = self
+            .jobs
+            .get(&completion.job_id)
+            .map(|job| job.task.kind())
+            .unwrap_or("unknown");
         let metadata = completion.metadata();
 
         match completion.outcome {
@@ -152,6 +175,16 @@ impl SchedulerActor {
                     attempt: completion.attempt,
                     duration_ms: duration_ms(completion.elapsed),
                 });
+                tracing::debug!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    attempt = completion.attempt,
+                    duration_ms = duration_ms(completion.elapsed),
+                    output_delivered,
+                    "agent scheduler execution succeeded"
+                );
                 if output_delivered {
                     self.emit(SchedulerEventKind::OutputDelivered {
                         job_id: completion.job_id,
@@ -167,6 +200,14 @@ impl SchedulerActor {
                 self.handle_execution_failure(metadata, error, FailureClass::Permanent);
             }
             CompletionOutcome::Finished(TaskRunResult::CallbackTransient(error)) => {
+                tracing::warn!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    error = %error,
+                    "agent scheduler callback delivery failed"
+                );
                 self.emit(SchedulerEventKind::CallbackFailed {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -176,6 +217,14 @@ impl SchedulerActor {
                 self.record_final_failure(completion.job_id, error, false);
             }
             CompletionOutcome::Finished(TaskRunResult::CallbackPermanent(error)) => {
+                tracing::error!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    error = %error,
+                    "agent scheduler callback permanently failed"
+                );
                 self.emit(SchedulerEventKind::CallbackFailed {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -185,6 +234,13 @@ impl SchedulerActor {
                 let _ = self.force_disable(completion.job_id, error);
             }
             CompletionOutcome::Finished(TaskRunResult::ChannelClosed) => {
+                tracing::warn!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    "agent scheduler output channel closed; deleting job"
+                );
                 self.emit(SchedulerEventKind::OutputChannelClosed {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -194,6 +250,15 @@ impl SchedulerActor {
                 let _ = self.delete_job(completion.job_id, completion.version, true);
             }
             CompletionOutcome::TimedOut => {
+                tracing::warn!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    attempt = completion.attempt,
+                    elapsed_ms = duration_ms(completion.elapsed),
+                    "agent scheduler execution timed out"
+                );
                 self.emit(SchedulerEventKind::ExecutionTimedOut {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -207,6 +272,15 @@ impl SchedulerActor {
                 );
             }
             CompletionOutcome::Panicked(message) => {
+                tracing::error!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    attempt = completion.attempt,
+                    panic = %message,
+                    "agent scheduler execution panicked"
+                );
                 self.emit(SchedulerEventKind::ExecutionPanicked {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -217,6 +291,13 @@ impl SchedulerActor {
                 self.handle_execution_failure(metadata, message, FailureClass::Panic);
             }
             CompletionOutcome::Cancelled => {
+                tracing::debug!(
+                    task_kind,
+                    job_id = %completion.job_id,
+                    version = completion.version,
+                    run_id = %completion.run_id,
+                    "agent scheduler execution cancelled"
+                );
                 self.emit(SchedulerEventKind::ExecutionCancelled {
                     job_id: completion.job_id,
                     version: completion.version,
@@ -241,6 +322,15 @@ impl SchedulerActor {
             scheduled_at,
         } = execution;
         if class == FailureClass::Permanent {
+            tracing::error!(
+                job_id = %job_id,
+                version,
+                run_id = %run_id,
+                attempt,
+                failure_class = ?class,
+                error = %error,
+                "agent scheduler permanent task failure"
+            );
             self.emit(SchedulerEventKind::ExecutionFailed {
                 job_id,
                 version,
@@ -253,6 +343,16 @@ impl SchedulerActor {
             return;
         }
         let retry = self.retry_delay(job_id, attempt, class);
+        tracing::warn!(
+            job_id = %job_id,
+            version,
+            run_id = %run_id,
+            attempt,
+            failure_class = ?class,
+            error = %error,
+            will_retry = retry.is_some(),
+            "agent scheduler task execution failed"
+        );
         self.emit(SchedulerEventKind::ExecutionFailed {
             job_id,
             version,

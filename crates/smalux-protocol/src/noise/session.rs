@@ -7,6 +7,7 @@ use prost::Message;
 use snow::TransportState;
 
 use crate::agent::v1::{ProtocolFrame, SecureMessage, protocol_frame};
+use tracing::{debug, trace, warn};
 
 use super::NoiseError;
 
@@ -23,6 +24,7 @@ pub struct SecureSession {
 impl SecureSession {
     /// 由已完成的 XXpsk3/IK 握手创建，外部不能绕过握手直接构造。
     pub(crate) fn new(transport: TransportState) -> Self {
+        debug!("created Noise transport session");
         Self {
             transport,
             generation: 0,
@@ -40,6 +42,14 @@ impl SecureSession {
         let written = self.transport.write_message(&plaintext, &mut ciphertext)?;
         ciphertext.truncate(written);
         self.encrypted_frames = self.encrypted_frames.saturating_add(1);
+        trace!(
+            generation = self.generation,
+            plaintext_len = plaintext.len(),
+            ciphertext_len = ciphertext.len(),
+            encrypted_frames = self.encrypted_frames,
+            next_nonce = self.transport.sending_nonce(),
+            "encrypted Noise business frame"
+        );
         Ok(ProtocolFrame {
             body: Some(protocol_frame::Body::Ciphertext(ciphertext)),
         })
@@ -51,12 +61,38 @@ impl SecureSession {
     pub fn decrypt(&mut self, frame: ProtocolFrame) -> Result<SecureMessage, NoiseError> {
         // 握手帧和外层错误不能出现在已经建立的加密业务路径中。
         let Some(protocol_frame::Body::Ciphertext(ciphertext)) = frame.body else {
+            warn!("received a non-ciphertext frame in Noise transport mode");
             return Err(NoiseError::InvalidFrame);
         };
         let mut plaintext = vec![0; 65_535];
-        let read = self.transport.read_message(&ciphertext, &mut plaintext)?;
+        let read = self
+            .transport
+            .read_message(&ciphertext, &mut plaintext)
+            .map_err(|error| {
+                warn!(
+                    error = ?error,
+                    ciphertext_len = ciphertext.len(),
+                    "Noise frame decryption failed"
+                );
+                NoiseError::from(error)
+            })?;
         self.encrypted_frames = self.encrypted_frames.saturating_add(1);
-        Ok(SecureMessage::decode(&plaintext[..read])?)
+        trace!(
+            generation = self.generation,
+            ciphertext_len = ciphertext.len(),
+            plaintext_len = read,
+            encrypted_frames = self.encrypted_frames,
+            next_nonce = self.transport.receiving_nonce(),
+            "decrypted Noise business frame"
+        );
+        SecureMessage::decode(&plaintext[..read]).map_err(|error| {
+            warn!(
+                error = ?error,
+                plaintext_len = read,
+                "decrypted Noise payload is not a SecureMessage"
+            );
+            NoiseError::from(error)
+        })
     }
 
     /// 返回已完成同步 rekey 的次数；初始 transport key 属于 generation 0。
@@ -81,16 +117,24 @@ impl SecureSession {
 
     /// 把接收方向切换到 Noise 规范派生的下一把对称密钥。
     pub(crate) fn rekey_incoming(&mut self) {
+        debug!(generation = self.generation, "switching Noise incoming key");
         self.transport.rekey_incoming();
     }
 
     /// 把发送方向切换到 Noise 规范派生的下一把对称密钥。
     pub(crate) fn rekey_outgoing(&mut self) {
+        debug!(generation = self.generation, "switching Noise outgoing key");
         self.transport.rekey_outgoing();
     }
 
     /// 双向密钥都切换完成后提交 generation，并清零本代帧计数。
     pub(crate) fn finish_rekey(&mut self, generation: u64) {
+        debug!(
+            previous_generation = self.generation,
+            generation,
+            frames_before_rekey = self.encrypted_frames,
+            "completed Noise transport rekey"
+        );
         self.generation = generation;
         self.encrypted_frames = 0;
     }

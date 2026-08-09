@@ -30,6 +30,10 @@ let identity = NoiseIdentity::generate()?;
 let mut client = AgentProtocolClient::new("https://agent.example.com");
 client.set_grpc_prefix("/api/v1/grpc");
 
+// token 使用公开 Token ID 与秘密 PSK 的组合格式；完整值只会进入 Noise 加密消息。
+let token =
+    "token-001.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+
 let pending = client
     .prepare_registration(identity, &psk, token, agent_name)
     .await?;

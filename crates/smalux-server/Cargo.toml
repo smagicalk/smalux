@@ -33,9 +33,9 @@ serde_json = "1.0.150"
 # Server 结构化日志 API。
 tracing = { version = "0.1.44", features = ["log", "std"] }
 # ORM 与数据库连接，支持 SQLite、PostgreSQL 和 MySQL。
-sea-orm = { version = "2.0.0-rc.42", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+sea-orm = { version = "2.0.1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "macros", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SeaORM 迁移运行时，用于启动时执行数据库 schema 升级。
-sea-orm-migration = { version = "2.0.0-rc.42", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
+sea-orm-migration = { version = "2.0.1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "with-json", "with-chrono", "with-time", "with-uuid", "sqlite-use-returning-for-3_35"] }
 # SQL 构建器，用于动态查询、复杂条件和迁移辅助。
 sea-query = { version = "1.0.1", default-features = false, features = ["derive", "backend-sqlite", "backend-postgres", "backend-mysql", "serde", "with-json", "with-chrono", "with-time", "with-uuid", "sea-orm"] }
 # 启动和应用边界的通用错误封装。
@@ -68,3 +68,12 @@ mime_guess = { version = "2.0.5", optional = true }
 smalux-core = { path = "../smalux-core" }
 # 项目协议库
 smalux-protocol = { path = "../smalux-protocol"}
+# Echo 示例需要直接调用 Prost 的 Message 编解码 trait。
+prost = "0.14.4"
+tonic = "0.14.6"
+# Noise XXpsk3/IK 握手和 transport mode 加密。
+snow = "0.10.0"
+
+[dev-dependencies]
+# 测试二进制启动时提前安装全局 tracing subscriber。
+ctor = "1.0.8"

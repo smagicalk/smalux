@@ -24,6 +24,7 @@ pub use server::{ServerIkHandshake, ServerXxAwaitMessage3, ServerXxHandshake};
 pub use session::SecureSession;
 
 use crate::agent::v1::{NoiseHandshake, noise_handshake::HandshakeType};
+use tracing::{trace, warn};
 
 /// 首次注册使用的 Noise suite：XX + psk3 + X25519 + ChaChaPoly + BLAKE2s。
 pub const NOISE_XX_PSK3: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
@@ -53,22 +54,47 @@ pub struct EstablishedNoise {
 
 /// 构造正式 Protobuf 握手消息，并可选附带 responder key ID。
 fn handshake_frame(kind: HandshakeType, key_id: Option<KeyId>, payload: Vec<u8>) -> NoiseHandshake {
+    trace!(
+        handshake = ?kind,
+        key_id_present = key_id.is_some(),
+        payload_len = payload.len(),
+        "building Noise handshake frame"
+    );
     NoiseHandshake {
         r#type: kind as i32,
         responder_key_id: key_id
             .map(|value| value.as_bytes().to_vec())
             .unwrap_or_default(),
         payload,
+        registration_token_id: String::new(),
     }
 }
 
 /// 确认收到的握手帧仍属于当前 typestate 期待的模式。
 fn validate_handshake(frame: &NoiseHandshake, expected: HandshakeType) -> Result<(), NoiseError> {
-    let actual =
-        HandshakeType::try_from(frame.r#type).map_err(|_| NoiseError::InvalidHandshakeType)?;
+    let actual = HandshakeType::try_from(frame.r#type).map_err(|_| {
+        warn!(
+            expected = ?expected,
+            raw_type = frame.r#type,
+            payload_len = frame.payload.len(),
+            "received an unknown Noise handshake type"
+        );
+        NoiseError::InvalidHandshakeType
+    })?;
+    trace!(
+        expected = ?expected,
+        actual = ?actual,
+        payload_len = frame.payload.len(),
+        "validating Noise handshake frame"
+    );
     if actual == expected {
         Ok(())
     } else {
+        warn!(
+            expected = ?expected,
+            actual = ?actual,
+            "Noise handshake type does not match current state"
+        );
         Err(NoiseError::InvalidHandshakeType)
     }
 }

@@ -154,16 +154,33 @@ pub(crate) async fn collect_public_families(
 /// 把端点查询结果转换为可序列化的稳定状态模型。
 fn into_public_ip_state(result: anyhow::Result<IpAddr>) -> PublicIpState {
     match result {
-        Ok(address) => PublicIpState {
-            status: PublicIpStatus::Resolved as i32,
-            address: Some(address.to_string()),
-            message: None,
-        },
-        Err(error) => PublicIpState {
-            status: PublicIpStatus::Failed as i32,
-            address: None,
-            message: Some(error.to_string()),
-        },
+        Ok(address) => {
+            tracing::trace!(
+                address_family = address_family(address),
+                "public IP endpoint resolved"
+            );
+            PublicIpState {
+                status: PublicIpStatus::Resolved as i32,
+                address: Some(address.to_string()),
+                message: None,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "public IP endpoint family failed");
+            PublicIpState {
+                status: PublicIpStatus::Failed as i32,
+                address: None,
+                message: Some(error.to_string()),
+            }
+        }
+    }
+}
+
+/// 仅返回地址族名称，日志不记录真实公网 IP。
+fn address_family(address: IpAddr) -> &'static str {
+    match address {
+        IpAddr::V4(_) => "ipv4",
+        IpAddr::V6(_) => "ipv6",
     }
 }
 

@@ -48,7 +48,7 @@ enum SecureErrorCode {
   // Agent 静态公钥未注册、已撤销或没有当前业务操作权限。
   SECURE_ERROR_CODE_AGENT_NOT_AUTHORIZED = 3;
 
-  // 相同 Agent 名称或公钥已经完成注册。
+  // 相同 Agent 静态公钥或稳定身份已经完成注册；展示名称不参与判断。
   SECURE_ERROR_CODE_AGENT_ALREADY_REGISTERED = 4;
 
   // SecureMessage body、oneof 分支或字段值不符合当前会话阶段。
@@ -65,6 +65,9 @@ enum SecureErrorCode {
 
   // Server 内部或存储失败；不得在 message 中暴露路径、密钥或数据库细节。
   SECURE_ERROR_CODE_INTERNAL = 9;
+
+  // Server 当前注册或会话资源已达上限，Agent 可以稍后重试。
+  SECURE_ERROR_CODE_RESOURCE_EXHAUSTED = 10;
 }
 
 // 只在已经建立的 Noise transport mode 内发送的加密错误。

@@ -62,11 +62,23 @@ impl ProbeTask {
 #[async_trait]
 impl ReportingTask for ProbeTask {
     async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
+        tracing::debug!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            nodes = self.compiled.nodes.len(),
+            concurrency = self.compiled.concurrency.get(),
+            "network probe task started"
+        );
         let cancellation = context.cancellation;
         let sampled_at = Instant::now();
         let sampled_at_ms = unix_timestamp_ms();
         let sample_interval_ms = tokio::select! {
             _ = cancellation.cancelled() => {
+                tracing::debug!(
+                    job_id = %context.job_id,
+                    run_id = %context.run_id,
+                    "network probe cancelled before sampling"
+                );
                 return Err(TaskError::Transient(anyhow!("network probe cancelled before start")));
             }
             mut previous = self.last_sampled_at.lock() => {
@@ -88,6 +100,12 @@ impl ReportingTask for ProbeTask {
             .then(HttpClients::new)
             .transpose()
             .map_err(|error| {
+                tracing::warn!(
+                    job_id = %context.job_id,
+                    run_id = %context.run_id,
+                    error = %error,
+                    "network probe HTTP client initialization failed"
+                );
                 TaskError::Permanent(anyhow!("failed to build HTTP probe client: {error}"))
             })?
             .map(Arc::new);
@@ -131,11 +149,23 @@ impl ReportingTask for ProbeTask {
         .collect::<Vec<_>>();
         let mut results = tokio::select! {
             _ = cancellation.cancelled() => {
+                tracing::debug!(
+                    job_id = %context.job_id,
+                    run_id = %context.run_id,
+                    "network probe cancelled while probing nodes"
+                );
                 return Err(TaskError::Transient(anyhow!("network probe cancelled")));
             }
             results = work => results,
         };
         if results.iter().any(|(_, result)| result.is_err()) {
+            let failed_nodes = results.iter().filter(|(_, result)| result.is_err()).count();
+            tracing::warn!(
+                job_id = %context.job_id,
+                run_id = %context.run_id,
+                failed_nodes,
+                "network probe node execution was cancelled"
+            );
             return Err(TaskError::Transient(anyhow!("network probe cancelled")));
         }
         results.sort_by_key(|(index, _)| *index);
@@ -143,11 +173,40 @@ impl ReportingTask for ProbeTask {
             .into_iter()
             .map(|(_, result)| result.expect("cancelled results returned above"))
             .collect::<Vec<_>>();
+        let unhealthy_nodes = nodes.iter().filter(|node| node.succeeded == 0).count();
+        for node in nodes.iter().filter(|node| node.succeeded < node.attempted) {
+            tracing::debug!(
+                job_id = %context.job_id,
+                run_id = %context.run_id,
+                node = %node.name,
+                protocol = ?node.protocol,
+                attempted = node.attempted,
+                succeeded = node.succeeded,
+                failure_percent = node.failure_percent,
+                "network probe node recorded failed attempts"
+            );
+        }
+        if unhealthy_nodes > 0 {
+            tracing::warn!(
+                job_id = %context.job_id,
+                run_id = %context.run_id,
+                unhealthy_nodes,
+                total_nodes = nodes.len(),
+                "network probe completed with unhealthy nodes"
+            );
+        }
         let snapshot = CollectedSnapshot {
             total_nodes: nodes.len(),
             healthy_nodes: nodes.iter().filter(|node| node.succeeded > 0).count(),
             nodes,
         };
+        tracing::trace!(
+            job_id = %context.job_id,
+            run_id = %context.run_id,
+            total_nodes = snapshot.total_nodes,
+            healthy_nodes = snapshot.healthy_nodes,
+            "network probe task completed"
+        );
         Ok(TaskResult {
             sample: Some(SampleMetadata {
                 sampled_at_ms,

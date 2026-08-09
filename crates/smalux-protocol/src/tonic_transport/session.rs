@@ -5,11 +5,12 @@
 
 use std::{
     collections::VecDeque,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     agent::v1::{
@@ -31,6 +32,48 @@ pub struct HeartbeatPolicy {
     pub interval: Duration,
     /// 距离上次成功接收超过该时长时判定会话失联。
     pub timeout: Duration,
+}
+
+/// 一次成功匹配的 Ping/Pong 样本。
+///
+/// `rtt` 使用发送端和接收端同一进程内的 [`Instant`] 计算，不受两台机器系统时钟偏差影响。
+/// Unix 微秒字段只用于日志、诊断和跨机器对照，不应被用来计算单向延迟。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeartbeatSample {
+    /// Ping/Pong 的关联值。
+    pub nonce: u64,
+    /// 本地从发送 Ping 到收到匹配 Pong 的往返时间。
+    pub rtt: Duration,
+    /// Ping 发送方记录的 Unix 微秒时间。
+    pub sent_at_unix_micros: u64,
+    /// 对端收到 Ping 时记录的 Unix 微秒时间。
+    pub responder_received_at_unix_micros: u64,
+    /// 对端发送 Pong 前记录的 Unix 微秒时间。
+    pub responder_sent_at_unix_micros: u64,
+    /// 本地收到 Pong 时记录的 Unix 微秒时间。
+    pub received_at_unix_micros: u64,
+}
+
+/// 当前会话累计的链路心跳统计。
+///
+/// 统计只在收到与本地 pending nonce 匹配的 Pong 后更新。`lost_count` 在心跳超时关闭
+/// 会话时记录尚未收到响应的探测数量；业务消息本身不会清零连续心跳失败次数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeartbeatStats {
+    /// 已成功写入 Tonic outbound channel 的 Ping 数量。
+    pub sent_count: u64,
+    /// 收到并匹配 nonce 的 Pong 数量。
+    pub received_count: u64,
+    /// 会话因心跳超时而放弃的 pending Ping 数量。
+    pub lost_count: u64,
+    /// 最近一次成功 Pong 后清零的连续失败次数。
+    pub consecutive_failures: u64,
+    /// 最近一次成功探测的样本。
+    pub last_sample: Option<HeartbeatSample>,
+    /// 已成功探测样本中的最小 RTT。
+    pub min_rtt: Option<Duration>,
+    /// 已成功探测样本中的最大 RTT。
+    pub max_rtt: Option<Duration>,
 }
 
 impl Default for HeartbeatPolicy {
@@ -108,14 +151,21 @@ impl TryFrom<SecureMessage> for SessionEvent {
             Some(secure_message::Body::Error(error)) => {
                 let code = crate::agent::v1::SecureErrorCode::try_from(error.code)
                     .unwrap_or(crate::agent::v1::SecureErrorCode::Unspecified);
+                warn!(?code, "received encrypted remote secure error");
                 Err(TransportError::RemoteSecure(code, error.message))
             }
-            Some(secure_message::Body::SessionControl(_)) => Err(TransportError::Protocol(
-                "session control escaped the transport state machine".to_owned(),
-            )),
-            None => Err(TransportError::Protocol(
-                "SecureMessage body is required".to_owned(),
-            )),
+            Some(secure_message::Body::SessionControl(_)) => {
+                warn!("session control escaped the transport state machine");
+                Err(TransportError::Protocol(
+                    "session control escaped the transport state machine".to_owned(),
+                ))
+            }
+            None => {
+                warn!("received SecureMessage without a body");
+                Err(TransportError::Protocol(
+                    "SecureMessage body is required".to_owned(),
+                ))
+            }
         }
     }
 }
@@ -157,6 +207,10 @@ pub struct TonicNoiseSession {
     last_received: Instant,
     /// 自动 Ping 使用的本地递增关联值。
     next_ping_nonce: u64,
+    /// 尚未收到 Pong 的 Ping 及其本地单调发送时间。
+    pending_pings: std::collections::HashMap<u64, Instant>,
+    /// 当前连接的心跳统计。
+    heartbeat_stats: HeartbeatStats,
     /// 当前心跳参数。
     heartbeat: HeartbeatPolicy,
     /// 当前 rekey 参数。
@@ -191,6 +245,7 @@ impl TonicNoiseSession {
         initiator: bool,
     ) -> Self {
         let now = Instant::now();
+        info!(initiator, "created Tonic Noise session");
         Self {
             outbound,
             inbound,
@@ -200,6 +255,8 @@ impl TonicNoiseSession {
             last_sent: now,
             last_received: now,
             next_ping_nonce: 1,
+            pending_pings: std::collections::HashMap::new(),
+            heartbeat_stats: HeartbeatStats::default(),
             heartbeat: HeartbeatPolicy::default(),
             rekey: RekeyPolicy::default(),
             buffered_messages: VecDeque::new(),
@@ -208,17 +265,29 @@ impl TonicNoiseSession {
 
     /// 替换当前心跳策略；下一次 `receive()` 立即使用新值。
     pub fn set_heartbeat_policy(&mut self, policy: HeartbeatPolicy) {
+        debug!(?policy, "updated Noise session heartbeat policy");
         self.heartbeat = policy;
     }
 
     /// 替换自动 rekey 策略；不会立即切换密钥，下一次 `receive()` 才会评估。
     pub fn set_rekey_policy(&mut self, policy: RekeyPolicy) {
+        debug!(?policy, "updated Noise session rekey policy");
         self.rekey = policy;
     }
 
     /// 返回当前心跳策略副本，便于状态展示或诊断。
     pub fn heartbeat_policy(&self) -> HeartbeatPolicy {
         self.heartbeat
+    }
+
+    /// 返回当前心跳统计的副本，不改变 Session 状态。
+    pub fn heartbeat_stats(&self) -> HeartbeatStats {
+        self.heartbeat_stats
+    }
+
+    /// 返回最近一次成功匹配的心跳样本。
+    pub fn last_heartbeat(&self) -> Option<HeartbeatSample> {
+        self.heartbeat_stats.last_sample
     }
 
     /// 最近没有成功发送达到 `interval` 时返回 `true`。
@@ -251,15 +320,24 @@ impl TonicNoiseSession {
     pub async fn perform_maintenance(&mut self) -> Result<MaintenanceResult, TransportError> {
         let status = self.maintenance_status();
         if status.heartbeat_expired {
+            warn!(
+                lost_pings = self.pending_pings.len(),
+                "Noise session heartbeat expired during maintenance"
+            );
+            self.record_heartbeat_timeout();
             return Err(TransportError::HeartbeatTimeout);
         }
         let mut result = MaintenanceResult::default();
         if status.rekey_due {
+            debug!(
+                generation = self.secure.generation(),
+                "automatic Noise rekey is due"
+            );
             result.rekeyed_generation = Some(self.request_rekey().await?);
         }
         if status.ping_due {
-            let nonce = self.next_ping_nonce;
-            self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
+            let nonce = self.allocate_ping_nonce();
+            trace!(nonce, "automatic Noise heartbeat ping is due");
             self.ping(nonce).await?;
             result.ping_sent = true;
         }
@@ -271,9 +349,16 @@ impl TonicNoiseSession {
     /// `&mut self` 保证同一会话不会并发复用 sending nonce。
     pub async fn send(&mut self, message: SecureMessage) -> Result<(), TransportError> {
         // 先加密再异步发送；加密成功时 nonce 已推进，因此发送失败后会话应关闭而不是重试同帧。
+        let message_kind = secure_message_kind(&message);
         let frame = self.secure.encrypt(&message)?;
         self.send_frame(frame).await?;
         self.last_sent = Instant::now();
+        trace!(
+            message_kind,
+            generation = self.secure.generation(),
+            encrypted_frames = self.secure.encrypted_frames(),
+            "sent encrypted Noise session message"
+        );
         Ok(())
     }
 
@@ -318,34 +403,53 @@ impl TonicNoiseSession {
     pub async fn receive(&mut self) -> Result<Option<SecureMessage>, TransportError> {
         loop {
             if let Some(message) = self.buffered_messages.pop_front() {
+                trace!(
+                    buffered = self.buffered_messages.len(),
+                    "delivering buffered Noise session message"
+                );
                 return Ok(Some(message));
             }
             // 只有 initiator 发起同步 rekey，防止双方同时切 key 造成方向失步。
             if self.initiator && self.should_rekey() {
+                debug!(
+                    generation = self.secure.generation(),
+                    "initiator rekey threshold reached while receiving"
+                );
                 self.request_rekey().await?;
                 // request_rekey 可能在 Ack 前收到并缓存业务帧，回到循环顶部优先交付它们。
                 continue;
             }
             if self.heartbeat_expired() {
+                warn!("Noise session heartbeat expired while receiving");
+                self.record_heartbeat_timeout();
                 return Err(TransportError::HeartbeatTimeout);
             }
             let frame =
                 match tokio::time::timeout(self.heartbeat.interval, self.inbound.message()).await {
                     Ok(result) => result?,
                     Err(_) => {
-                        let nonce = self.next_ping_nonce;
-                        self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
+                        let nonce = self.allocate_ping_nonce();
+                        trace!(
+                            nonce,
+                            "receive idle interval elapsed; sending heartbeat ping"
+                        );
                         self.ping(nonce).await?;
                         continue;
                     }
                 };
             let Some(frame) = frame else {
+                info!("remote closed Noise session stream");
                 return Ok(None);
             };
             let message = self.secure.decrypt(frame)?;
             self.last_received = Instant::now();
+            trace!(
+                message_kind = secure_message_kind(&message),
+                "received encrypted Noise session message"
+            );
             match message.body {
                 Some(secure_message::Body::SessionControl(control)) => {
+                    trace!("received encrypted Noise session control message");
                     match self.handle_control(control).await {
                         Err(TransportError::RekeyRequired) if self.initiator => {
                             self.request_rekey().await?;
@@ -360,8 +464,43 @@ impl TonicNoiseSession {
 
     /// 手动发送加密 Ping；通常由 `receive()` 的空闲超时分支自动调用。
     pub async fn ping(&mut self, nonce: u64) -> Result<(), TransportError> {
-        self.send(control(session_control::Body::Ping(Ping { nonce })))
-            .await
+        if self.pending_pings.contains_key(&nonce) {
+            warn!(nonce, "refusing to reuse a pending heartbeat nonce");
+            return Err(TransportError::Protocol(
+                "heartbeat nonce is already pending".to_owned(),
+            ));
+        }
+        let sent_at = Instant::now();
+        self.pending_pings.insert(nonce, sent_at);
+        let result = self
+            .send(control(session_control::Body::Ping(Ping {
+                nonce,
+                sent_at_unix_micros: unix_micros(),
+            })))
+            .await;
+        if result.is_err() {
+            self.pending_pings.remove(&nonce);
+            warn!(nonce, "failed to send encrypted heartbeat ping");
+        } else {
+            self.heartbeat_stats.sent_count = self.heartbeat_stats.sent_count.saturating_add(1);
+            trace!(
+                nonce,
+                sent_count = self.heartbeat_stats.sent_count,
+                "sent encrypted heartbeat ping"
+            );
+        }
+        result
+    }
+
+    /// 为自动心跳生成当前没有占用的关联值。
+    fn allocate_ping_nonce(&mut self) -> u64 {
+        loop {
+            let nonce = self.next_ping_nonce;
+            self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
+            if !self.pending_pings.contains_key(&nonce) {
+                return nonce;
+            }
+        }
     }
 
     /// Server 通知 Agent 发起同步 rekey，但本方法本身不切换任何 cipher key。
@@ -369,11 +508,13 @@ impl TonicNoiseSession {
     /// 只有 responder 可以调用；返回值是期望的下一 generation。
     pub async fn require_rekey(&mut self) -> Result<u64, TransportError> {
         if self.initiator {
+            warn!("initiator attempted to require a responder rekey");
             return Err(TransportError::Protocol(
                 "only the Noise responder may require rekey".to_owned(),
             ));
         }
         let generation = self.secure.generation().saturating_add(1);
+        info!(generation, "Server requesting Agent Noise rekey");
         self.send(control(session_control::Body::RekeyRequired(
             RekeyRequired {
                 next_generation: generation,
@@ -446,11 +587,13 @@ impl TonicNoiseSession {
     pub async fn request_rekey(&mut self) -> Result<u64, TransportError> {
         // responder 只能调用 require_rekey，不能直接进入 initiator 状态机。
         if !self.initiator {
+            warn!("responder attempted to request an initiator rekey");
             return Err(TransportError::Protocol(
                 "only the Noise initiator may request rekey".to_owned(),
             ));
         }
         let generation = self.secure.generation().saturating_add(1);
+        info!(generation, "initiator requesting Noise rekey");
         self.send(control(session_control::Body::RekeyRequest(RekeyRequest {
             generation,
         })))
@@ -471,6 +614,7 @@ impl TonicNoiseSession {
                     self.secure.finish_rekey(generation);
                     self.established_at = Instant::now();
                     self.last_received = Instant::now();
+                    info!(generation, "initiator completed Noise rekey");
                     return Ok(generation);
                 }
                 Some(secure_message::Body::SessionControl(control)) => match control.body {
@@ -493,20 +637,89 @@ impl TonicNoiseSession {
         self.secure.encrypted_frames()
     }
 
+    /// 记录一次心跳超时，并清理当前仍未收到响应的探测。
+    fn record_heartbeat_timeout(&mut self) {
+        let lost = self.pending_pings.len().max(1) as u64;
+        self.pending_pings.clear();
+        self.heartbeat_stats.lost_count = self.heartbeat_stats.lost_count.saturating_add(lost);
+        self.heartbeat_stats.consecutive_failures =
+            self.heartbeat_stats.consecutive_failures.saturating_add(1);
+        warn!(
+            lost,
+            consecutive_failures = self.heartbeat_stats.consecutive_failures,
+            "recorded Noise heartbeat timeout"
+        );
+    }
+
+    /// 保存一条成功的本地 RTT 样本，并恢复连续心跳成功状态。
+    fn record_heartbeat_sample(&mut self, sample: HeartbeatSample) {
+        self.heartbeat_stats.received_count = self.heartbeat_stats.received_count.saturating_add(1);
+        self.heartbeat_stats.consecutive_failures = 0;
+        self.heartbeat_stats.min_rtt = Some(
+            self.heartbeat_stats
+                .min_rtt
+                .map_or(sample.rtt, |value| value.min(sample.rtt)),
+        );
+        self.heartbeat_stats.max_rtt = Some(
+            self.heartbeat_stats
+                .max_rtt
+                .map_or(sample.rtt, |value| value.max(sample.rtt)),
+        );
+        self.heartbeat_stats.last_sample = Some(sample);
+        debug!(
+            nonce = sample.nonce,
+            rtt = ?sample.rtt,
+            received_count = self.heartbeat_stats.received_count,
+            "recorded Noise heartbeat RTT sample"
+        );
+    }
+
     /// 处理一条已经解密的 `SessionControl`。
     async fn handle_control(&mut self, control: SessionControl) -> Result<(), TransportError> {
         match control.body {
             Some(session_control::Body::Ping(ping)) => {
-                // Pong 原样返回关联 nonce，让发送方确认收到的是对应探测响应。
+                trace!(nonce = ping.nonce, "received encrypted heartbeat ping");
+                // 记录 responder 的墙上时钟时间；发送端的 RTT 仍使用本地 Instant 计算。
+                let responder_received_at_unix_micros = unix_micros();
+                let responder_sent_at_unix_micros = unix_micros();
+                // Pong 原样返回关联 nonce 和 Ping 诊断时间，便于发送端生成完整样本。
                 self.send(control_message(session_control::Body::Pong(Pong {
                     nonce: ping.nonce,
+                    echoed_sent_at_unix_micros: ping.sent_at_unix_micros,
+                    responder_received_at_unix_micros,
+                    responder_sent_at_unix_micros,
                 })))
                 .await
             }
-            Some(session_control::Body::Pong(_)) => Ok(()),
+            Some(session_control::Body::Pong(pong)) => {
+                let Some(sent_at) = self.pending_pings.remove(&pong.nonce) else {
+                    // 迟到或重复 Pong 不应让正常 Session 失效。
+                    warn!(nonce = pong.nonce, "received an unmatched heartbeat pong");
+                    return Ok(());
+                };
+                let sample = HeartbeatSample {
+                    nonce: pong.nonce,
+                    rtt: sent_at.elapsed(),
+                    sent_at_unix_micros: pong.echoed_sent_at_unix_micros,
+                    responder_received_at_unix_micros: pong.responder_received_at_unix_micros,
+                    responder_sent_at_unix_micros: pong.responder_sent_at_unix_micros,
+                    received_at_unix_micros: unix_micros(),
+                };
+                self.record_heartbeat_sample(sample);
+                Ok(())
+            }
             Some(session_control::Body::RekeyRequest(request)) if !self.initiator => {
+                info!(
+                    generation = request.generation,
+                    "responder received Noise rekey request"
+                );
                 // responder 只接受严格的下一代，拒绝重复、跳代和回放。
                 if request.generation != self.secure.generation().saturating_add(1) {
+                    warn!(
+                        requested_generation = request.generation,
+                        current_generation = self.secure.generation(),
+                        "received unexpected Noise rekey generation"
+                    );
                     return Err(TransportError::Protocol(
                         "unexpected rekey generation".to_owned(),
                     ));
@@ -519,18 +732,29 @@ impl TonicNoiseSession {
                 self.secure.rekey_outgoing();
                 self.secure.finish_rekey(request.generation);
                 self.established_at = Instant::now();
+                info!(
+                    generation = request.generation,
+                    "responder completed Noise rekey"
+                );
                 Ok(())
             }
             Some(session_control::Body::RekeyRequired(_)) if self.initiator => {
                 // 把控制权交给 Agent 主循环，由它显式调用 request_rekey。
+                debug!("initiator received a Server rekey requirement");
                 Err(TransportError::RekeyRequired)
             }
-            Some(session_control::Body::RekeyAck(_)) => Err(TransportError::Protocol(
-                "unexpected rekey acknowledgement".to_owned(),
-            )),
-            _ => Err(TransportError::Protocol(
-                "invalid session control message".to_owned(),
-            )),
+            Some(session_control::Body::RekeyAck(_)) => {
+                warn!("received an unexpected Noise rekey acknowledgement");
+                Err(TransportError::Protocol(
+                    "unexpected rekey acknowledgement".to_owned(),
+                ))
+            }
+            _ => {
+                warn!("received an invalid encrypted session control message");
+                Err(TransportError::Protocol(
+                    "invalid session control message".to_owned(),
+                ))
+            }
         }
     }
 
@@ -540,6 +764,7 @@ impl TonicNoiseSession {
         mut commands: mpsc::Receiver<DriverCommand>,
         events: mpsc::Sender<Result<SessionEvent, TransportError>>,
     ) {
+        info!(initiator = self.initiator, "Noise session driver started");
         // interval 的第一次 tick 会立即完成，先消费它，避免 Driver 启动后无条件发送 Ping。
         let tick_period = self.heartbeat.interval.max(Duration::from_millis(1));
         let mut maintenance = tokio::time::interval(tick_period);
@@ -554,10 +779,12 @@ impl TonicNoiseSession {
                     let frame = match inbound {
                         Ok(Some(frame)) => frame,
                         Ok(None) => {
+                            info!("remote closed stream; stopping Noise session driver");
                             let _ = events.send(Err(TransportError::Closed)).await;
                             return;
                         }
                         Err(error) => {
+                            error!(error = %error, "inbound gRPC stream failed in Noise session driver");
                             let _ = events.send(Err(TransportError::Status(error))).await;
                             return;
                         }
@@ -565,11 +792,13 @@ impl TonicNoiseSession {
                     match self.process_driver_frame(frame).await {
                         Ok(Some(event)) => {
                             if events.send(Ok(event)).await.is_err() {
+                                debug!("business event receiver dropped; stopping Noise session driver");
                                 return;
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            error!(error = %error, "failed to process inbound Noise frame in driver");
                             let _ = events.send(Err(error)).await;
                             return;
                         }
@@ -586,12 +815,14 @@ impl TonicNoiseSession {
                                     let _ = completed.send(Ok(()));
                                 }
                                 Err(error) => {
+                                    error!(error = %error, "Driver failed to send encrypted message");
                                     let _ = completed.send(Err(error));
                                     return;
                                 }
                             }
                         }
                         Some(DriverCommand::Shutdown { completed }) => {
+                            info!("Noise session driver shutdown requested");
                             let _ = completed.send(());
                             return;
                         }
@@ -602,6 +833,7 @@ impl TonicNoiseSession {
                                     false
                                 }
                                 Err(error) => {
+                                    warn!(error = %error, "Driver failed to send heartbeat ping");
                                     let _ = completed.send(Err(error));
                                     true
                                 }
@@ -617,6 +849,7 @@ impl TonicNoiseSession {
                                     false
                                 }
                                 Err(error) => {
+                                    warn!(error = %error, "Driver failed to request Noise rekey");
                                     let _ = completed.send(Err(error));
                                     true
                                 }
@@ -635,6 +868,7 @@ impl TonicNoiseSession {
                                     false
                                 }
                                 Err(error) => {
+                                    warn!(error = %error, "Driver failed to require Noise rekey");
                                     let _ = completed.send(Err(error));
                                     true
                                 }
@@ -643,11 +877,18 @@ impl TonicNoiseSession {
                                 return;
                             }
                         }
-                        None => return,
+                        Some(DriverCommand::HeartbeatStats { completed }) => {
+                            let _ = completed.send(Ok(self.heartbeat_stats()));
+                        }
+                        None => {
+                            info!("all Noise session driver command senders dropped");
+                            return;
+                        }
                     }
                 }
                 _ = maintenance.tick() => {
                     if let Err(error) = self.perform_maintenance().await {
+                        error!(error = %error, "Noise session maintenance failed in driver");
                         let _ = events.send(Err(error)).await;
                         return;
                     }
@@ -666,6 +907,10 @@ impl TonicNoiseSession {
     ) -> Result<Option<SessionEvent>, TransportError> {
         let message = self.secure.decrypt(frame)?;
         self.last_received = Instant::now();
+        trace!(
+            message_kind = secure_message_kind(&message),
+            "Driver received encrypted Noise session message"
+        );
         match message.body {
             Some(secure_message::Body::SessionControl(control)) => {
                 match self.handle_control(control).await {
@@ -694,15 +939,24 @@ impl TonicNoiseSession {
 
     async fn send_frame(&self, frame: ProtocolFrame) -> Result<(), TransportError> {
         match &self.outbound {
-            Outbound::Client(sender) => {
-                sender.send(frame).await.map_err(|_| TransportError::Closed)
-            }
-            Outbound::Server(sender) => sender
-                .send(Ok(frame))
-                .await
-                .map_err(|_| TransportError::Closed),
+            Outbound::Client(sender) => sender.send(frame).await.map_err(|_| {
+                warn!("Client outbound Noise frame channel is closed");
+                TransportError::Closed
+            }),
+            Outbound::Server(sender) => sender.send(Ok(frame)).await.map_err(|_| {
+                warn!("Server outbound Noise frame channel is closed");
+                TransportError::Closed
+            }),
         }
     }
+}
+
+/// 返回当前系统时钟的 Unix 微秒值，仅供心跳诊断字段使用。
+fn unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
 }
 
 /// 构造一条包含 `SessionControl` 的加密业务消息。
@@ -723,6 +977,21 @@ fn rotation(body: key_rotation_message::Body) -> SecureMessage {
         body: Some(secure_message::Body::KeyRotation(KeyRotationMessage {
             body: Some(body),
         })),
+    }
+}
+
+/// 返回不包含业务内容的消息类型标签，供 debug/trace 日志关联协议阶段。
+fn secure_message_kind(message: &SecureMessage) -> &'static str {
+    match message.body.as_ref() {
+        Some(secure_message::Body::RegistrationMessage(_)) => "registration",
+        Some(secure_message::Body::Messages(_)) => "messages",
+        Some(secure_message::Body::KeyRotation(_)) => "key_rotation",
+        Some(secure_message::Body::JobCommand(_)) => "job_command",
+        Some(secure_message::Body::JobCommandResult(_)) => "job_command_result",
+        Some(secure_message::Body::TaskReport(_)) => "task_report",
+        Some(secure_message::Body::SessionControl(_)) => "session_control",
+        Some(secure_message::Body::Error(_)) => "error",
+        None => "empty",
     }
 }
 

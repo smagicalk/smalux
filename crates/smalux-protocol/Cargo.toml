@@ -32,6 +32,8 @@ tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "net", 
 tokio-stream = { version = "0.1.18", features = ["net"] }
 # Endpoint URI 错误作为稳定 transport error 暴露。
 http = "1.4.0"
+# 协议层结构化日志；初始化由宿主进程决定，协议只负责产生多级日志事件。
+tracing = "0.1.44"
 
 [build-dependencies]
 # 配置 Protobuf 代码生成器。

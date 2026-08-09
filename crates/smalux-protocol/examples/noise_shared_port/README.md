@@ -92,18 +92,42 @@ cargo run -p smalux-protocol --example noise_shared_port_server
 cargo run -p smalux-protocol --example noise_shared_port_server -- --mode driver
 ```
 
-Server 输出固定的示例 Token 和 Client 启动命令：
+Server 启动后在控制台执行 `token generate`，得到一条随机的一次性 Token：
 
 ```powershell
-$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
+
+Client 首次运行会在控制台提示 `paste registration token:`；粘贴完整的 `token_id.psk` 后回车。
 
 Client 和 Server 可以独立选择模式，wire 协议完全相同；Driver Client 的启动方式为：
 
 ```powershell
 cargo run -p smalux-protocol --example noise_shared_port_client -- --mode driver
 ```
+
+两种模式都会在三条业务消息完成后额外观察一次心跳。示例公共配置当前为：
+
+| 配置 | 默认值 | 作用 |
+| --- | --- | --- |
+| `EXAMPLE_HEARTBEAT_INTERVAL_SECS` | `1` 秒 | 空闲多久由本端自动发送加密 Ping。 |
+| `EXAMPLE_HEARTBEAT_TIMEOUT_SECS` | `5` 秒 | 多久没有成功入站帧后判定链路失联。 |
+| `EXAMPLE_HEARTBEAT_OBSERVE_SECS` | `2` 秒 | 三条业务消息完成后保留会话并等待 RTT 样本。 |
+
+这些是示例代码中的常量，不是协议层默认值；生产调用方应根据上报频率和网络质量构造自己的
+`HeartbeatPolicy`。`manual` 模式在观察窗口内继续调用 `receive_event()`，由调用方亲自驱动
+Ping/Pong；`driver` 模式把会话交给 `SessionDriver`，业务层只轮询
+`SessionHandle::heartbeat_stats()`。两端都会输出类似下面的两行：
+
+```text
+[client][heartbeat] sent=1 received=1 lost=0 consecutive_failures=0 min_rtt=...
+[client][heartbeat] sample nonce=1 rtt=... sent_at=... responder_received_at=... responder_sent_at=... received_at=...
+```
+
+`rtt` 使用本端单调时钟计算，适合判断往返链路；四个 `*_at` 字段是 Unix 微秒诊断时间，
+用于对照两端日志，不能替代单向延迟计算。`lost` 和 `consecutive_failures` 用于发现
+Ping 没有匹配 Pong 的情况。观察窗口结束后示例主动关闭业务 Session，Server 也会打印
+自己的统计快照。
 
 Server 启动后可直接检查普通接口：
 
@@ -129,8 +153,8 @@ Server 数据默认保存在 `target/smalux-noise-server/`：
 ```text
 noise/static-private.bin  # Server Noise 私钥
 noise/static-public.bin   # Server Noise 公钥
-agents/<agent>.key        # 已登记的 Agent Noise 公钥
-registrations/<agent>/    # pending/committed 注册事务及恢复字段
+agents/<agent-id>/        # 已登记 Agent 的公钥和展示名称
+registrations/<agent-id>/ # pending/committed 注册事务及恢复字段
 ```
 
 ## 密钥生命周期与更换
@@ -140,41 +164,51 @@ registrations/<agent>/    # pending/committed 注册事务及恢复字段
 | 位置 | 文件或值 | 谁创建 | 用途 |
 | --- | --- | --- | --- |
 | Server | `noise/static-private.bin`、`noise/static-public.bin` | Server 第一次启动 | 长期 Noise 身份；XXpsk3 和 IK 都使用同一对密钥。 |
-| Server | 固定的 64 位十六进制示例 Token | 示例代码 | 32 字节注册 PSK；只允许绑定同一注册事务，不是 Server 长期密钥。 |
-| Server | `registrations/<agent>/` | `prepare` | 保存事务 ID、Token、Agent 名称、公钥和 committed 标记。 |
-| Server | `agents/<agent>.key` | XXpsk3 注册成功后 | Agent 公钥到 Agent 名称的授权记录；后续 IK 用它识别 Agent。 |
+| Server | `registration-tokens/<id>.token` | Server/控制台 | 128 位公开 ID 加 256 位秘密 PSK；每条只允许绑定一台 Agent。 |
+| Server | `registrations/<agent-id>/` | `prepare` | 保存事务 ID、Token、Agent ID、展示名称、公钥和 committed 标记。 |
+| Server | `agents/<agent-id>/` | XXpsk3 注册成功后 | 保存 Agent 公钥和展示名称；后续 IK 通过公钥取得稳定 Agent ID。 |
 | Agent | `noise/static-private.bin`、`noise/static-public.bin` | Agent 首次注册前 | Agent 长期 Noise 身份；私钥只保留在本机，握手中只证明其持有。 |
 | Agent | `server-public.bin`、`agent-id.txt`、`registration-id.bin` | 收到 prepared 后 | commit 前保存的 pending 身份材料。 |
 | Agent | `registration-committed` | 收到 committed 后 | 只有存在该标记，下次启动才允许直接使用 IK。 |
 
 Token 既参与 XXpsk3 的 `psk(3, ...)`，也位于 Noise 加密的注册请求中。第一次 prepare 后，Token
-只允许相同 Agent 名称和公钥恢复同一事务；不同公钥重用会得到 `TokenAlreadyUsed`。Agent 在 commit
+只允许相同 Agent 公钥恢复同一事务；展示名称不参与身份判断，不同公钥重用会得到 `TokenAlreadyUsed`。Agent 在 commit
 前退出时，下次仍用原 Noise 身份和 Token 继续；Server 已 commit 但最终响应丢失时，也会返回同一事务。
 生产代码仍应生成随机、短期、单次且可审计的 Token。已完成注册的 IK 连接不读取 Token。
 
-不要只删除 Agent 目录中的一个文件。Client 发现 `noise/`、`server-public.bin`、`agent-id.txt` 只要
-缺少任意一项就会报 `incomplete Agent Noise identity directory`，避免混用新旧身份。要让该 Agent
-重新走首次注册，应删除整个 Agent 数据目录。
+当前版本的完整身份必须同时包含 `noise/`、`server-public.bin`、`agent-id.txt`、
+`registration-id.bin` 和 `registration-committed`。如果这些文件只完成了一部分，Client 会报带目录
+路径的 `incomplete Agent Noise identity directory`，避免混用新旧身份；此时应删除整个 Agent 数据
+目录，再签发新 Token 重新走 XXpsk3。旧版示例如果已经保存完整的 Noise 密钥、Server 公钥和
+Agent ID，但没有事务 ID/完成标记，Client 会打印 legacy metadata 提示并直接尝试 IK，不会覆盖旧密钥。
 
 ### 更换 Agent 密钥
 
 当前示例不支持在 IK 流中静默替换 Agent 公钥。Server 用握手取得的公钥直接查询
-`agents/<agent>.key`；新公钥没有记录就会被拒绝，旧公钥也不能自动授权新公钥。正确的示例操作是：
+`agents/<agent-id>/public.key`；新公钥没有记录就会被拒绝，旧公钥也不能自动授权新公钥。正确的示例操作是：
 
-1. 停止旧 Agent，在 Server 控制台输入 `revoke example-agent` 删除该 Agent 的注册表记录；也可以
-   使用 `SMALUX_EXAMPLE_REVOKE_AGENT=example-agent` 重启 Server 完成同一操作。
+1. 停止旧 Agent，先用 `agents` 查看稳定 ID，再输入 `revoke <agent-id>` 删除注册表记录；也可以
+   使用 `SMALUX_EXAMPLE_REVOKE_AGENT=<agent-id>` 重启 Server 完成同一操作。
 2. 删除 Agent 的整个本地身份目录，使下次启动生成新的 Agent 静态密钥对：
 
    ```powershell
    Remove-Item -Recurse -Force target/smalux-noise-agent
-   $env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   # 在 Server 控制台执行 token generate，再把输出粘贴到 Client 控制台。
    cargo run -p smalux-protocol --example noise_shared_port_client
    ```
 
-3. Client 用新密钥完成 XXpsk3，Server 写入新的 `agents/example-agent.key`，随后双方用新密钥 IK。
+3. Client 用新密钥完成 XXpsk3，Server 分配新 ID 并写入 `agents/<agent-id>/`，随后双方用新密钥 IK。
 
-`SMALUX_EXAMPLE_REVOKE_AGENT` 和控制台都是示例管理入口，不是生产管理 API。固定 Token 在单次
-Server 进程内只能注册一个 Agent；若已被消费，需要重启示例 Server 才会重新启用该固定值。
+`SMALUX_EXAMPLE_REVOKE_AGENT` 和控制台都是示例管理入口，不是生产管理 API。每条 Token 只能
+绑定一台 Agent；要注册更多 Agent，执行 `token create` 为每台分别签发。
+
+第二台 Agent 必须使用独立数据目录；展示名称可以重复：
+
+```powershell
+$env:SMALUX_EXAMPLE_AGENT_NAME = "agent-2"
+$env:SMALUX_EXAMPLE_AGENT_DATA_DIR = "target/smalux-noise-agent-2"
+cargo run -p smalux-protocol --example noise_shared_port_client
+```
 
 ### 更换 Server 密钥
 
@@ -185,7 +219,7 @@ TLS 证书可以独立更换，而 Server Noise 公钥是 IK 的固定身份。�
 1. 停止 Server，并同时替换 `target/smalux-noise-server/noise/` 中的私钥和公钥；删除整个 `noise/`
    目录后下次启动会生成一对新密钥，绝不能只替换其中一个文件。
 2. 对每个已注册 Agent，通过控制台或 `SMALUX_EXAMPLE_REVOKE_AGENT` 吊销旧公钥。
-3. 在该 Agent 上删除完整的 Agent 数据目录，使用固定示例 Token 再运行 Client。XXpsk3 会认证新 Server，
+3. 在该 Agent 上删除完整的 Agent 数据目录，签发一条新 Token 再运行 Client。XXpsk3 会认证新 Server，
    Client 只在收到加密注册确认后保存新的 `server-public.bin`。
 
 可执行示例没有接入数据库，因此没有在控制台暴露在线轮换命令；正式协议层已经提供由旧会话认证的
@@ -198,15 +232,17 @@ Server 启动后可以直接在同一控制台输入命令：
 
 ```text
 server> help
-server> token
+server> token generate
+server> token list
+server> token revoke <id>
 server> agents
-server> revoke example-agent
+server> revoke <agent-id>
 server> quit
 ```
 
-- `token` 打印固定示例 Token；
+- `token generate` 签发一条新的独立 Token；`token create` 是兼容别名；`token list` 只显示公开 ID；`token revoke <id>` 吊销它；
 - `agents` 列出磁盘注册表中已登记的 Agent；
-- `revoke <agent>` 删除该 Agent 公钥，已经建立的流保持到自行关闭，新的 IK 会被拒绝；
+- `revoke <agent-id>` 按稳定 ID 删除该 Agent 公钥，已经建立的流保持到自行关闭，新的 IK 会被拒绝；
 - `quit` 触发 Tonic/Axum 正常关闭，不需要直接终止进程。
 
 每个 gRPC RPC 都会分配递增编号，例如 `rpc:1`。一次正常 XXpsk3 会输出：
@@ -215,8 +251,8 @@ server> quit
 [server][rpc:1] opened; waiting for first handshake frame
 [server][rpc:1] Noise handshake completed mode=RegistrationXxPsk3
 [server][rpc:1][xxpsk3] waiting for encrypted RegistrationRequest
-[server][rpc:1][xxpsk3] pending agent=example-agent resumed=false
-[server][rpc:1][xxpsk3] committed agent=example-agent
+[server][rpc:1][xxpsk3] pending agent=<agent-id> resumed=false
+[server][rpc:1][xxpsk3] committed agent=<agent-id>
 [server][rpc:1] completed
 ```
 
@@ -224,6 +260,34 @@ server> quit
 不发送下一条握手帧，默认 5 秒后打印握手超时。Server 会尝试发送不含敏感细节的外层
 `ProtocolError`；若 Client 已完全断开，会追加 `Client already closed; error could not be delivered`。
 这些错误只终止当前 RPC，不会关闭监听端口。
+
+示例同时保留面向阅读流程的 println 输出和结构化 tracing 日志。前者始终展示主要步骤，
+后者可以按模块和级别过滤：
+
+本次示例只负责产生日志事件，不改变宿主的全局 subscriber 初始化。若 standalone example
+没有安装 subscriber，tracing 事件会被丢弃，但 println 流程输出仍然可见；接入 Server、
+Agent 或测试入口时，在进程启动阶段复用统一日志初始化即可。
+
+    # 只看连接、握手、注册和关闭
+    $env:RUST_LOG = "smalux_protocol=info,noise_shared_port_server=info"
+    cargo run -p smalux-protocol --example noise_shared_port_server
+
+    # 查看注册表、Driver、策略和候选密钥
+    $env:RUST_LOG = "smalux_protocol=debug,noise_shared_port_client=debug"
+    cargo run -p smalux-protocol --example noise_shared_port_client
+
+    # 短时间排查每帧、nonce 和心跳 RTT
+    $env:RUST_LOG = "smalux_protocol=trace"
+
+examples 的结构化日志重点包括：
+
+- info：RPC 建立、XXpsk3/IK 完成、注册提交、Agent 授权、业务循环和优雅关闭；
+- debug：Token ID 选择、密钥候选、心跳策略、Driver 命令和本地身份恢复；
+- trace：握手 payload 长度、加密帧计数、业务序号、Ping/Pong nonce 和 RTT；
+- warn/error：Token 或公钥拒绝、超时、无效帧、远端关闭、Driver 失败和控制台错误。
+
+日志不会打印 Token 的 PSK、Noise 私钥或业务消息内容；Server 控制台为了演示交付流程仍会
+直接显示新签发的完整 Token，生产管理入口不应照搬这一行为。
 
 ## 可选 TLS
 
@@ -276,13 +340,14 @@ cargo run -p smalux-protocol --example noise_shared_port_client
 
 `ServerSessionAcceptor` 和 `AgentProtocolClient` 的握手默认上限都是 5 秒。业务 IK 流不套用握手
 超时，而是由 `HeartbeatPolicy` 的 Ping/Pong 和失联上限管理，避免把正常长连接误判为半开握手。
+Ping/Pong 会携带 nonce 和诊断时间，Driver 通过 `SessionHandle::heartbeat_stats()` 提供成功数、
+丢失数和 RTT；RTT 使用本地单调时钟计算，不依赖 Server 与 Agent 的系统时间一致。
 
-错误 Token：使用一个全新的 Agent 数据目录，并设置任意非 Server 输出的 64 位 Token。
+错误 Token：使用一个全新的 Agent 数据目录，启动 Client 后粘贴任意非 Server 输出的 `token_id.psk`。
 Client 会在 XXpsk3 第三条消息阶段得到通用 Noise 认证失败：
 
 ```powershell
 $env:SMALUX_EXAMPLE_AGENT_DATA_DIR = "target/noise-bad-token-agent"
-$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0000000000000000000000000000000000000000000000000000000000000000"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
 

@@ -109,6 +109,11 @@ impl TaskFactory {
 
     /// 把具体采集器、业务版本和结果出口封装成 Scheduler 可执行对象。
     fn bind<T: ReportingTask>(&self, task: T, job_revision: u64) -> TaskBinding {
+        tracing::debug!(
+            task_kind = task.kind(),
+            job_revision,
+            "agent task binding created"
+        );
         TaskBinding::reporting(Arc::new(task), job_revision, self.sink.clone())
     }
 }
@@ -160,6 +165,10 @@ impl JobController {
         let command_id = match parse_uuid(&command.command_id, "command_id") {
             Ok(value) => value,
             Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "agent rejected job command with invalid command id"
+                );
                 return command_error(
                     &command.command_id,
                     0,
@@ -170,27 +179,78 @@ impl JobController {
         };
         // 锁覆盖一次完整命令的校验、Scheduler 调用和本地索引更新。
         let mut state = self.state.lock().await;
+        let action = command_action_name(command.action.as_ref());
         // Server 重发相同 command_id 时返回首次结果，尤其避免 RunNow 被执行两次。
         if let Some(result) = state.cached_results.get(&command_id) {
+            tracing::debug!(
+                command_id = %command_id,
+                action,
+                "agent reused cached job command result"
+            );
             return result.clone();
         }
+        tracing::debug!(
+            command_id = %command_id,
+            action,
+            catalog_revision = state.catalog_revision,
+            "agent applying job command"
+        );
         // 首次命令在锁内执行，完成后无论成功或失败都缓存结构化结果。
         let result = self.apply_locked(&mut state, &command).await;
         cache_result(&mut state, command_id, result.clone());
+        if result.status == proto::JobCommandStatus::Applied as i32 {
+            tracing::info!(
+                command_id = %command_id,
+                action,
+                catalog_revision = result.catalog_revision,
+                "agent job command applied"
+            );
+        } else {
+            tracing::warn!(
+                command_id = %command_id,
+                action,
+                catalog_revision = result.catalog_revision,
+                error_code = result.error.as_ref().map(|error| error.code),
+                error_message = ?result.error.as_ref().map(|error| error.message.as_str()),
+                "agent job command rejected"
+            );
+        }
         result
     }
 
     /// 删除全部远程所有权 Job；本地 Job 不在控制器索引中，因此不会受影响。
     pub async fn clear(&self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
+        tracing::info!(
+            remote_jobs = state.remote_jobs.len(),
+            "clearing agent remote jobs"
+        );
         // 克隆小型所有权索引，避免遍历时直接修改原 HashMap。
         let jobs = state.remote_jobs.clone();
         for (job_id, managed) in jobs {
-            self.scheduler.delete(job_id, managed.generation).await?;
-            state.remote_jobs.remove(&job_id);
+            match self.scheduler.delete(job_id, managed.generation).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        generation = managed.generation,
+                        "agent cleared remote job"
+                    );
+                    state.remote_jobs.remove(&job_id);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        job_id = %job_id,
+                        generation = managed.generation,
+                        error = %error,
+                        "agent failed to clear remote job"
+                    );
+                    return Err(error.into());
+                }
+            }
         }
         // clear 表示丢弃当前远程目录；下一次同步应从 catalog revision 1 开始。
         state.catalog_revision = 0;
+        tracing::info!("agent remote jobs cleared");
         Ok(())
     }
 
@@ -238,8 +298,17 @@ impl JobController {
             .as_ref()
             .ok_or_else(|| invalid_job("upsert job is required"))?;
         // 编译阶段不修改 Scheduler，因此无效定义不会留下半安装 Job。
-        let compiled = compile_job(definition, &self.factory)
-            .map_err(|error| (proto::JobCommandErrorCode::InvalidJob, error))?;
+        let compiled = match compile_job(definition, &self.factory) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    catalog_revision = command.catalog_revision,
+                    "agent rejected invalid job definition"
+                );
+                return Err((proto::JobCommandErrorCode::InvalidJob, error));
+            }
+        };
         let status = self.upsert_compiled(state, compiled, true).await?;
         // 只有 Scheduler 已成功更新后才推进目录版本。
         state.catalog_revision = command.catalog_revision;
@@ -399,10 +468,13 @@ impl JobController {
                     anyhow::anyhow!("replace_all contains duplicate job_id"),
                 ));
             }
-            compiled_jobs.push(
-                compile_job(job, &self.factory)
-                    .map_err(|error| (proto::JobCommandErrorCode::InvalidJob, error))?,
-            );
+            compiled_jobs.push(match compile_job(job, &self.factory) {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    tracing::warn!(error = %error, "agent rejected invalid job in replace-all");
+                    return Err((proto::JobCommandErrorCode::InvalidJob, error));
+                }
+            });
         }
         // 第二阶段逐个写入 Scheduler；单个写入原子，但多个 Job 不是跨 Job 事务。
         for compiled in compiled_jobs {
@@ -430,6 +502,17 @@ impl JobController {
 }
 
 type ControlResult<T> = Result<T, (proto::JobCommandErrorCode, anyhow::Error)>;
+
+/// 返回 Job 命令的稳定动作名称，日志不记录完整 Proto 内容。
+fn command_action_name(action: Option<&proto::job_command::Action>) -> &'static str {
+    match action {
+        Some(proto::job_command::Action::Upsert(_)) => "upsert",
+        Some(proto::job_command::Action::Delete(_)) => "delete",
+        Some(proto::job_command::Action::RunNow(_)) => "run_now",
+        Some(proto::job_command::Action::ReplaceAll(_)) => "replace_all",
+        None => "missing",
+    }
+}
 
 /// 要求集合变更命令连续到达，发现丢包或乱序时让 Server 重新同步。
 fn require_next_catalog(state: &ControllerState, revision: u64) -> ControlResult<()> {

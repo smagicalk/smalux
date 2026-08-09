@@ -4,6 +4,7 @@
 //! transport mode。这种 typestate 设计用于保护 Noise 严格的消息顺序。
 
 use snow::{Builder, HandshakeState, params::NoiseParams};
+use tracing::{debug, trace, warn};
 
 use crate::agent::v1::{NoiseHandshake, noise_handshake::HandshakeType};
 
@@ -29,6 +30,10 @@ impl ClientXxHandshake {
         identity: &NoiseIdentity,
         psk: &[u8],
     ) -> Result<(ClientXxAwaitMessage2, NoiseHandshake), NoiseError> {
+        debug!(
+            local_key_id = ?identity.key_id(),
+            "starting Client XXpsk3 registration handshake"
+        );
         let psk: &[u8; 32] = psk.try_into().map_err(|_| NoiseError::InvalidPskLength)?;
         let params: NoiseParams = NOISE_XX_PSK3.parse()?;
         let mut handshake = Builder::new(params)
@@ -36,6 +41,10 @@ impl ClientXxHandshake {
             .psk(3, psk)?
             .build_initiator()?;
         let first = write_handshake(&mut handshake, HandshakeType::XxPsk3, None)?;
+        trace!(
+            payload_len = first.payload.len(),
+            "Client XXpsk3 message 1 created"
+        );
         Ok((Self::waiting(handshake), first))
     }
 
@@ -53,6 +62,10 @@ impl ClientXxAwaitMessage2 {
         mut self,
         frame: NoiseHandshake,
     ) -> Result<(EstablishedNoise, NoiseHandshake), NoiseError> {
+        debug!(
+            payload_len = frame.payload.len(),
+            "Client received XXpsk3 message 2"
+        );
         validate_handshake(&frame, HandshakeType::XxPsk3)?;
         read_handshake(&mut self.handshake, &frame.payload)?;
         let remote = NoisePublicKey::from_bytes(
@@ -64,10 +77,16 @@ impl ClientXxAwaitMessage2 {
         if !frame.responder_key_id.is_empty()
             && KeyId::from_bytes(&frame.responder_key_id)? != key_id
         {
+            warn!("Client XXpsk3 responder key ID does not match authenticated key");
             return Err(NoiseError::AuthenticationFailed);
         }
         let third = write_handshake(&mut self.handshake, HandshakeType::XxPsk3, Some(key_id))?;
         let transport = self.handshake.into_transport_mode()?;
+        debug!(
+            remote_key_id = ?key_id,
+            third_payload_len = third.payload.len(),
+            "Client XXpsk3 authentication completed"
+        );
         Ok((
             EstablishedNoise {
                 session: SecureSession::new(transport),
@@ -99,12 +118,21 @@ impl ClientIkHandshake {
         identity: &NoiseIdentity,
         server_key: NoisePublicKey,
     ) -> Result<(ClientIkAwaitMessage2, NoiseHandshake), NoiseError> {
+        debug!(
+            local_key_id = ?identity.key_id(),
+            server_key_id = ?server_key.key_id(),
+            "starting Client IK handshake"
+        );
         let params: NoiseParams = NOISE_IK.parse()?;
         let mut handshake = Builder::new(params)
             .local_private_key(identity.private_key())?
             .remote_public_key(server_key.as_bytes())?
             .build_initiator()?;
         let first = write_handshake(&mut handshake, HandshakeType::Ik, Some(server_key.key_id()))?;
+        trace!(
+            payload_len = first.payload.len(),
+            "Client IK message 1 created"
+        );
         Ok((
             ClientIkAwaitMessage2 {
                 handshake,
@@ -121,12 +149,21 @@ impl ClientIkAwaitMessage2 {
         mut self,
         frame: NoiseHandshake,
     ) -> Result<EstablishedNoise, NoiseError> {
+        debug!(
+            payload_len = frame.payload.len(),
+            "Client received IK message 2"
+        );
         validate_handshake(&frame, HandshakeType::Ik)?;
         if KeyId::from_bytes(&frame.responder_key_id)? != self.server_key.key_id() {
+            warn!("Client IK responder key ID is not the pinned Server key");
             return Err(NoiseError::UnknownKeyId);
         }
         read_handshake(&mut self.handshake, &frame.payload)?;
         let transport = self.handshake.into_transport_mode()?;
+        debug!(
+            server_key_id = ?self.server_key.key_id(),
+            "Client IK authentication completed"
+        );
         Ok(EstablishedNoise {
             session: SecureSession::new(transport),
             mode: HandshakeMode::AuthenticatedIk,
@@ -145,6 +182,12 @@ fn write_handshake(
     let mut output = vec![0; 65_535];
     let written = handshake.write_message(&[], &mut output)?;
     output.truncate(written);
+    trace!(
+        handshake = ?kind,
+        payload_len = output.len(),
+        key_id_present = key_id.is_some(),
+        "Client wrote Noise handshake message"
+    );
     Ok(handshake_frame(kind, key_id, output))
 }
 
@@ -152,5 +195,9 @@ fn write_handshake(
 fn read_handshake(handshake: &mut HandshakeState, payload: &[u8]) -> Result<(), NoiseError> {
     let mut plaintext = vec![0; 65_535];
     handshake.read_message(payload, &mut plaintext)?;
+    trace!(
+        payload_len = payload.len(),
+        "Client consumed Noise handshake message"
+    );
     Ok(())
 }

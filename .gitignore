@@ -25,6 +25,7 @@ target
 
 /target
 /logs/
+**/*.log
 .idea
 /**/target
 **/**/target

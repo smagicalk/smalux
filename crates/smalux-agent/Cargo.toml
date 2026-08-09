@@ -59,6 +59,15 @@ prost-types = "0.14.4"
 # Tokio 原生异步 ICMPv4/ICMPv6，实现多节点 Ping 且支持 Linux 非特权 DGRAM socket。
 surge-ping = "0.9.0"
 
+# gRPC 交互消息的 Protocol Buffers 编解码实现。
+prost = "0.14.4"
+# 生成的 gRPC Client/Server 公共类型。
+tonic = { version = "0.14.6", features = ["transport", "tls-native-roots"] }
+# Tonic 0.14 的 Prost 消息 Codec。
+tonic-prost = "0.14.6"
+
+
+
 [dev-dependencies]
 # 测试进程初始化钩子，用于测试环境的全局准备工作。
 ctor = "1.0.8"

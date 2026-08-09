@@ -63,11 +63,17 @@ Driver 收发和错误路径。
 cargo run -p smalux-protocol --example noise_shared_port_server
 ```
 
-Server 默认监听 `127.0.0.1:8080`，并在控制台打印固定示例 Token。保持 Server 运行，在另一个终端
-设置 Token 后启动 Client：
+Server 默认监听 `127.0.0.1:8080`。保持 Server 运行，在 Server 控制台执行
+`token generate` 生成一次性 Token：
 
 ```powershell
-$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+server> token generate
+```
+
+然后在另一个终端启动 Client。Client 会提示 `paste registration token:`，把刚才生成的完整
+`token_id.psk` 粘贴到控制台并回车：
+
+```powershell
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
 
@@ -83,7 +89,7 @@ cargo run -p smalux-protocol --example noise_shared_port_client
 
 ```text
 target/smalux-noise-server/   Server Noise 身份和示例注册表
-target/smalux-noise-agent/    Agent Noise 身份、固定 Server 公钥和注册状态
+target/smalux-noise-agent/    Agent Noise 身份、Server 公钥和注册状态
 ```
 
 第二次运行 Client 时，如果目录完整且带有 committed 标记，它不会再次读取 Token，而是直接使用 IK。
@@ -96,8 +102,8 @@ cargo run -p smalux-protocol --example noise_shared_port_server -- --mode driver
 cargo run -p smalux-protocol --example noise_shared_port_client -- --mode driver
 ```
 
-Example 当前只接受 `--mode manual|driver`；未传参数时默认使用 `manual`。其他地址、Token、数据目录和
-TLS 配置通过环境变量传入，完整列表见源码附近的 Example README。
+Example 当前只接受 `--mode manual|driver`；未传参数时默认使用 `manual`。其他地址、数据目录和
+TLS 配置通过环境变量传入；注册 Token 不通过环境变量传递，始终由 Client 控制台输入。
 
 ## 6. 判断运行是否正确
 
@@ -105,9 +111,9 @@ TLS 配置通过环境变量传入，完整列表见源码附近的 Example READ
 
 ```text
 Server: Noise handshake completed mode=RegistrationXxPsk3
-Server: pending agent=example-agent
-Server: committed agent=example-agent
-Client: learned Server key and registered agent=example-agent
+Server: pending agent=<server-assigned-agent-id>
+Server: committed agent=<server-assigned-agent-id>
+Client: learned Server key and registered agent=<server-assigned-agent-id>
 ```
 
 后续运行应出现 IK authentication，而不是再次进入注册。错误 Token 会在 Noise 认证阶段失败；协议故意

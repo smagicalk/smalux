@@ -64,10 +64,23 @@ impl SchedulerRuntime {
     /// # Ok::<(), SchedulerError>(())
     /// ```
     pub fn start(config: SchedulerConfig) -> Result<Self, SchedulerError> {
-        validate_config(&config)?;
-        tokio::runtime::Handle::try_current().map_err(|error| {
-            SchedulerError::Actor(format!("Tokio runtime is required: {error}"))
-        })?;
+        if let Err(error) = validate_config(&config) {
+            tracing::error!(error = %error, "agent scheduler configuration is invalid");
+            return Err(error);
+        }
+        if let Err(error) = tokio::runtime::Handle::try_current() {
+            tracing::error!(error = %error, "agent scheduler requires a Tokio runtime");
+            return Err(SchedulerError::Actor(format!(
+                "Tokio runtime is required: {error}"
+            )));
+        }
+
+        tracing::info!(
+            global_concurrency = config.global_concurrency.get(),
+            max_jobs = config.max_jobs,
+            global_max_pending = config.global_max_pending,
+            "agent scheduler starting"
+        );
 
         let (command_tx, command_rx) = mpsc::channel(config.command_channel_capacity);
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
@@ -104,6 +117,7 @@ impl SchedulerRuntime {
     ///
     /// 关闭期间会清空 Pending、取消运行实例，并最多等待 `shutdown_timeout`。
     pub async fn shutdown(mut self) -> Result<(), SchedulerError> {
+        tracing::info!("agent scheduler shutdown requested");
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .scheduler
@@ -115,26 +129,54 @@ impl SchedulerRuntime {
             .await
             .is_ok()
         {
-            response_rx.await.map_err(|_| SchedulerError::Closed)??;
+            match response_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(error = %error, "agent scheduler rejected shutdown request");
+                    return Err(error);
+                }
+                Err(_) => {
+                    tracing::error!("agent scheduler shutdown response was dropped");
+                    return Err(SchedulerError::Closed);
+                }
+            }
         } else {
+            tracing::warn!("agent scheduler command channel closed during shutdown");
             self.shutdown.cancel();
         }
-        self.await_actor().await
+        let result = self.await_actor().await;
+        match &result {
+            Ok(()) => tracing::info!("agent scheduler stopped"),
+            Err(error) => tracing::error!(error = %error, "agent scheduler stop failed"),
+        }
+        result
     }
 
     /// 仅等待 Actor 自行退出，不主动发送关闭命令。
     ///
     /// 通常由另一个持有 Scheduler 的任务发出关闭命令时使用；否则可能一直等待。
     pub async fn wait(mut self) -> Result<(), SchedulerError> {
-        self.await_actor().await
+        tracing::debug!("waiting for agent scheduler actor");
+        let result = self.await_actor().await;
+        if let Err(error) = &result {
+            tracing::error!(error = %error, "agent scheduler actor exited with an error");
+        }
+        result
     }
 
     /// 取出并等待唯一 Actor JoinHandle，把 JoinError 转换为 SchedulerError。
     async fn await_actor(&mut self) -> Result<(), SchedulerError> {
-        let actor = self.actor.take().ok_or(SchedulerError::Closed)?;
-        actor
-            .await
-            .map_err(|error| SchedulerError::Join(error.to_string()))?
+        let actor = self.actor.take().ok_or_else(|| {
+            tracing::warn!("agent scheduler actor was already awaited");
+            SchedulerError::Closed
+        })?;
+        match actor.await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(error = %error, "agent scheduler actor join failed");
+                Err(SchedulerError::Join(error.to_string()))
+            }
+        }
     }
 }
 
@@ -142,6 +184,7 @@ impl Drop for SchedulerRuntime {
     /// Runtime 未显式关闭时触发兜底取消，防止 Actor 永久后台运行。
     fn drop(&mut self) {
         if self.actor.is_some() {
+            tracing::debug!("agent scheduler runtime dropped without explicit shutdown");
             self.shutdown.cancel();
         }
     }
@@ -389,12 +432,30 @@ impl Scheduler {
         command: impl FnOnce(oneshot::Sender<Result<T, SchedulerError>>) -> Command,
     ) -> Result<T, SchedulerError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.inner
-            .command_tx
-            .send(command(response_tx))
-            .await
-            .map_err(|_| SchedulerError::Closed)?;
-        response_rx.await.map_err(|_| SchedulerError::Closed)?
+        let command = command(response_tx);
+        let command_kind = command.kind();
+        self.inner.command_tx.send(command).await.map_err(|_| {
+            tracing::warn!(
+                command = command_kind,
+                "agent scheduler command channel closed"
+            );
+            SchedulerError::Closed
+        })?;
+        let result = response_rx.await.map_err(|_| {
+            tracing::warn!(
+                command = command_kind,
+                "agent scheduler command response dropped"
+            );
+            SchedulerError::Closed
+        })?;
+        if let Err(error) = &result {
+            tracing::warn!(
+                command = command_kind,
+                error = %error,
+                "agent scheduler command failed"
+            );
+        }
+        result
     }
 }
 
@@ -460,6 +521,24 @@ enum Command {
     Shutdown {
         response: oneshot::Sender<Result<(), SchedulerError>>,
     },
+}
+
+impl Command {
+    /// 返回内部命令的稳定日志名称，不记录完整 Task 或配置内容。
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Update { .. } => "update",
+            Self::Get { .. } => "get",
+            Self::List { .. } => "list",
+            Self::Enable { .. } => "enable",
+            Self::Disable { .. } => "disable",
+            Self::Delete { .. } => "delete",
+            Self::GetConfig { .. } => "get_config",
+            Self::UpdateConfig { .. } => "update_config",
+            Self::Shutdown { .. } => "shutdown",
+        }
+    }
 }
 
 #[cfg(test)]

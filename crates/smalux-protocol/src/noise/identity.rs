@@ -5,6 +5,7 @@
 
 use blake2::{Blake2s256, Digest};
 use snow::{Builder, params::NoiseParams};
+use tracing::debug;
 
 use super::{NOISE_XX_PSK3, NoiseError};
 
@@ -63,22 +64,27 @@ impl NoiseIdentity {
     ///
     /// 返回成功后应立即持久化；进程重启时生成新身份会使已有 IK 信任关系失效。
     pub fn generate() -> Result<Self, NoiseError> {
+        debug!("generating a new Noise static identity");
         // 使用正式 XXpsk3 suite 取得与协议一致的 25519 keypair 生成器。
         let params: NoiseParams = NOISE_XX_PSK3.parse()?;
         let pair = Builder::new(params).generate_keypair()?;
-        Self::from_parts(&pair.private, &pair.public)
+        let identity = Self::from_parts(&pair.private, &pair.public)?;
+        debug!(key_id = ?identity.key_id(), "generated Noise static identity");
+        Ok(identity)
     }
 
     /// 从调用方存储的私钥和公钥恢复身份，并严格验证两者长度。
     ///
     /// 当前方法不重新推导公钥；调用方必须保证这一对字节来自同一身份记录。
     pub fn from_parts(private_key: &[u8], public_key: &[u8]) -> Result<Self, NoiseError> {
-        Ok(Self {
+        let identity = Self {
             private_key: private_key
                 .try_into()
                 .map_err(|_| NoiseError::InvalidKeyLength)?,
             public_key: NoisePublicKey::from_bytes(public_key)?,
-        })
+        };
+        debug!(key_id = ?identity.key_id(), "restored Noise static identity from persisted bytes");
+        Ok(identity)
     }
 
     /// 返回可公开复制的静态公钥。
@@ -129,6 +135,7 @@ impl RotationId {
     pub fn generate() -> Result<Self, NoiseError> {
         let mut bytes = [0; ROTATION_ID_LEN];
         getrandom::fill(&mut bytes)?;
+        debug!("generated a Noise key rotation transaction ID");
         Ok(Self(bytes))
     }
 

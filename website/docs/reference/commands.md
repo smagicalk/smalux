@@ -31,13 +31,15 @@ Server：
 
 ```powershell
 cargo run -p smalux-protocol --example noise_shared_port_server
+# 在 Server 控制台输入：
+# server> token generate
 ```
 
 Client：
 
 ```powershell
-$env:SMALUX_EXAMPLE_REGISTRATION_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 cargo run -p smalux-protocol --example noise_shared_port_client
+# Client 启动后在 paste registration token: 提示处粘贴 Server 生成的 token_id.psk
 ```
 
 Driver 模式：
@@ -54,14 +56,14 @@ Example 支持的环境变量：
 | `SMALUX_EXAMPLE_ADDR` | `127.0.0.1:8080`，Server | 监听地址。 |
 | `SMALUX_EXAMPLE_ENDPOINT` | `http://127.0.0.1:8080`，Client | 公开 endpoint；经代理时设为 HTTPS 域名。 |
 | `SMALUX_EXAMPLE_SERVER_DATA_DIR` | `target/smalux-noise-server` | Server identity 与注册状态目录。 |
-| `SMALUX_EXAMPLE_AGENT_DATA_DIR` | `target/smalux-noise-agent` | Agent identity、固定 Server key 与 pending 状态目录。 |
-| `SMALUX_EXAMPLE_REGISTRATION_TOKEN` | 内置固定示例值 | 仅用于首次 XXpsk3 注册；生产禁止固定 Token。 |
+| `SMALUX_EXAMPLE_AGENT_DATA_DIR` | `target/smalux-noise-agent` | Agent identity、Server key 与 pending 状态目录。 |
 | `SMALUX_EXAMPLE_REVOKE_AGENT` | 未设置 | Server 启动时吊销指定示例 Agent。 |
 | `SMALUX_EXAMPLE_TLS_CERT` | 未设置 | Server TLS 证书链 PEM；必须与私钥同时设置。 |
 | `SMALUX_EXAMPLE_TLS_KEY` | 未设置 | Server TLS 私钥 PEM。 |
 
-PowerShell 设置的 `$env:...` 只影响当前终端及其子进程。切换数据目录可以并行模拟不同 Agent，也可以隔离
-错误 Token 测试，避免覆盖已经完成注册的默认身份。
+PowerShell 设置的 `$env:...` 只影响当前终端及其子进程。Token 不使用环境变量，而是在 Client
+启动后的控制台提示中输入。切换数据目录可以并行模拟不同 Agent，也可以隔离错误 Token 测试，
+避免覆盖已经完成注册的身份。
 
 清理 Example 身份时应删除完整数据目录，不能只删除单个 key 文件：
 

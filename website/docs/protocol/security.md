@@ -52,7 +52,7 @@ Agent 验证 Ack 后切换 incoming/outgoing
 1. `AgentKeySet::prepare_rotation()` 生成 pending identity 和 snapshot。
 2. Agent **先持久化**包含 pending 私钥的 snapshot。
 3. 通过已认证 Session 发送新公钥请求。
-4. Server 验证并保存 pending Agent 公钥。
+4. Server 验证并保存注册尝试中的 Agent 公钥；此时还没有 active Agent 授权记录。
 5. Server 发送接受消息。
 6. Agent `promote_pending()`。
 7. 稳定窗口结束后双方退休 previous 公钥。
@@ -72,18 +72,24 @@ Agent 验证 Ack 后切换 incoming/outgoing
 轮换窗口内 Agent 可用 `connect_with_candidates()` 按 `pending/current/previous` 顺序尝试。每次尝试是新的
 RPC 和 Noise 状态，失败 Session 不能复用。
 
+正式 Server 不直接让 gRPC handler 修改 `ServerKeyRing`。`ServerKeyRingManager` 负责运行时
+协调：首次启动使用 `keyring_id = default` 的唯一键原子创建，轮换先在候选快照上计算，再
+使用数据库 `revision` 做 CAS；CAS 成功后才替换当前握手句柄。多实例进程按固定周期读取
+更高 revision 并替换本地句柄，因此同一个数据库上的实例最终收敛，旧 revision 不会覆盖新密钥。
+
 ## 存储要求
 
 - `NoiseIdentity` 故意不实现 `Debug`，但调用方仍必须保护导出的私钥字节。
 - snapshot 应原子写入，避免 current 已推进而磁盘仍只有旧状态。
-- 多实例 Server 必须同步 keyring 和注册表，否则同一 Agent 连到不同实例会随机认证失败。
+- 多实例 Server 必须共享同一 keyring 持久化源；当前实现通过 revision 轮询同步 keyring，注册表
+  仍需使用同样的共享数据库/一致性策略，否则同一 Agent 连到不同实例会随机认证失败。
 - 日志只记录 key ID、rotation ID 和安全错误分类，不记录 PSK、Token、私钥或完整业务载荷。
 
 建议把持久化接口按业务事务拆开，而不是让 Protocol 直接依赖数据库：
 
 | 方法语义 | 必须原子保存的内容 |
 | --- | --- |
-| 保存注册 pending | Agent identity、Server 公钥、Agent ID、transaction ID。 |
+| 保存注册 pending | 注册公钥、展示名称、预分配 Agent ID、Token ID 和 transaction ID；此时不创建 Agent 授权记录。 |
 | 提交注册 | pending 状态转换为 committed，并记录注册 ID。 |
 | 保存 Agent 轮换 | current、pending、previous identity 和 rotation ID snapshot。 |
 | 保存 Server 轮换 | current、next、previous identity 和确认进度。 |

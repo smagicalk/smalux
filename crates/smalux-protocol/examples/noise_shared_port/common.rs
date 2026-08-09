@@ -3,7 +3,10 @@
 // 此文件分别编译进两个独立 example；每个二进制都会有另一端专用的常量。
 #![allow(dead_code)]
 
-use std::{env, fmt};
+use std::{env, fmt, time::Duration};
+
+use smalux_protocol::tonic_transport::{HeartbeatPolicy, HeartbeatStats};
+use tracing::{debug, info, warn};
 
 /// 示例业务会话的运行方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,15 +24,23 @@ impl ExampleMode {
         let mut mode = Self::Manual;
         while let Some(argument) = arguments.next() {
             if argument != "--mode" {
+                warn!(argument, "unknown example command-line argument");
                 return Err(ExampleModeError(format!("unknown argument: {argument}")));
             }
             mode = match arguments.next().as_deref() {
                 Some("manual") => Self::Manual,
                 Some("driver") => Self::Driver,
-                Some(value) => return Err(ExampleModeError(format!("unknown mode: {value}"))),
-                None => return Err(ExampleModeError("--mode requires manual or driver".into())),
+                Some(value) => {
+                    warn!(value, "unknown example session mode");
+                    return Err(ExampleModeError(format!("unknown mode: {value}")));
+                }
+                None => {
+                    warn!("example --mode argument is missing a value");
+                    return Err(ExampleModeError("--mode requires manual or driver".into()));
+                }
             };
         }
+        debug!(?mode, "parsed example session mode");
         Ok(mode)
     }
 }
@@ -56,14 +67,9 @@ pub const ADDRESS_ENV: &str = "SMALUX_EXAMPLE_ADDR";
 pub const ENDPOINT_ENV: &str = "SMALUX_EXAMPLE_ENDPOINT";
 pub const SERVER_DATA_DIR_ENV: &str = "SMALUX_EXAMPLE_SERVER_DATA_DIR";
 pub const AGENT_DATA_DIR_ENV: &str = "SMALUX_EXAMPLE_AGENT_DATA_DIR";
-pub const REGISTRATION_TOKEN_ENV: &str = "SMALUX_EXAMPLE_REGISTRATION_TOKEN";
+pub const AGENT_NAME_ENV: &str = "SMALUX_EXAMPLE_AGENT_NAME";
+pub const DEFAULT_AGENT_NAME: &str = "example-agent";
 pub const REVOKE_AGENT_ENV: &str = "SMALUX_EXAMPLE_REVOKE_AGENT";
-/// 仅供本地手工测试使用的固定 256 位注册 Token。
-///
-/// 生产环境绝不能内置固定 Token：应使用密码学安全随机数生成、设置短有效期，并在注册成功后
-/// 立即作废。这里固定它只是为了反复运行示例时不必每次复制新的值。
-pub const FIXED_REGISTRATION_TOKEN: &str =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 /// 可选的 Server TLS 证书链 PEM 路径；不设置时 Server 使用 h2c。
 pub const TLS_CERT_ENV: &str = "SMALUX_EXAMPLE_TLS_CERT";
 /// 可选的 Server TLS 私钥 PEM 路径，必须与证书变量同时设置。
@@ -74,3 +80,59 @@ pub const HEALTH_PATH: &str = "/api/v1/health";
 pub const STATUS_PATH: &str = "/api/v1/status";
 /// 浏览器或普通 Client 使用的 WebSocket Echo 接口。
 pub const WEBSOCKET_PATH: &str = "/api/v1/ws";
+
+/// 示例心跳发送间隔；生产环境应按业务上报频率和网络质量单独配置。
+pub const EXAMPLE_HEARTBEAT_INTERVAL_SECS: u64 = 1;
+/// 示例心跳失联判定时间；必须大于发送间隔，避免正常抖动被立即判定为断线。
+pub const EXAMPLE_HEARTBEAT_TIMEOUT_SECS: u64 = 5;
+/// 示例在业务消息完成后继续保持会话的时间，用来观察至少一次 Ping/Pong。
+pub const EXAMPLE_HEARTBEAT_OBSERVE_SECS: u64 = 2;
+
+/// 返回 Client 与 Server 共用的示例心跳策略。
+pub fn example_heartbeat_policy() -> HeartbeatPolicy {
+    HeartbeatPolicy {
+        interval: Duration::from_secs(EXAMPLE_HEARTBEAT_INTERVAL_SECS),
+        timeout: Duration::from_secs(EXAMPLE_HEARTBEAT_TIMEOUT_SECS),
+    }
+}
+
+/// 返回业务消息发送完成后用于观察心跳的等待窗口。
+pub fn example_heartbeat_observe_window() -> Duration {
+    Duration::from_secs(EXAMPLE_HEARTBEAT_OBSERVE_SECS)
+}
+
+/// 统一输出示例两端的心跳累计值和最近一次完整 RTT 样本。
+pub fn print_heartbeat_stats(side: &str, stats: HeartbeatStats) {
+    info!(
+        side,
+        sent = stats.sent_count,
+        received = stats.received_count,
+        lost = stats.lost_count,
+        consecutive_failures = stats.consecutive_failures,
+        "example heartbeat statistics"
+    );
+    println!(
+        "[{side}][heartbeat] sent={} received={} lost={} consecutive_failures={} min_rtt={:?} max_rtt={:?}",
+        stats.sent_count,
+        stats.received_count,
+        stats.lost_count,
+        stats.consecutive_failures,
+        stats.min_rtt,
+        stats.max_rtt,
+    );
+    if let Some(sample) = stats.last_sample {
+        debug!(side, nonce = sample.nonce, rtt = ?sample.rtt, "example heartbeat sample");
+        println!(
+            "[{side}][heartbeat] sample nonce={} rtt={:?} sent_at={} responder_received_at={} responder_sent_at={} received_at={}",
+            sample.nonce,
+            sample.rtt,
+            sample.sent_at_unix_micros,
+            sample.responder_received_at_unix_micros,
+            sample.responder_sent_at_unix_micros,
+            sample.received_at_unix_micros,
+        );
+    } else {
+        warn!(side, "example has no matching heartbeat Pong");
+        println!("[{side}][heartbeat] no matching Pong received");
+    }
+}

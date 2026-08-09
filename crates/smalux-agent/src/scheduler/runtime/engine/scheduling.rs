@@ -30,6 +30,11 @@ impl SchedulerActor {
             let Some(expired) = next else { break };
             entries.push(expired.into_inner());
         }
+        tracing::debug!(
+            batch_id,
+            entries = entries.len(),
+            "agent scheduler timer batch expired"
+        );
         for entry in entries {
             self.handle_timer(entry, batch_id);
         }
@@ -40,9 +45,16 @@ impl SchedulerActor {
     /// 旧版本 Timer 会被直接丢弃，这是更新和删除 Job 时无需遍历所有已到期消息的关键。
     fn handle_timer(&mut self, entry: TimerEntry, batch_id: u64) {
         let Some(job) = self.jobs.get(&entry.job_id) else {
+            tracing::trace!(job_id = %entry.job_id, "agent scheduler ignored timer for missing job");
             return;
         };
         if job.version != entry.version || !matches!(job.state, JobState::Enabled) {
+            tracing::trace!(
+                job_id = %entry.job_id,
+                timer_version = entry.version,
+                current_version = job.version,
+                "agent scheduler ignored stale or disabled timer"
+            );
             return;
         }
         match entry.kind {
@@ -100,6 +112,12 @@ impl SchedulerActor {
             match due_occurrences(&trigger, scheduled_at, now, self.config.maximum_catch_up) {
                 Ok(value) => value,
                 Err(error) => {
+                    tracing::error!(
+                        job_id = %job_id,
+                        version,
+                        error = %error,
+                        "agent scheduler failed to calculate due occurrences"
+                    );
                     let _ = self.force_disable(job_id, error.to_string());
                     return;
                 }
@@ -108,6 +126,12 @@ impl SchedulerActor {
 
         let mut blocked = false;
         if due.occurrences.is_empty() {
+            tracing::debug!(
+                job_id = %job_id,
+                version,
+                scheduled_at = %scheduled_at,
+                "agent scheduler skipped trigger occurrences"
+            );
             self.emit(SchedulerEventKind::TriggerSkipped {
                 job_id,
                 version,
@@ -188,6 +212,15 @@ impl SchedulerActor {
         let global_full = self.ready.len() >= self.config.global_max_pending;
         let job_full = self.ready.count_job(job_id) >= job_limit;
         if global_full || job_full {
+            tracing::debug!(
+                job_id = %job_id,
+                version,
+                run_id = %pending.run_id,
+                global_full,
+                job_full,
+                capacity = ?capacity,
+                "agent scheduler pending capacity reached"
+            );
             match capacity {
                 CapacityPolicy::SkipNewest => {
                     self.emit(SchedulerEventKind::TriggerSkipped {
@@ -226,6 +259,13 @@ impl SchedulerActor {
             run_id,
             pending_count,
         });
+        tracing::debug!(
+            job_id = %job_id,
+            version,
+            run_id = %run_id,
+            pending_count,
+            "agent scheduler execution queued"
+        );
         Admission::Accepted
     }
 
@@ -236,6 +276,7 @@ impl SchedulerActor {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.blocked.push_back(pending);
         }
+        tracing::debug!(job_id = %job_id, version, "agent scheduler applied backpressure");
         self.emit(SchedulerEventKind::BackpressureApplied { job_id, version });
     }
 
@@ -273,6 +314,12 @@ impl SchedulerActor {
                         run_id,
                         pending_count: self.ready.count_job(job_id),
                     });
+                    tracing::debug!(
+                        job_id = %job_id,
+                        version,
+                        run_id = %run_id,
+                        "agent scheduler restored blocked execution"
+                    );
                 }
             }
             if self.jobs[&job_id].blocked.is_empty()

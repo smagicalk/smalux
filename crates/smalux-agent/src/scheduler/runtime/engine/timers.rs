@@ -21,6 +21,13 @@ impl SchedulerActor {
             let _ = self.timers.try_remove(&key);
         }
         let version = job.version;
+        tracing::debug!(
+            job_id = %job_id,
+            version,
+            run_at = %run_at,
+            timer_kind = ?kind,
+            "agent scheduler normal timer scheduled"
+        );
         let key = self.timers.insert_at(
             TimerEntry {
                 job_id,
@@ -52,6 +59,14 @@ impl SchedulerActor {
         if let Some(previous) = self.retry_timers.remove(&run_id) {
             let _ = self.timers.try_remove(&previous.key);
         }
+        tracing::debug!(
+            job_id = %job_id,
+            version,
+            run_id = %run_id,
+            attempt,
+            run_at = %run_at,
+            "agent scheduler retry timer scheduled"
+        );
         let key = self.timers.insert_at(
             TimerEntry {
                 job_id,

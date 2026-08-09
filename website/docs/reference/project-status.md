@@ -25,6 +25,9 @@ description: 区分当前已实现、示例实现和待完成的能力。
 - Agent/Server 静态密钥轮换状态与 snapshot；
 - Tonic Client/Server 适配和 SessionDriver；
 - 注册四阶段状态机与错误/超时测试。
+- `smalux-server` library 的 Axum 启动链、`/api/v1/health` 和 `/api/v1/grpc` 路由装配；
+- Server Noise PSK resolver 的异步接口与握手级超时。
+- Server 数据库注册中心：一次性 Token 查询、幂等 prepare、原子 commit、Agent 授权与吊销查询。
 
 ## Example 中实现
 
@@ -38,19 +41,20 @@ description: 区分当前已实现、示例实现和待完成的能力。
 Example 用于说明调用流程，不具备生产数据库、审计、限流和密钥安全存储。
 
 正式入口的当前状态也需要单独说明：`smalux-agent` 的 `main` 尚未组装 Scheduler、连接和上报循环；
-`smalux-server` 能启动 Axum listener，但默认 Router 还没有接入 Example 中的 REST/gRPC/Noise 流程。
-因此“底层 crate 已实现”不等于“正式二进制已经可部署”。
+`smalux-server` 已能启动 Axum listener，并装配健康检查、Agent gRPC/Noise 入口和数据库注册中心；
+但管理端尚未提供 Token 签发/吊销 API，Agent 正式入口也尚未组装自动连接与重连。因此“注册与授权
+链路已实现”仍不等于“正式二进制已经可部署”。
 
 ## 仍需完成
 
 - Agent 与 Server 正式连接生命周期和自动重连；
 - TaskReport 本地持久化、跨 Session ACK、去重和重放；
-- Server 正式 Agent/Token/Job/指标数据库模型与迁移；
+- Server Job/指标数据库模型与迁移，以及 Agent/Token 管理 API；
 - 能力协商和协议版本策略；
 - 管理 REST API、Web 管理端和用户授权；
 - 安装包、系统服务、容器镜像、升级和回滚；
 - `smalux-plus-rustic` 实际业务实现；
-- 多实例密钥与注册状态同步；
+- 多实例部署下的迁移互斥、事件通知和端到端并发验证；
 - 生产监控、审计、速率限制和容量测试。
 
 ## 阅读原则

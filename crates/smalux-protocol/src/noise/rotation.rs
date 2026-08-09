@@ -4,6 +4,7 @@
 //! 再发送网络确认或进入下一阶段。这样进程崩溃后可以从明确阶段恢复，而不是猜测密钥状态。
 
 use crate::agent::v1::{AgentKeyRotationRequest, ServerKeyAnnouncement};
+use tracing::{debug, warn};
 
 use super::{KeyId, NoiseError, NoiseIdentity, NoisePublicKey, RotationId};
 
@@ -37,6 +38,7 @@ pub struct AgentRotationPrepared {
 impl AgentKeySet {
     /// 用已持久化的稳定身份创建没有 pending 的初始状态。
     pub fn new(current: NoiseIdentity) -> Self {
+        debug!(current_key_id = ?current.key_id(), "created Agent key rotation state");
         Self {
             state: AgentKeySetSnapshot {
                 current,
@@ -49,6 +51,7 @@ impl AgentKeySet {
     /// 从数据库或本地文件恢复状态，并验证 pending 与 rotation ID 同时存在或同时缺失。
     pub fn from_snapshot(snapshot: AgentKeySetSnapshot) -> Result<Self, NoiseError> {
         if snapshot.pending.is_some() != snapshot.rotation_id.is_some() {
+            warn!("rejected inconsistent Agent key rotation snapshot");
             return Err(NoiseError::NoPendingRotation);
         }
         Ok(Self { state: snapshot })
@@ -60,12 +63,18 @@ impl AgentKeySet {
     pub fn prepare_rotation(&mut self) -> Result<AgentRotationPrepared, NoiseError> {
         // 同一 Agent 同时只允许一笔轮换，避免确认消息匹配到错误私钥。
         if self.state.pending.is_some() {
+            warn!("Agent key rotation already has a pending identity");
             return Err(NoiseError::RotationAlreadyInProgress);
         }
         let identity = NoiseIdentity::generate()?;
         let rotation_id = RotationId::generate()?;
         self.state.pending = Some(identity.clone());
         self.state.rotation_id = Some(rotation_id);
+        debug!(
+            rotation_id = ?rotation_id,
+            new_key_id = ?identity.key_id(),
+            "prepared Agent static key rotation"
+        );
         Ok(AgentRotationPrepared {
             rotation_id,
             new_identity: identity.clone(),
@@ -92,6 +101,7 @@ impl AgentKeySet {
     pub fn promote_pending(&mut self, rotation_id: RotationId) -> Result<(), NoiseError> {
         // ID 不匹配通常表示过期确认或数据库状态被另一个事务更新。
         if self.state.rotation_id != Some(rotation_id) {
+            warn!(rotation_id = ?rotation_id, "Agent key rotation confirmation ID does not match");
             return Err(NoiseError::RotationIdMismatch);
         }
         self.state.current = self
@@ -100,15 +110,18 @@ impl AgentKeySet {
             .take()
             .ok_or(NoiseError::NoPendingRotation)?;
         self.state.rotation_id = None;
+        debug!(rotation_id = ?rotation_id, "promoted Agent pending identity");
         Ok(())
     }
 
     /// Server 拒绝轮换或事务超时后，丢弃尚未生效的 pending 私钥。
     pub fn cancel_rotation(&mut self) -> Result<(), NoiseError> {
         if self.state.pending.take().is_none() {
+            warn!("cannot cancel Agent key rotation without a pending identity");
             return Err(NoiseError::NoPendingRotation);
         }
         self.state.rotation_id = None;
+        debug!("cancelled Agent static key rotation");
         Ok(())
     }
 
@@ -138,6 +151,7 @@ pub struct AgentPublicKeySet {
 impl AgentPublicKeySet {
     /// 用首次注册得到的 Agent 公钥创建稳定状态。
     pub fn new(current: NoisePublicKey) -> Self {
+        debug!(current_key_id = ?current.key_id(), "created Agent public-key authorization state");
         Self {
             state: AgentPublicKeySetSnapshot {
                 current,
@@ -150,6 +164,7 @@ impl AgentPublicKeySet {
     /// 从持久化 snapshot 恢复授权集合，并校验 pending 与事务 ID 的一致性。
     pub fn from_snapshot(snapshot: AgentPublicKeySetSnapshot) -> Result<Self, NoiseError> {
         if snapshot.pending.is_some() != snapshot.rotation_id.is_some() {
+            warn!("rejected inconsistent Agent public-key rotation snapshot");
             return Err(NoiseError::NoPendingRotation);
         }
         Ok(Self { state: snapshot })
@@ -160,15 +175,23 @@ impl AgentPublicKeySet {
     /// Server 只接收公钥；重新计算 key ID 可防止请求内的冗余字段互相矛盾。
     pub fn stage(&mut self, request: &AgentKeyRotationRequest) -> Result<(), NoiseError> {
         if self.state.pending.is_some() {
+            warn!("Agent public-key rotation already has a pending key");
             return Err(NoiseError::RotationAlreadyInProgress);
         }
         let rotation_id = RotationId::from_bytes(&request.rotation_id)?;
         let key = NoisePublicKey::from_bytes(&request.new_public_key)?;
         if key.key_id() != KeyId::from_bytes(&request.new_key_id)? {
+            warn!("Agent key rotation request contains mismatched key ID");
             return Err(NoiseError::AuthenticationFailed);
         }
+        let new_key_id = key.key_id();
         self.state.pending = Some(key);
         self.state.rotation_id = Some(rotation_id);
+        debug!(
+            rotation_id = ?rotation_id,
+            new_key_id = ?new_key_id,
+            "staged Agent public-key rotation"
+        );
         Ok(())
     }
 
@@ -180,6 +203,7 @@ impl AgentPublicKeySet {
     /// 新 Agent 身份完成 IK 后，把 pending 提升为唯一 current 授权公钥。
     pub fn promote_pending(&mut self, rotation_id: RotationId) -> Result<(), NoiseError> {
         if self.state.rotation_id != Some(rotation_id) {
+            warn!(rotation_id = ?rotation_id, "Agent public-key rotation confirmation ID does not match");
             return Err(NoiseError::RotationIdMismatch);
         }
         self.state.current = self
@@ -188,15 +212,18 @@ impl AgentPublicKeySet {
             .take()
             .ok_or(NoiseError::NoPendingRotation)?;
         self.state.rotation_id = None;
+        debug!(rotation_id = ?rotation_id, "promoted Agent pending public key");
         Ok(())
     }
 
     /// Agent 换钥被拒绝或超时后，撤销 pending 公钥授权。
     pub fn cancel_rotation(&mut self) -> Result<(), NoiseError> {
         if self.state.pending.take().is_none() {
+            warn!("cannot cancel Agent public-key rotation without a pending key");
             return Err(NoiseError::NoPendingRotation);
         }
         self.state.rotation_id = None;
+        debug!("cancelled Agent public-key rotation");
         Ok(())
     }
 
@@ -238,6 +265,7 @@ pub struct ServerKeyRing {
 impl ServerKeyRing {
     /// 用稳定 Server 身份创建没有轮换窗口的 keyring。
     pub fn new(current: NoiseIdentity) -> Self {
+        debug!(current_key_id = ?current.key_id(), "created Server key ring");
         Self {
             state: ServerKeyRingSnapshot {
                 current,
@@ -251,6 +279,7 @@ impl ServerKeyRing {
     /// 从持久化 snapshot 恢复，并校验 next 与 rotation ID 同时存在或同时缺失。
     pub fn from_snapshot(snapshot: ServerKeyRingSnapshot) -> Result<Self, NoiseError> {
         if snapshot.next.is_some() != snapshot.rotation_id.is_some() {
+            warn!("rejected inconsistent Server key ring snapshot");
             return Err(NoiseError::NoPendingRotation);
         }
         Ok(Self { state: snapshot })
@@ -261,12 +290,18 @@ impl ServerKeyRing {
     /// 成功后应先持久化 `snapshot()`，再向 Agent 发送 `announcement`。
     pub fn prepare_rotation(&mut self) -> Result<ServerRotationPrepared, NoiseError> {
         if self.state.next.is_some() || self.state.previous.is_some() {
+            warn!("Server key rotation already has an active transition");
             return Err(NoiseError::RotationAlreadyInProgress);
         }
         let next = NoiseIdentity::generate()?;
         let rotation_id = RotationId::generate()?;
         self.state.next = Some(next.clone());
         self.state.rotation_id = Some(rotation_id);
+        debug!(
+            rotation_id = ?rotation_id,
+            new_key_id = ?next.key_id(),
+            "prepared Server static key rotation"
+        );
         Ok(ServerRotationPrepared {
             rotation_id,
             next_identity: next.clone(),
@@ -296,6 +331,7 @@ impl ServerKeyRing {
     /// Agent 已保存新公钥后，把 next 提升为 current，并暂时保留旧 current。
     pub fn promote_next(&mut self, rotation_id: RotationId) -> Result<(), NoiseError> {
         if self.state.rotation_id != Some(rotation_id) {
+            warn!(rotation_id = ?rotation_id, "Server key rotation confirmation ID does not match");
             return Err(NoiseError::RotationIdMismatch);
         }
         let next = self
@@ -305,23 +341,28 @@ impl ServerKeyRing {
             .ok_or(NoiseError::NoPendingRotation)?;
         self.state.previous = Some(std::mem::replace(&mut self.state.current, next));
         self.state.rotation_id = None;
+        debug!(rotation_id = ?rotation_id, "promoted Server next identity");
         Ok(())
     }
 
     /// 迁移观察期结束后永久移除 previous 私钥，使旧 key ID 不再可连接。
     pub fn retire_previous(&mut self) -> Result<(), NoiseError> {
         if self.state.previous.take().is_none() {
+            warn!("cannot retire Server key without a previous identity");
             return Err(NoiseError::NoPendingRotation);
         }
+        debug!("retired previous Server identity");
         Ok(())
     }
 
     /// 在 promote 前撤销 Server 轮换并丢弃 next 私钥。
     pub fn cancel_rotation(&mut self) -> Result<(), NoiseError> {
         if self.state.next.take().is_none() {
+            warn!("cannot cancel Server key rotation without a next identity");
             return Err(NoiseError::NoPendingRotation);
         }
         self.state.rotation_id = None;
+        debug!("cancelled Server static key rotation");
         Ok(())
     }
 
@@ -353,6 +394,7 @@ pub struct PinnedServerKeys {
 impl PinnedServerKeys {
     /// 用首次 XXpsk3 注册认证得到的 Server 公钥创建稳定状态。
     pub fn new(current: NoisePublicKey) -> Self {
+        debug!(current_key_id = ?current.key_id(), "created pinned Server key state");
         Self {
             state: PinnedServerKeysSnapshot {
                 current,
@@ -366,6 +408,7 @@ impl PinnedServerKeys {
     /// 从持久化 snapshot 恢复，并校验 pending 与 rotation ID 的一致性。
     pub fn from_snapshot(snapshot: PinnedServerKeysSnapshot) -> Result<Self, NoiseError> {
         if snapshot.pending.is_some() != snapshot.rotation_id.is_some() {
+            warn!("rejected inconsistent pinned Server key snapshot");
             return Err(NoiseError::NoPendingRotation);
         }
         Ok(Self { state: snapshot })
@@ -376,15 +419,23 @@ impl PinnedServerKeys {
     /// 成功后应先保存 `snapshot()`，再通过旧加密会话发送确认。
     pub fn stage(&mut self, announcement: &ServerKeyAnnouncement) -> Result<(), NoiseError> {
         if self.state.pending.is_some() {
+            warn!("pinned Server key rotation already has a pending key");
             return Err(NoiseError::RotationAlreadyInProgress);
         }
         let rotation_id = RotationId::from_bytes(&announcement.rotation_id)?;
         let key = NoisePublicKey::from_bytes(&announcement.new_public_key)?;
         if key.key_id() != KeyId::from_bytes(&announcement.new_key_id)? {
+            warn!("Server key announcement contains mismatched key ID");
             return Err(NoiseError::AuthenticationFailed);
         }
+        let new_key_id = key.key_id();
         self.state.pending = Some(key);
         self.state.rotation_id = Some(rotation_id);
+        debug!(
+            rotation_id = ?rotation_id,
+            new_key_id = ?new_key_id,
+            "staged pinned Server key rotation"
+        );
         Ok(())
     }
 
@@ -402,6 +453,7 @@ impl PinnedServerKeys {
     /// 使用 pending 公钥成功建立 IK 后，将其提升为 current 并保留旧 current。
     pub fn promote_pending(&mut self, rotation_id: RotationId) -> Result<(), NoiseError> {
         if self.state.rotation_id != Some(rotation_id) {
+            warn!(rotation_id = ?rotation_id, "pinned Server key rotation confirmation ID does not match");
             return Err(NoiseError::RotationIdMismatch);
         }
         let next = self
@@ -411,23 +463,28 @@ impl PinnedServerKeys {
             .ok_or(NoiseError::NoPendingRotation)?;
         self.state.previous = Some(std::mem::replace(&mut self.state.current, next));
         self.state.rotation_id = None;
+        debug!(rotation_id = ?rotation_id, "promoted pinned Server key");
         Ok(())
     }
 
     /// 观察期结束后移除 previous，之后不再信任旧 Server 公钥。
     pub fn retire_previous(&mut self) -> Result<(), NoiseError> {
         if self.state.previous.take().is_none() {
+            warn!("cannot retire pinned Server key without a previous key");
             return Err(NoiseError::NoPendingRotation);
         }
+        debug!("retired previous pinned Server key");
         Ok(())
     }
 
     /// 新公钥无法连接或轮换被撤销时，丢弃 pending 信任项。
     pub fn cancel_pending(&mut self) -> Result<(), NoiseError> {
         if self.state.pending.take().is_none() {
+            warn!("cannot cancel pinned Server key rotation without a pending key");
             return Err(NoiseError::NoPendingRotation);
         }
         self.state.rotation_id = None;
+        debug!("cancelled pinned Server key rotation");
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::PublicIpTaskConfig;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{PublicIpStatus, SampleMetadata, TaskResult, task_result};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -111,6 +111,31 @@ impl ReportingTask for PublicIpTask {
             ) => snapshot,
         };
         *last_sampled_at = Some(sampled_at);
+
+        for (family, state) in [
+            ("ipv4", snapshot.ipv4.as_ref()),
+            ("ipv6", snapshot.ipv6.as_ref()),
+        ] {
+            if let Some(state) = state {
+                if state.status == PublicIpStatus::Failed as i32 {
+                    tracing::warn!(
+                        job_id = %context.job_id,
+                        run_id = %context.run_id,
+                        family,
+                        error = ?state.message,
+                        "public IP collection failed for address family"
+                    );
+                } else {
+                    tracing::trace!(
+                        job_id = %context.job_id,
+                        run_id = %context.run_id,
+                        family,
+                        status = state.status,
+                        "public IP collection completed for address family"
+                    );
+                }
+            }
+        }
 
         Ok(TaskResult {
             sample: Some(SampleMetadata {

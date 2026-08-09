@@ -26,9 +26,9 @@ use axum::{
     routing::get,
 };
 use common::{
-    ADDRESS_ENV, DEFAULT_ADDRESS, DEFAULT_SERVER_DATA_DIR, ExampleMode, FIXED_REGISTRATION_TOKEN,
-    GRPC_PREFIX, HEALTH_PATH, REGISTRATION_TOKEN_ENV, REVOKE_AGENT_ENV, SERVER_DATA_DIR_ENV,
-    STATUS_PATH, TLS_CERT_ENV, TLS_KEY_ENV, WEBSOCKET_PATH,
+    ADDRESS_ENV, DEFAULT_ADDRESS, DEFAULT_SERVER_DATA_DIR, ExampleMode, GRPC_PREFIX, HEALTH_PATH,
+    REVOKE_AGENT_ENV, SERVER_DATA_DIR_ENV, STATUS_PATH, TLS_CERT_ENV, TLS_KEY_ENV, WEBSOCKET_PATH,
+    example_heartbeat_observe_window, example_heartbeat_policy, print_heartbeat_stats,
 };
 use smalux_protocol::{
     agent::v1::{
@@ -44,8 +44,7 @@ use smalux_protocol::{
     },
 };
 use support::{
-    AgentRegistry, ExampleResult, RegistrationError, load_or_generate_identity,
-    parse_registration_psk, public_key_hex,
+    AgentRegistry, ExampleResult, RegistrationError, load_or_generate_identity, public_key_hex,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -55,6 +54,7 @@ use tokio::{
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming, service::Routes};
+use tracing::{debug, error, info, trace, warn};
 
 #[path = "../common.rs"]
 mod common;
@@ -69,8 +69,6 @@ type ResponseStream = Pin<Box<dyn Stream<Item = Result<ProtocolFrame, Status>> +
 struct ExampleService {
     /// 可同时接受当前、下一把和上一把 Server 静态密钥的协议层密钥环。
     keyring: Arc<ServerKeyRing>,
-    /// 本次启动的一次性注册 Token 解码后的 PSK，仅用于 XXpsk3。
-    registration_psk: Arc<[u8; 32]>,
     /// Agent 公钥注册表；XXpsk3 写入，IK 查询。
     registry: Arc<AgentRegistry>,
     /// 给并发 RPC 分配可读编号，方便在控制台关联同一次握手的所有日志。
@@ -90,6 +88,7 @@ impl AgentTransport for ExampleService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         // code=0 和 message=ok 只表示服务可达，不表示 Token 或 Agent 身份有效。
+        debug!("received unauthenticated Server HealthCheck RPC");
         Ok(Response::new(HealthResponse {
             message: "ok".to_owned(),
             code: 0,
@@ -112,12 +111,17 @@ impl AgentTransport for ExampleService {
         // RPC 立即返回响应流；Noise 状态机在独立任务内按顺序读写。
         tokio::spawn(async move {
             println!("[server][rpc:{session_id}] opened; waiting for first handshake frame");
+            info!(session_id, "Server OpenSession RPC opened");
             match service
                 .handle_session(session_id, inbound, sender.clone())
                 .await
             {
-                Ok(()) => println!("[server][rpc:{session_id}] completed"),
+                Ok(()) => {
+                    info!(session_id, "Server OpenSession RPC completed");
+                    println!("[server][rpc:{session_id}] completed");
+                }
                 Err(error) => {
+                    error!(session_id, error = %error, "Server OpenSession RPC aborted");
                     eprintln!("[server][rpc:{session_id}] aborted: {error}");
                     // 握手外层只发送通用分类，绝不回显 Token、密钥或业务明文。
                     // Client 仍读取时会看到 ProtocolError；完全断开时发送失败是正常结果。
@@ -128,6 +132,10 @@ impl AgentTransport for ExampleService {
                         .await
                         .is_err()
                     {
+                        warn!(
+                            session_id,
+                            "Client closed before Server protocol error could be delivered"
+                        );
                         eprintln!(
                             "[server][rpc:{session_id}] Client already closed; error could not be delivered"
                         );
@@ -149,19 +157,32 @@ impl ExampleService {
         inbound: Streaming<ProtocolFrame>,
         sender: mpsc::Sender<Result<ProtocolFrame, Status>>,
     ) -> Result<(), TransportError> {
+        debug!(
+            session_id,
+            "starting Server Noise handshake and authorization flow"
+        );
         // 协议层完成带超时的 XXpsk3/IK 握手，并返回认证过的对端静态公钥。
+        let registry = Arc::clone(&self.registry);
         let incoming = ServerSessionAcceptor::default()
-            .accept_incoming(
+            .accept_incoming_with_psk_resolver(
                 inbound,
                 sender,
                 &self.keyring,
-                self.registration_psk.as_ref(),
+                move |token_id| async move {
+                    registry
+                        .resolve_registration_psk(&token_id)
+                        .map_err(|error| TransportError::Protocol(error.to_string()))
+                },
             )
             .await?;
         let (agent_id, mut session) = match incoming {
             IncomingSession::Registration(registration) => {
                 println!(
                     "[server][rpc:{session_id}] Noise handshake completed mode=RegistrationXxPsk3"
+                );
+                info!(
+                    session_id,
+                    "Server accepted XXpsk3; entering registration flow"
                 );
                 let Some(result) = self.register_agent(session_id, registration).await? else {
                     return Ok(());
@@ -172,12 +193,17 @@ impl ExampleService {
                 println!(
                     "[server][rpc:{session_id}] Noise handshake completed mode=AuthenticatedIk"
                 );
+                info!(
+                    session_id,
+                    "Server accepted IK; entering Agent authorization flow"
+                );
                 let agent_id = match self
                     .registry
                     .authenticate(authentication.peer_public_key().as_bytes())
                 {
                     Ok(agent_id) => agent_id,
                     Err(error) => {
+                        warn!(session_id, error = %error, "Agent authorization failed");
                         authentication
                             .reject(registration_secure_error(error))
                             .await?;
@@ -185,9 +211,23 @@ impl ExampleService {
                     }
                 };
                 println!("[server][rpc:{session_id}][ik] authenticated agent={agent_id}");
+                info!(session_id, agent_id = %agent_id, "Agent authorized for Server business session");
                 (agent_id, authentication.authorize())
             }
         };
+        // 注册后的 XX Session 和后续 IK Session 使用同一套可观测心跳参数。
+        session.set_heartbeat_policy(example_heartbeat_policy());
+        println!(
+            "[server][rpc:{session_id}][heartbeat] policy interval={:?} timeout={:?}",
+            session.heartbeat_policy().interval,
+            session.heartbeat_policy().timeout
+        );
+        debug!(
+            session_id,
+            heartbeat_interval = ?session.heartbeat_policy().interval,
+            heartbeat_timeout = ?session.heartbeat_policy().timeout,
+            "configured Server session heartbeat policy"
+        );
         // 注册成功的 XX 与后续 IK 都已经获得业务身份，共用同一个长期消息循环。
         match self.mode {
             ExampleMode::Manual => self.messages_loop_manual(&mut session, &agent_id).await,
@@ -205,10 +245,18 @@ impl ExampleService {
         mut registration: ServerRegistration,
     ) -> Result<Option<(String, TonicNoiseSession)>, TransportError> {
         println!("[server][rpc:{session_id}][xxpsk3] waiting for encrypted RegistrationRequest");
+        info!(
+            session_id,
+            "Server waiting for encrypted RegistrationRequest"
+        );
         let remote_public_key = registration.peer_public_key();
         let request = match registration.receive_request().await {
             Ok(request) => request,
             Err(_) => {
+                warn!(
+                    session_id,
+                    "Server received an invalid encrypted registration request"
+                );
                 registration
                     .reject(SecureError {
                         code: SecureErrorCode::InvalidMessage as i32,
@@ -225,6 +273,7 @@ impl ExampleService {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
+                warn!(session_id, error = %error, "Server rejected registration request");
                 registration
                     .reject(registration_secure_error(error))
                     .await?;
@@ -234,6 +283,12 @@ impl ExampleService {
         println!(
             "[server][rpc:{session_id}][xxpsk3] pending agent={} resumed={}",
             prepared.agent_id, prepared.already_committed
+        );
+        info!(
+            session_id,
+            agent_id = %prepared.agent_id,
+            resumed = prepared.already_committed,
+            "Server prepared Agent registration"
         );
         registration
             .prepare(prepared.registration_id, prepared.agent_id.clone())
@@ -247,6 +302,7 @@ impl ExampleService {
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
         let session = registration.complete(prepared.registration_id).await?;
         println!("[server][rpc:{session_id}][xxpsk3] committed agent={agent_id}");
+        info!(session_id, agent_id = %agent_id, "Server committed Agent registration");
         Ok(Some((agent_id, session)))
     }
 
@@ -263,6 +319,10 @@ impl ExampleService {
             })) = message.body
             else {
                 // 非 MessagesRequest 返回加密错误，但不关闭整个 Server。
+                warn!(
+                    agent_id,
+                    "Server received an unexpected business message type"
+                );
                 send_secure_error(
                     session,
                     SecureErrorCode::InvalidMessage,
@@ -274,6 +334,11 @@ impl ExampleService {
             println!(
                 "[server][noise] <- agent={agent_id} sequence={}",
                 request.sequence
+            );
+            debug!(
+                agent_id,
+                sequence = request.sequence,
+                "Server received encrypted metric batch"
             );
             // oneof payload 按类型映射，展示 bytes、string 和 typed Echo 的处理方式。
             let response_payload = request.payload.map(|payload| match payload {
@@ -302,8 +367,15 @@ impl ExampleService {
                     })),
                 })
                 .await?;
+            trace!(
+                agent_id,
+                sequence = request.sequence,
+                "Server sent encrypted metric ACK"
+            );
         }
+        print_heartbeat_stats("server", session.heartbeat_stats());
         println!("[server][noise] session closed agent={agent_id}");
+        info!(agent_id, "Server manual business loop closed");
         Ok(())
     }
 
@@ -313,20 +385,30 @@ impl ExampleService {
         session: TonicNoiseSession,
         agent_id: &str,
     ) -> Result<(), TransportError> {
+        info!(agent_id, "Server Driver business loop started");
         let mut running = SessionDriver::spawn(session, SessionDriverConfig::default());
+        let mut messages_seen = 0_u64;
         while let Some(event) = running.events.recv().await {
             let event = match event {
                 Ok(event) => event,
                 Err(TransportError::Closed) => {
+                    info!(agent_id, "Server Driver observed remote session close");
                     println!("[server][driver] session closed agent={agent_id}");
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    error!(agent_id, error = %error, "Server Driver received session error");
+                    return Err(error);
+                }
             };
             let SessionEvent::Messages(Messages {
                 body: Some(messages::Body::Request(request)),
             }) = event
             else {
+                warn!(
+                    agent_id,
+                    "Server Driver received an unexpected business event"
+                );
                 running
                     .handle
                     .send(SecureMessage {
@@ -341,6 +423,11 @@ impl ExampleService {
             println!(
                 "[server][driver] <- agent={agent_id} sequence={}",
                 request.sequence
+            );
+            debug!(
+                agent_id,
+                sequence = request.sequence,
+                "Server Driver received encrypted metric batch"
             );
             let response_payload = request.payload.map(|payload| match payload {
                 messages_request::Payload::BytesPayload(value) => {
@@ -366,6 +453,41 @@ impl ExampleService {
                     })),
                 })
                 .await?;
+            trace!(
+                agent_id,
+                sequence = request.sequence,
+                "Server Driver sent encrypted metric ACK"
+            );
+            messages_seen = messages_seen.saturating_add(1);
+
+            // 示例 Client 固定发送三条消息；收到第三条后等待 Driver 自动完成一次 Ping/Pong。
+            if messages_seen == 3 {
+                println!(
+                    "[server][driver] waiting for a heartbeat sample for {:?}",
+                    example_heartbeat_observe_window()
+                );
+                let deadline = tokio::time::Instant::now() + example_heartbeat_observe_window();
+                let heartbeat_stats = loop {
+                    let stats = running.handle.heartbeat_stats().await?;
+                    if stats.received_count > 0 || tokio::time::Instant::now() >= deadline {
+                        break stats;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                print_heartbeat_stats("server", heartbeat_stats);
+                running.handle.shutdown().await?;
+                running.task.await.map_err(|error| {
+                    TransportError::Protocol(format!("driver task failed: {error}"))
+                })?;
+                println!(
+                    "[server][driver] encrypted bidirectional stream completed agent={agent_id}"
+                );
+                info!(
+                    agent_id,
+                    "Server Driver business loop completed after example messages"
+                );
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -389,11 +511,13 @@ async fn open_websocket(upgrade: WebSocketUpgrade) -> impl IntoResponse {
 /// 逐帧回显文本和二进制消息，同时显式处理 Ping 与关闭帧。
 async fn websocket_echo(mut socket: WebSocket) {
     println!("[server][ws] connection opened");
+    info!("WebSocket connection opened");
     while let Some(frame) = socket.recv().await {
         // 接收错误表示连接已经不可继续，记录后结束本次 WebSocket，不影响其他路由。
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
+                warn!(error = %error, "WebSocket receive failed");
                 eprintln!("[server][ws] receive failed: {error}");
                 break;
             }
@@ -411,11 +535,13 @@ async fn websocket_echo(mut socket: WebSocket) {
             }
         };
         if let Err(error) = socket.send(response).await {
+            warn!(error = %error, "WebSocket send failed");
             eprintln!("[server][ws] send failed: {error}");
             break;
         }
     }
     println!("[server][ws] connection closed");
+    info!("WebSocket connection closed");
 }
 
 /// 恢复 Server 身份与注册表，组合 REST/WS/gRPC Router，并按配置选择 h2c 或 TLS。
@@ -429,6 +555,12 @@ async fn main() -> ExampleResult<()> {
     let data_dir = PathBuf::from(
         env::var(SERVER_DATA_DIR_ENV).unwrap_or_else(|_| DEFAULT_SERVER_DATA_DIR.to_owned()),
     );
+    info!(
+        address = %address,
+        ?mode,
+        data_dir = %data_dir.display(),
+        "starting Noise shared-port Server example"
+    );
     // Server 静态密钥首次生成后持久化，重启不能随意改变，否则已有 Agent 的 IK 会失败。
     let stored_server_identity = load_or_generate_identity(&data_dir.join("noise"))?;
     // support 返回原始字节，正式协议类型再次验证固定长度。
@@ -436,15 +568,11 @@ async fn main() -> ExampleResult<()> {
         &stored_server_identity.private_key,
         &stored_server_identity.public_key,
     )?;
-    // 为了便于反复手工测试，示例固定使用同一个 256 位 Token。
-    // 生产环境必须改为密码学安全的随机短期 Token，并在成功注册后立即作废。
-    let token = FIXED_REGISTRATION_TOKEN.to_owned();
-    // 同一个 Token 解码成 32 字节 PSK，直接参与 XXpsk3 握手认证。
-    let registration_psk = parse_registration_psk(&token)?;
-    // 注册表恢复旧 Agent，同时允许该 Token 成功注册一台新 Agent。
-    let registry = Arc::new(AgentRegistry::load(token.clone(), &data_dir)?);
+    // 只恢复此前显式签发的 Token；管理员必须从控制台执行 `token generate` 才能新增凭据。
+    let registry = Arc::new(AgentRegistry::load_without_token(&data_dir)?);
     // 可选变量允许启动前吊销 Agent，演示后续 IK 被拒绝。
     if let Ok(agent_id) = env::var(REVOKE_AGENT_ENV) {
+        info!(agent_id = %agent_id, "revoking Agent before starting example Server");
         println!(
             "[server][revoke] agent={agent_id} removed={}",
             registry.revoke(&agent_id)?
@@ -455,8 +583,6 @@ async fn main() -> ExampleResult<()> {
     let service = AgentTransportServer::new(ExampleService {
         // 密钥环由协议层管理，并允许后续平滑执行 Server 静态密钥轮换。
         keyring: Arc::new(ServerKeyRing::new(server_identity)),
-        // PSK 只保存在 Server 进程内存与管理员拿到的注册命令中。
-        registration_psk: Arc::new(registration_psk),
         // 注册表内部使用 Mutex 串行化注册、查询和吊销。
         registry: Arc::clone(&registry),
         next_session_id: Arc::new(AtomicU64::new(1)),
@@ -473,17 +599,15 @@ async fn main() -> ExampleResult<()> {
 
     println!("[server] Noise public key (Client learns it during XXpsk3): {server_public}");
     println!("[server] session mode={mode:?}");
-    println!("[server] registration command:");
-    // 首次 Client 只需要 Token，不再需要预置 Server 公钥。
-    println!("  $env:{REGISTRATION_TOKEN_ENV} = \"{token}\"");
-    println!("  cargo run -p smalux-protocol --example noise_shared_port_client");
+    println!("[server] run `token generate` to issue an Agent registration token");
     println!("[server] REST status: http://{address}{STATUS_PATH}");
     println!("[server] WebSocket echo: ws://{address}{WEBSOCKET_PATH}");
     println!("[server][console] type 'help' for interactive commands");
+    info!(address = %address, ?mode, "Server routes configured for REST, WebSocket and gRPC");
 
     // 控制台与网络 Server 并行，通过 oneshot 请求优雅关闭。
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    tokio::spawn(console_loop(Arc::clone(&registry), token, shutdown_sender));
+    tokio::spawn(console_loop(Arc::clone(&registry), shutdown_sender));
     // shutdown future 只等待一次信号，再交给当前 transport 停止接受新连接。
     let shutdown = async move {
         let _ = shutdown_receiver.await;
@@ -493,6 +617,7 @@ async fn main() -> ExampleResult<()> {
     match (env::var(TLS_CERT_ENV).ok(), env::var(TLS_KEY_ENV).ok()) {
         (None, None) => {
             println!("[server] listening on http://{address} (Noise still enabled)");
+            info!(address = %address, transport = "h2c", "Server is listening");
             // Axum 自动接受普通 HTTP/1 请求和 gRPC 所需的明文 HTTP/2 prior knowledge。
             let listener = TcpListener::bind(address).await?;
             axum::serve(listener, app)
@@ -506,6 +631,7 @@ async fn main() -> ExampleResult<()> {
                 fs::read(private_key)?,
             ));
             println!("[server] listening on https://{address} (TLS + Noise)");
+            info!(address = %address, transport = "tls", "Server is listening");
             // Noise 位于 TLS 内层，因此 TLS 开关不改变注册和 IK 代码路径。
             Server::builder()
                 .accept_http1(true)
@@ -514,17 +640,16 @@ async fn main() -> ExampleResult<()> {
                 .await?;
         }
         // 只设置一项是明确配置错误，禁止静默降级到明文。
-        _ => return Err(format!("{TLS_CERT_ENV} and {TLS_KEY_ENV} must be set together").into()),
+        _ => {
+            error!("only one of the Server TLS certificate and key variables is configured");
+            return Err(format!("{TLS_CERT_ENV} and {TLS_KEY_ENV} must be set together").into());
+        }
     }
     Ok(())
 }
 
 /// 运行一个只面向本地示例操作者的控制台，不暴露任何网络管理接口。
-async fn console_loop(
-    registry: Arc<AgentRegistry>,
-    token: String,
-    shutdown_sender: oneshot::Sender<()>,
-) {
+async fn console_loop(registry: Arc<AgentRegistry>, shutdown_sender: oneshot::Sender<()>) {
     // Tokio 异步 stdin 避免阻塞网络 runtime worker。
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     // Option 确保 oneshot sender 最多消费一次。
@@ -540,6 +665,7 @@ async fn console_loop(
                 println!(
                     "\n[server][console] standard input closed; network service remains active"
                 );
+                warn!("Server console stdin closed; network service remains active");
                 // 等待接收端被 Server 主任务释放，同时让 Sender 跨越 await 保持存活。
                 // 只调用 pending() 可能使编译器提前释放后续不再使用的 Sender，反而触发关闭。
                 if let Some(sender) = shutdown_sender.as_mut() {
@@ -550,6 +676,7 @@ async fn console_loop(
             Err(error) => {
                 // 单次控制台读取失败不影响网络服务，继续等待下一条输入。
                 eprintln!("[server][console] failed to read input: {error}");
+                warn!(error = %error, "Server console input failed");
                 continue;
             }
         };
@@ -559,23 +686,53 @@ async fn console_loop(
             "" => {}
             "help" => {
                 println!("  help                 show commands");
-                println!("  token                print the fixed example registration token");
-                println!("  agents               list registered Agent names");
-                println!("  revoke <agent>       revoke an Agent for future IK sessions");
+                println!("  token generate       issue a new one-Agent registration token");
+                println!("  token create         alias for token generate");
+                println!("  token list           list public registration token IDs");
+                println!("  token revoke <id>    revoke a registration token");
+                println!("  agents               list registered Agent IDs and names");
+                println!("  revoke <agent-id>    revoke an Agent for future IK sessions");
                 println!("  quit                 gracefully stop the example Server");
             }
-            "token" => println!("[server][console] registration token={token}"),
+            "token" | "token create" | "token generate" => {
+                match registry.issue_registration_token() {
+                    Ok(token) => {
+                        info!(
+                            "issued a registration token; token value is printed only for the example operator"
+                        );
+                        println!("[server][console] registration token={token}");
+                    }
+                    Err(error) => {
+                        error!(error = %error, "failed to issue registration token");
+                        eprintln!("[server][console] failed to issue token: {error}");
+                    }
+                }
+            }
+            "token list" => match registry.registration_token_ids() {
+                Ok(ids) => println!("[server][console] token IDs: {}", ids.join(", ")),
+                Err(error) => {
+                    warn!(error = %error, "failed to list registration token IDs");
+                    eprintln!("[server][console] failed to list tokens: {error}");
+                }
+            },
             "agents" => match registry.registered_agents() {
                 Ok(agents) if agents.is_empty() => {
                     println!("[server][console] no registered Agents")
                 }
                 Ok(agents) => {
-                    println!("[server][console] registered Agents: {}", agents.join(", "))
+                    println!("[server][console] registered Agents:");
+                    for agent in agents {
+                        println!("  id={} name={}", agent.agent_id, agent.name);
+                    }
                 }
-                Err(error) => eprintln!("[server][console] failed to list Agents: {error}"),
+                Err(error) => {
+                    warn!(error = %error, "failed to list registered Agents");
+                    eprintln!("[server][console] failed to list Agents: {error}");
+                }
             },
             "quit" | "exit" => {
                 println!("[server][console] graceful shutdown requested");
+                info!("Server graceful shutdown requested from console");
                 // 发送后立即返回，避免再次使用已消费的 oneshot sender。
                 if let Some(sender) = shutdown_sender.take() {
                     let _ = sender.send(());
@@ -586,7 +743,7 @@ async fn console_loop(
                 // 只截取固定前缀后的 Agent ID，不执行 shell 或动态命令。
                 let agent_id = command["revoke ".len()..].trim();
                 if agent_id.is_empty() {
-                    eprintln!("[server][console] usage: revoke <agent>");
+                    eprintln!("[server][console] usage: revoke <agent-id>");
                     continue;
                 }
                 match registry.revoke(agent_id) {
@@ -595,11 +752,26 @@ async fn console_loop(
                     ),
                     Ok(false) => println!("[server][console] agent not found: {agent_id}"),
                     Err(error) => {
+                        warn!(agent_id, error = %error, "failed to revoke Agent from console");
                         eprintln!("[server][console] failed to revoke {agent_id}: {error}")
                     }
                 }
             }
-            _ => eprintln!("[server][console] unknown command '{command}'; type 'help'"),
+            _ if command.starts_with("token revoke ") => {
+                let token_id = command["token revoke ".len()..].trim();
+                match registry.revoke_registration_token(token_id) {
+                    Ok(true) => println!("[server][console] revoked token ID={token_id}"),
+                    Ok(false) => println!("[server][console] token ID not found: {token_id}"),
+                    Err(error) => {
+                        warn!(token_id, error = %error, "failed to revoke registration token");
+                        eprintln!("[server][console] failed to revoke token: {error}");
+                    }
+                }
+            }
+            _ => {
+                warn!(command, "unknown Server console command");
+                eprintln!("[server][console] unknown command '{command}'; type 'help'");
+            }
         }
     }
 }

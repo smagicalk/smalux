@@ -4,6 +4,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tracing::{debug, info, warn};
 
 use crate::{
     agent::v1::{
@@ -13,7 +14,7 @@ use crate::{
     noise::{AgentRotationPrepared, KeyId, RotationId, ServerRotationPrepared},
 };
 
-use super::{SessionEvent, TonicNoiseSession, TransportError};
+use super::{HeartbeatStats, SessionEvent, TonicNoiseSession, TransportError};
 
 /// Driver 的有界队列容量配置。
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +53,9 @@ pub(crate) enum DriverCommand {
     RequireRekey {
         completed: oneshot::Sender<Result<u64, TransportError>>,
     },
+    HeartbeatStats {
+        completed: oneshot::Sender<Result<HeartbeatStats, TransportError>>,
+    },
 }
 
 /// 可克隆的会话发送句柄；真正的加密和 nonce 推进始终在 Driver task 内串行完成。
@@ -67,7 +71,10 @@ impl SessionHandle {
         self.commands
             .send(DriverCommand::Send { message, completed })
             .await
-            .map_err(|_| TransportError::Closed)?;
+            .map_err(|_| {
+                warn!("Noise session Driver command channel is closed while sending");
+                TransportError::Closed
+            })?;
         result.await.map_err(|_| TransportError::Closed)?
     }
 
@@ -108,29 +115,57 @@ impl SessionHandle {
 
     /// 手动发送加密 Ping；自动 Driver 通常会按 HeartbeatPolicy 自行发送。
     pub async fn ping(&self, nonce: u64) -> Result<(), TransportError> {
+        debug!(
+            nonce,
+            "queueing manual heartbeat ping in Noise session Driver"
+        );
         let (completed, result) = oneshot::channel();
         self.commands
             .send(DriverCommand::Ping { nonce, completed })
             .await
-            .map_err(|_| TransportError::Closed)?;
+            .map_err(|_| {
+                warn!(
+                    nonce,
+                    "Noise session Driver command channel is closed while pinging"
+                );
+                TransportError::Closed
+            })?;
         result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// Agent/initiator 立即发起当前连接的同步 rekey，并返回新 generation。
     pub async fn request_rekey(&self) -> Result<u64, TransportError> {
+        info!("queueing initiator Noise rekey in session Driver");
         let (completed, result) = oneshot::channel();
         self.commands
             .send(DriverCommand::RequestRekey { completed })
             .await
-            .map_err(|_| TransportError::Closed)?;
+            .map_err(|_| {
+                warn!("Noise session Driver command channel is closed while requesting rekey");
+                TransportError::Closed
+            })?;
         result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// Server/responder 通知 Agent 发起同步 rekey。
     pub async fn require_rekey(&self) -> Result<u64, TransportError> {
+        info!("queueing responder Noise rekey requirement in session Driver");
         let (completed, result) = oneshot::channel();
         self.commands
             .send(DriverCommand::RequireRekey { completed })
+            .await
+            .map_err(|_| {
+                warn!("Noise session Driver command channel is closed while requiring rekey");
+                TransportError::Closed
+            })?;
+        result.await.map_err(|_| TransportError::Closed)?
+    }
+
+    /// 查询 Driver 当前维护的心跳统计和最近一次 RTT 样本。
+    pub async fn heartbeat_stats(&self) -> Result<HeartbeatStats, TransportError> {
+        let (completed, result) = oneshot::channel();
+        self.commands
+            .send(DriverCommand::HeartbeatStats { completed })
             .await
             .map_err(|_| TransportError::Closed)?;
         result.await.map_err(|_| TransportError::Closed)?
@@ -188,6 +223,7 @@ impl SessionHandle {
 
     /// 请求 Driver 正常结束；已经进入 Tonic channel 的帧不会被撤回。
     pub async fn shutdown(&self) -> Result<(), TransportError> {
+        info!("requesting Noise session Driver shutdown");
         let (completed, result) = oneshot::channel();
         if self
             .commands
@@ -238,6 +274,11 @@ impl SessionDriver {
         session: TonicNoiseSession,
         config: SessionDriverConfig,
     ) -> (Self, SessionHandle, SessionEventReceiver) {
+        info!(
+            command_capacity = config.command_capacity.max(1),
+            event_capacity = config.event_capacity.max(1),
+            "created Noise session Driver"
+        );
         let (command_sender, commands) = mpsc::channel(config.command_capacity.max(1));
         let (events, event_receiver) = mpsc::channel(config.event_capacity.max(1));
         (
@@ -257,11 +298,14 @@ impl SessionDriver {
 
     /// 在当前 task 中运行到主动关闭、远端关闭或发生错误。
     pub async fn run(self) {
+        info!("running Noise session Driver task");
         self.session.run_driver(self.commands, self.events).await;
+        info!("Noise session Driver task stopped");
     }
 
     /// 创建并立即启动 Driver，适合不需要自定义 task 生命周期的调用方。
     pub fn spawn(session: TonicNoiseSession, config: SessionDriverConfig) -> RunningSession {
+        info!("spawning Noise session Driver task");
         let (driver, handle, events) = Self::new(session, config);
         let task = tokio::spawn(driver.run());
         RunningSession {

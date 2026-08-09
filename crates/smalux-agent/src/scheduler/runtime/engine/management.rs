@@ -14,6 +14,10 @@ impl SchedulerActor {
         options: JobOptions,
     ) -> Result<JobId, SchedulerError> {
         if self.jobs.len() >= self.config.max_jobs {
+            tracing::warn!(
+                max_jobs = self.config.max_jobs,
+                "agent scheduler rejected job because maximum job count was reached"
+            );
             return Err(SchedulerError::MaximumJobsReached(self.config.max_jobs));
         }
         validate_trigger(&trigger, &options, &self.config)?;
@@ -34,6 +38,7 @@ impl SchedulerActor {
         };
         let (coalescing, capacity) = effective_queue_policies(&trigger, &options);
         let next_run = first_run_at(&trigger, now)?;
+        let task_kind = task.inner.kind();
         self.jobs.insert(
             id,
             JobEntry {
@@ -76,6 +81,13 @@ impl SchedulerActor {
             job_id: id,
             version: generation,
         });
+        tracing::info!(
+            job_id = %id,
+            version = generation,
+            task_kind,
+            enabled,
+            "agent scheduler job added"
+        );
         Ok(id)
     }
 
@@ -246,6 +258,12 @@ impl SchedulerActor {
             self.cancel_job_version(job_id, expected_version);
         }
         self.emit(SchedulerEventKind::JobUpdated { job_id, version });
+        tracing::info!(
+            job_id = %job_id,
+            version,
+            task_kind = self.jobs[&job_id].task.kind(),
+            "agent scheduler job updated"
+        );
         Ok(self.snapshot(self.jobs.get(&job_id).unwrap()))
     }
 
@@ -278,6 +296,7 @@ impl SchedulerActor {
         self.schedule_normal(job_id, next, TimerKind::Normal);
         let version = self.jobs[&job_id].version;
         self.emit(SchedulerEventKind::JobEnabled { job_id, version });
+        tracing::info!(job_id = %job_id, version, "agent scheduler job enabled");
         Ok(self.snapshot(&self.jobs[&job_id]))
     }
 
@@ -290,6 +309,11 @@ impl SchedulerActor {
     ) -> Result<JobSnapshot, SchedulerError> {
         self.check_version(job_id, expected_version)?;
         self.force_disable(job_id, reason)?;
+        tracing::info!(
+            job_id = %job_id,
+            expected_version,
+            "agent scheduler job disabled"
+        );
         Ok(self.snapshot(&self.jobs[&job_id]))
     }
 
@@ -314,6 +338,11 @@ impl SchedulerActor {
             job_id,
             version: expected_version,
         });
+        tracing::info!(
+            job_id = %job_id,
+            version = expected_version,
+            "agent scheduler job deleted"
+        );
         Ok(())
     }
 
@@ -341,6 +370,10 @@ impl SchedulerActor {
         self.emit(SchedulerEventKind::SchedulerConfigUpdated {
             revision: self.config_revision,
         });
+        tracing::info!(
+            revision = self.config_revision,
+            "agent scheduler configuration updated"
+        );
         Ok(SchedulerConfigSnapshot {
             revision: self.config_revision,
             config: self.config.clone(),

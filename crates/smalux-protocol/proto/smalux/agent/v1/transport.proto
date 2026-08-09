@@ -75,6 +75,10 @@ message NoiseHandshake {
 
   // snow 产生的原始 Noise handshake message；不得由业务层解析或修改。
   bytes payload = 3;
+
+  // XXpsk3 首帧携带的公开注册凭据 ID，Server 用它选择对应 PSK。
+  // 该值不是秘密；IK 和 XXpsk3 后续帧必须为空。
+  string registration_token_id = 4;
 }
 
 // Noise 建立后的内部消息总封装。

@@ -376,10 +376,16 @@ where
     }
 
     async fn execute(&self, context: TaskContext) -> TaskRunResult {
+        let kind = self.kind();
+        log_task_started(kind, &context);
         // 先运行 Task；Task 失败时没有业务结果，因此不会调用 Sink。
         let result = match self.task.run(context.clone()).await {
             Ok(result) => result,
-            Err(error) => return map_task_error(error),
+            Err(error) => {
+                let outcome = map_task_error(error);
+                log_task_finished(kind, &context, &outcome);
+                return outcome;
+            }
         };
         // Adapter 在统一位置补充 Job、Run、尝试次数和时间信息，采集器无需重复组装。
         let report = TaskReport {
@@ -392,7 +398,7 @@ where
             result: Some(result),
         };
         // 交付结果与 Task 执行结果分开映射，防止交付失败触发昂贵采集的重复执行。
-        match self.sink.report(report).await {
+        let outcome = match self.sink.report(report).await {
             Ok(()) => TaskRunResult::OutputDelivered,
             Err(CallbackError::Transient(error)) => {
                 TaskRunResult::CallbackTransient(format!("{error:#}"))
@@ -400,7 +406,9 @@ where
             Err(CallbackError::Permanent(error)) => {
                 TaskRunResult::CallbackPermanent(format!("{error:#}"))
             }
-        }
+        };
+        log_task_finished(kind, &context, &outcome);
+        outcome
     }
 }
 
@@ -430,10 +438,14 @@ where
 
     /// 执行 ActionTask 并映射公共错误。
     async fn execute(&self, context: TaskContext) -> TaskRunResult {
-        match self.task.run(context).await {
+        let kind = self.kind();
+        log_task_started(kind, &context);
+        let outcome = match self.task.run(context.clone()).await {
             Ok(()) => TaskRunResult::Completed,
             Err(error) => map_task_error(error),
-        }
+        };
+        log_task_finished(kind, &context, &outcome);
+        outcome
     }
 }
 
@@ -460,14 +472,22 @@ where
 
     /// 先执行 ValueTask，再把成功值发送到有界 Channel。
     async fn execute(&self, context: TaskContext) -> TaskRunResult {
-        let value = match self.task.run(context).await {
+        let kind = self.kind();
+        log_task_started(kind, &context);
+        let value = match self.task.run(context.clone()).await {
             Ok(value) => value,
-            Err(error) => return map_task_error(error),
+            Err(error) => {
+                let outcome = map_task_error(error);
+                log_task_finished(kind, &context, &outcome);
+                return outcome;
+            }
         };
-        match self.sender.send(value).await {
+        let outcome = match self.sender.send(value).await {
             Ok(()) => TaskRunResult::OutputDelivered,
             Err(_) => TaskRunResult::ChannelClosed,
-        }
+        };
+        log_task_finished(kind, &context, &outcome);
+        outcome
     }
 }
 
@@ -495,11 +515,17 @@ where
 
     /// 先执行 ValueTask，再异步调用 Callback 消费成功值。
     async fn execute(&self, context: TaskContext) -> TaskRunResult {
+        let kind = self.kind();
+        log_task_started(kind, &context);
         let value = match self.task.run(context.clone()).await {
             Ok(value) => value,
-            Err(error) => return map_task_error(error),
+            Err(error) => {
+                let outcome = map_task_error(error);
+                log_task_finished(kind, &context, &outcome);
+                return outcome;
+            }
         };
-        match self.callback.call(context, value).await {
+        let outcome = match self.callback.call(context.clone(), value).await {
             Ok(()) => TaskRunResult::OutputDelivered,
             Err(CallbackError::Transient(error)) => {
                 TaskRunResult::CallbackTransient(format!("{error:#}"))
@@ -507,7 +533,77 @@ where
             Err(CallbackError::Permanent(error)) => {
                 TaskRunResult::CallbackPermanent(format!("{error:#}"))
             }
+        };
+        log_task_finished(kind, &context, &outcome);
+        outcome
+    }
+}
+
+/// 记录统一 Task 入口，避免每个采集器重复实现相同的生命周期日志。
+fn log_task_started(kind: &'static str, context: &TaskContext) {
+    tracing::trace!(
+        task_kind = kind,
+        job_id = %context.job_id,
+        version = context.version,
+        run_id = %context.run_id,
+        attempt = context.attempt,
+        "agent task started"
+    );
+}
+
+/// 记录统一 Task 结果；业务输出本身不写入日志，只记录交付状态。
+fn log_task_finished(kind: &'static str, context: &TaskContext, outcome: &TaskRunResult) {
+    match outcome {
+        TaskRunResult::Completed | TaskRunResult::OutputDelivered => {
+            tracing::trace!(
+                task_kind = kind,
+                job_id = %context.job_id,
+                version = context.version,
+                run_id = %context.run_id,
+                attempt = context.attempt,
+                outcome = task_outcome_name(outcome),
+                "agent task finished"
+            );
         }
+        TaskRunResult::TaskTransient(error)
+        | TaskRunResult::TaskPermanent(error)
+        | TaskRunResult::CallbackTransient(error)
+        | TaskRunResult::CallbackPermanent(error) => {
+            tracing::warn!(
+                task_kind = kind,
+                job_id = %context.job_id,
+                version = context.version,
+                run_id = %context.run_id,
+                attempt = context.attempt,
+                outcome = task_outcome_name(outcome),
+                error = %error,
+                "agent task failed"
+            );
+        }
+        TaskRunResult::ChannelClosed => {
+            tracing::warn!(
+                task_kind = kind,
+                job_id = %context.job_id,
+                version = context.version,
+                run_id = %context.run_id,
+                attempt = context.attempt,
+                outcome = "channel_closed",
+                "agent task output channel closed"
+            );
+        }
+    }
+}
+
+/// 返回不包含业务错误正文的稳定结果标签，供结构化日志聚合使用。
+fn task_outcome_name(outcome: &TaskRunResult) -> &'static str {
+    match outcome {
+        TaskRunResult::Completed => "completed",
+        TaskRunResult::OutputDelivered => "output_delivered",
+        TaskRunResult::TaskTransient(_) => "task_transient",
+        TaskRunResult::TaskPermanent(_) => "task_permanent",
+        TaskRunResult::CallbackTransient(_) => "callback_transient",
+        TaskRunResult::CallbackPermanent(_) => "callback_permanent",
+        TaskRunResult::ChannelClosed => "channel_closed",
     }
 }
 

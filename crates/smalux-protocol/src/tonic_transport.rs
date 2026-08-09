@@ -13,23 +13,50 @@ mod driver;
 mod server;
 mod session;
 
-pub use client::{AgentPendingRegistration, AgentProtocolClient, AgentRegistration};
+pub use client::{
+    AgentPendingRegistration, AgentProtocolClient, AgentRegistration, AgentTransportRpcClient,
+};
 pub use driver::{
     RunningSession, SessionDriver, SessionDriverConfig, SessionEventReceiver, SessionHandle,
 };
 pub use server::{
     IncomingSession, ServerAuthentication, ServerPendingSession, ServerRegistration,
-    ServerSessionAcceptor,
+    ServerSessionAcceptor, validate_registration_token_id,
 };
 pub use session::{
-    HeartbeatPolicy, MaintenanceResult, MaintenanceStatus, RekeyPolicy, SessionEvent,
-    TonicNoiseSession,
+    HeartbeatPolicy, HeartbeatSample, HeartbeatStats, MaintenanceResult, MaintenanceStatus,
+    RekeyPolicy, SessionEvent, TonicNoiseSession,
 };
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use crate::agent::v1::{ProtocolError, ProtocolErrorCode, SecureErrorCode};
 use crate::noise::NoiseError;
+
+/// 日志中允许直接展示的外部标识最大字节数。
+///
+/// 该上限只约束日志表示，不改变协议字段或业务存储格式。
+const MAX_EXTERNAL_LOG_LABEL_BYTES: usize = 128;
+
+/// 返回适合写入日志的注册 Token ID。
+///
+/// Token ID 虽然是公开选择器，但 Server 在认证前就会收到它，因此仍然属于不可信输入。
+/// 这里只保留短的 ASCII 标识；控制字符、非 ASCII 字符和超长值统一替换为长度摘要，防止
+/// 伪造日志行或用单个握手帧放大日志文件。
+fn registration_token_id_log_label(token_id: &str) -> Cow<'_, str> {
+    if token_id.is_empty() {
+        return Cow::Borrowed("<none>");
+    }
+    let is_safe = token_id.len() <= MAX_EXTERNAL_LOG_LABEL_BYTES
+        && token_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if is_safe {
+        Cow::Borrowed(token_id)
+    } else {
+        Cow::Owned(format!("<invalid-token-id:{}-bytes>", token_id.len()))
+    }
+}
 
 #[derive(Debug)]
 /// Tonic + Noise 调用过程中对业务层稳定暴露的错误分类。
@@ -142,5 +169,31 @@ impl From<http::uri::InvalidUri> for TransportError {
     /// 允许 endpoint/prefix origin 解析错误使用 `?` 统一上抛。
     fn from(error: http::uri::InvalidUri) -> Self {
         Self::InvalidUri(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registration_token_id_log_label;
+
+    #[test]
+    fn registration_token_log_label_preserves_short_safe_ids() {
+        assert_eq!(
+            registration_token_id_log_label("0123456789abcdef0123456789abcdef"),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(registration_token_id_log_label(""), "<none>");
+    }
+
+    #[test]
+    fn registration_token_log_label_redacts_untrusted_text() {
+        assert_eq!(
+            registration_token_id_log_label("valid-prefix\nforged-log-line"),
+            "<invalid-token-id:28-bytes>"
+        );
+        assert_eq!(
+            registration_token_id_log_label(&"a".repeat(129)),
+            "<invalid-token-id:129-bytes>"
+        );
     }
 }

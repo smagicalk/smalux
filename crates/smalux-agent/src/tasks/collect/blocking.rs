@@ -61,16 +61,41 @@ where
         T: Send + 'static,
         F: FnOnce(&mut C) -> anyhow::Result<T> + Send + 'static,
     {
+        let job_id = context.job_id;
+        let run_id = context.run_id;
+        let version = context.version;
+        let attempt = context.attempt;
+        tracing::debug!(
+            job_id = %job_id,
+            run_id = %run_id,
+            version,
+            attempt,
+            "blocking collector waiting for state"
+        );
         let cancellation = context.cancellation;
         let inner = self.inner.clone();
         let guard = tokio::select! {
             _ = cancellation.cancelled() => {
+                tracing::debug!(
+                    job_id = %job_id,
+                    run_id = %run_id,
+                    version,
+                    attempt,
+                    "blocking collector cancelled before state lock"
+                );
                 return Err(TaskError::Transient(anyhow!("collection cancelled before start")));
             }
             guard = inner.lock_owned() => guard,
         };
 
         if guard.failed {
+            tracing::error!(
+                job_id = %job_id,
+                run_id = %run_id,
+                version,
+                attempt,
+                "blocking collector state is unavailable after a panic"
+            );
             return Err(TaskError::Permanent(anyhow!(
                 "collector state is unavailable after a previous panic"
             )));
@@ -101,12 +126,51 @@ where
         .await;
 
         match execution {
-            Ok(Ok(collected)) => Ok(collected),
-            Ok(Err(error)) => Err(TaskError::Transient(error)),
-            Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
-            Err(error) => Err(TaskError::Transient(anyhow!(
-                "blocking collection did not complete: {error}"
-            ))),
+            Ok(Ok(collected)) => {
+                tracing::trace!(
+                    job_id = %job_id,
+                    run_id = %run_id,
+                    version,
+                    attempt,
+                    sample_interval_ms = ?collected.sample_interval_ms,
+                    "blocking collector completed"
+                );
+                Ok(collected)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    run_id = %run_id,
+                    version,
+                    attempt,
+                    error = %error,
+                    "blocking collector query failed"
+                );
+                Err(TaskError::Transient(error))
+            }
+            Err(error) if error.is_panic() => {
+                tracing::error!(
+                    job_id = %job_id,
+                    run_id = %run_id,
+                    version,
+                    attempt,
+                    "blocking collector panicked"
+                );
+                resume_unwind(error.into_panic())
+            }
+            Err(error) => {
+                tracing::error!(
+                    job_id = %job_id,
+                    run_id = %run_id,
+                    version,
+                    attempt,
+                    error = %error,
+                    "blocking collector task did not complete"
+                );
+                Err(TaskError::Transient(anyhow!(
+                    "blocking collection did not complete: {error}"
+                )))
+            }
         }
     }
 }
