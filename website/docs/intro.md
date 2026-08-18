@@ -17,6 +17,7 @@ Smalux 是一个使用 Rust 编写的轻量监控探针项目。它把系统信�
 | 目标 | 推荐入口 |
 | --- | --- |
 | 第一次了解项目 | [项目概览](getting-started/overview.md) |
+| 按调用链阅读实现 | [项目概览](getting-started/overview.md) → [注册与会话](protocol/session.md) → [Job 与 Task](usage/job-task.md) |
 | 在本机编译运行 | [快速开始](getting-started/quick-start.md) |
 | 了解 Agent 采集能力 | [采集任务](usage/collectors.md) |
 | 配置远程调度 | [Job 与 Task](usage/job-task.md) |

@@ -51,6 +51,7 @@ crates/smalux-server/
 │   └── state.rs                # Agent gRPC 共享状态和容量限制
 └── src/database/
     ├── connection.rs           # SeaORM 连接池、配置校验和迁移入口
+    ├── agent_registration.rs   # Token、注册事务、Agent 授权与吊销的原子持久化
     ├── entity/                 # agents、registration_tokens 等实体
     ├── migration/              # 数据库 schema
     └── keyring.rs              # Server keyring 快照读写

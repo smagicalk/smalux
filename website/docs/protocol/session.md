@@ -162,3 +162,173 @@ Protocol 当前不提供跨 Session 的 TaskReport ACK。重连只恢复身份�
 | 授权 | Token 无效、Agent 吊销、租户拒绝 | 业务注册表，不应由 Noise 自动放行。 |
 | 会话 | 心跳超时、解密失败、远端关闭 | 丢弃 Session，重新建立 IK。 |
 | 业务 | revision 冲突、不支持 Task | 返回结构化结果，会话通常可以继续。 |
+
+## 从 RPC 到业务会话的逐步调用
+
+### Client 侧入口
+
+`AgentProtocolClient` 是应用应该优先使用的接口。它保存 endpoint、gRPC 前缀和握手超时，
+不会替调用方保存长期 identity 或数据库状态：
+
+```rust
+let mut client = AgentProtocolClient::new("https://agent.example.com");
+client.set_grpc_prefix("/api/v1/grpc");
+client.set_handshake_timeout(Duration::from_secs(5));
+
+// 首次注册：prepare 返回 pending，持久化完成后再 commit。
+let pending = client
+    .prepare_registration(identity, &psk, credential, "edge-01".to_owned())
+    .await?;
+store.save_pending(&pending)?;
+let registered = pending.commit().await?;
+store.save_committed(&registered)?;
+
+// 后续连接：只读取本地 identity 和已保存的 Server 公钥。
+let session = client.connect(&identity, server_public_key).await?;
+```
+
+实际调用顺序是：
+
+```text
+AgentProtocolClient::prepare_registration
+  -> validate_registration_token_id
+  -> ClientXxHandshake::start
+  -> AgentProtocolClient::open
+  -> AgentTransportRpcClient::open_session
+  -> next_handshake(message 2)
+  -> ClientXxHandshake::receive_message2
+  -> send(message 3)
+  -> TonicNoiseSession::send(RegistrationRequest)
+  -> TonicNoiseSession::receive(RegistrationPrepared)
+  -> AgentPendingRegistration
+  -> AgentPendingRegistration::commit
+```
+
+`register_agent` 是 `prepare_registration(...).commit()` 的便捷组合，适合不需要在两阶段之间
+自行落库的简单调用；需要崩溃恢复的正式 Agent 应使用显式 prepare/保存/commit 顺序。
+
+### Server 侧入口
+
+Server 的 Tonic adapter 只处理 RPC 资源和握手前错误；握手完成后的规则集中在 Session Policy：
+
+```text
+AgentTransport::open_session(request)
+  -> AgentState::try_acquire_session
+  -> create bounded outbound channel
+  -> ServerSessionAcceptor::accept_incoming_with_psk_resolver
+       -> next_handshake(first frame)
+       -> XXpsk3: AgentRegistrar::resolve_registration_psk(token_id)
+       -> IK: ServerKeyRing::find_active(responder_key_id)
+       -> IncomingSession::Registration / Authentication
+  -> AgentServer::handle_established_session
+```
+
+握手失败时 Server 只能通过未加密的 `ProtocolError` 返回粗粒度错误；握手成功后，注册、授权和
+业务错误才通过加密 `SecureError` 返回。Token、PSK、私钥和数据库错误的详细文本不会进入外层帧。
+
+## 注册四阶段的真实状态
+
+XXpsk3 建立加密通道后，`server_service/session.rs` 按以下顺序调用：
+
+```text
+IncomingSession::Registration
+  -> AgentState::try_acquire_registration
+  -> ServerRegistration::receive_request
+  -> AgentRegistrar::prepare_registration
+       -> ServerDatabase::load_active_registration_psk / prepare_agent_registration
+       -> 写入 pending registration
+  -> ServerRegistration::prepare(registration_id, agent_id)
+  -> ServerRegistration::wait_for_commit(registration_id, 10s)
+  -> AgentRegistrar::commit_registration
+       -> 原子激活 Agent + 提交 registration + 消费 Token
+  -> ServerRegistration::complete(registration_id)
+  -> handle_business_messages
+```
+
+四个协议阶段的含义不同：
+
+| 阶段 | Server 持久化状态 | Agent 可以做什么 |
+| --- | --- | --- |
+| Request | 尚未生成可恢复事务，或正在校验 | 等待 Prepared；失败时重新建立 XXpsk3。 |
+| Prepared | 有 `registration_id`、Agent ID 和过期时间 | 必须先保存 identity、Server 公钥、Agent ID、事务 ID。 |
+| Commit | Server 校验事务 ID 并原子激活 | 可在断线后查询/重试同一事务，不应生成另一 identity。 |
+| Committed | Agent active，Token 已消费 | 标记本地 committed，后续使用 IK。 |
+
+`wait_for_commit` 超时不会把 pending 直接当成成功；数据库 commit 失败也只返回固定的
+`registration service is unavailable`。这样不会出现“客户端已经收到成功、Server 却没有激活”的假状态。
+
+## IK 授权调用
+
+IK 只证明 Agent 拥有长期私钥，业务授权仍由 Server 的注册中心完成。当前实现使用一次数据库
+快照同时得到三种结果，避免先查吊销再查授权的重复查询：
+
+```text
+IncomingSession::Authentication
+  -> authentication.peer_public_key()
+  -> AgentRegistrar::authorize_agent(public_key)
+       -> ServerDatabase::find_agent_authorization(public_key)
+          -> Authorized(agent_id)
+          -> Revoked
+          -> Unauthorized
+  -> Authorized: authentication.authorize()
+  -> Revoked/Unauthorized: reject(AgentNotAuthorized)
+  -> Database error: reject(Internal)
+```
+
+即使 Noise IK 成功，`active` 状态和 `revoked_at == None` 仍是进入业务循环的必要条件。授权结果
+不会把数据库实体泄漏到 Protocol；`AgentAuthorizationError` 是 Server service 的稳定错误接口，
+数据库 adapter 只负责返回持久化快照。
+
+## Driver 的调用和所有权
+
+建立好的 `TonicNoiseSession` 只能由一个 owner 推进，因为每一帧都会改变 Noise nonce、心跳时间和
+rekey generation。并发业务应把它交给 `SessionDriver`：
+
+```rust
+let running = SessionDriver::spawn(session, SessionDriverConfig::default());
+let handle = running.handle.clone();
+let mut events = running.events;
+
+handle.send_task_report(report).await?;
+handle.send_job_command(command).await?;
+handle.request_rekey().await?;
+
+while let Some(event) = events.recv().await {
+    match event? {
+        SessionEvent::JobCommand(command) => {
+            let result = job_controller.apply(command).await;
+            handle.send_job_command_result(result).await?;
+        }
+        SessionEvent::TaskReport(report) => store_report(report).await?,
+        SessionEvent::Messages(messages) => handle_messages(messages).await?,
+        SessionEvent::KeyRotation(message) => handle_rotation(message).await?,
+        SessionEvent::Registration(_) | SessionEvent::JobCommandResult(_) => {}
+    }
+}
+```
+
+`SessionHandle` 可以 clone，但 `SessionEventReceiver` 只有一个消费者。发送接口把业务消息放入有界
+队列，Driver 在内部串行调用 `TonicNoiseSession::send`；队列满时等待形成反压。手动模式则由调用方
+独占 `&mut TonicNoiseSession`，适合示例和严格顺序的流程，不适合多个采集任务共享。
+
+## 心跳、rekey 和关闭顺序
+
+Driver 或手动循环接收消息时，会调用 `receive` 并在需要时执行维护动作：
+
+```text
+receive / receive_event
+  -> 读取 ProtocolFrame
+  -> 解密 SecureMessage
+  -> 消费 Ping/Pong 或 rekey 控制帧
+  -> 返回 SessionEvent
+
+perform_maintenance
+  -> maintenance_status
+  -> ping (interval 到期)
+  -> request_rekey (initiator 达到 max_age/max_frames)
+  -> HeartbeatTimeout / TransportError
+```
+
+应用关闭时应先停止新的 `send_task_report`，再调用 `SessionHandle::shutdown`，等待 Driver 退出，
+最后销毁当前 Session。任何发送失败、远端关闭或心跳超时都应丢弃整条 Session；不要复用已经推进
+过 nonce 的对象，也不要把同一密文重新发送到新连接。

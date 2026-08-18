@@ -154,14 +154,15 @@ runtime.shutdown().await?;
 
 | 命令 | 作用 | 版本要求 |
 | --- | --- | --- |
-| `ReplaceAllJobs` | 首次同步或检测到目录断档后完整对账。 | `catalog_revision` 必须连续。 |
+| `ReplaceAllJobs` | 首次同步或检测到目录断档后完整对账。 | 接受不低于当前版本的权威快照。 |
 | `UpsertJob` | 创建或完整替换一个远程 Job。 | `revision` 必须严格递增。 |
 | `DeleteJob` | 删除一个远程所有权 Job。 | 使用 `expected_revision` 乐观锁。 |
 | `RunJobNow` | 立即执行一次，不改变正常周期相位。 | 不修改 Job `revision`。 |
 
 每条命令必须有稳定的 `command_id`。相同 `command_id` 重试时返回第一次结果，不会重复执行
-`RunJobNow`。`catalog_revision`、Job `revision` 和 Scheduler `generation` 是三个不同版本，
-不能互相替代。
+`RunJobNow`。增量命令的 `catalog_revision` 必须严格连续；`ReplaceAllJobs` 使用 Server 的
+权威快照版本，可以跨过断档，但不能回滚。`catalog_revision`、Job `revision` 和 Scheduler
+`generation` 是三个不同版本，不能互相替代。
 
 ### 本地 Job 与远程 Job
 

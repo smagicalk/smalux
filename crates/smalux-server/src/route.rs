@@ -35,6 +35,7 @@ pub(crate) fn build_app_router(app_state: AppState) -> anyhow::Result<Router> {
 #[cfg(test)]
 mod tests {
     use axum::{
+        Router,
         body::Body,
         body::to_bytes,
         http::{Request, StatusCode},
@@ -57,16 +58,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn top_level_router_assigns_and_propagates_request_id() {
-        let config = test_config();
+    async fn test_router() -> Router {
         let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
             .await
             .expect("test database should connect");
-        let app_state = AppState::build(config, database)
+        let app_state = AppState::build(test_config(), database)
             .await
             .expect("test app state should build");
-        let router = build_app_router(app_state).expect("server router should build");
+        build_app_router(app_state).expect("server router should build")
+    }
+
+    #[tokio::test]
+    async fn top_level_router_assigns_and_propagates_request_id() {
+        let router = test_router().await;
         let response = router
             .oneshot(
                 Request::builder()
@@ -82,14 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn top_level_router_preserves_incoming_request_id() {
-        let config = test_config();
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("test database should connect");
-        let app_state = AppState::build(config, database)
-            .await
-            .expect("test app state should build");
-        let router = build_app_router(app_state).expect("server router should build");
+        let router = test_router().await;
         let response = router
             .oneshot(
                 Request::builder()
@@ -112,14 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn frontend_health_returns_the_server_date() {
-        let config = test_config();
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("test database should connect");
-        let app_state = AppState::build(config, database)
-            .await
-            .expect("test app state should build");
-        let router = build_app_router(app_state).expect("server router should build");
+        let router = test_router().await;
 
         let response = router
             .oneshot(

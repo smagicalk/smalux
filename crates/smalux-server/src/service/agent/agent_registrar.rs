@@ -1,127 +1,16 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::database::{
-    ServerDatabase,
-    entity::{agent, agent_registration, registration_token},
-};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, Set, TransactionTrait,
+    DatabaseError, PendingAgentRegistration, PersistedAgentAuthorization,
+    PrepareAgentRegistrationError, ServerDatabase,
 };
 use smalux_protocol::{noise::NoisePublicKey, tonic_transport::validate_registration_token_id};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
-/// XXpsk3 `RegistrationPrepared` 阶段需要暂存的注册事务。
-///
-/// `registration_id` 和预分配 Agent ID 来自数据库注册事务，不能只保存在当前进程内。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingRegistration {
-    pub(crate) registration_id: [u8; 16],
-    pub(crate) agent_id: String,
-}
-
-/// IK 握手通过后供业务层使用的授权结果。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AuthorizedAgent {
-    pub(crate) agent_id: String,
-    pub(crate) public_key: NoisePublicKey,
-}
-
-/// 数据库存储的稳定 Agent 生命周期值；数据库仍使用字符串以兼容三种后端。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentStatus {
-    Active,
-    Revoked,
-}
-
-impl AgentStatus {
-    const ACTIVE: &'static str = "active";
-    const REVOKED: &'static str = "revoked";
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            Self::ACTIVE => Some(Self::Active),
-            Self::REVOKED => Some(Self::Revoked),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => Self::ACTIVE,
-            Self::Revoked => Self::REVOKED,
-        }
-    }
-}
-
-/// 数据库存储的稳定注册 Token 生命周期值。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenStatus {
-    Active,
-    Used,
-    Revoked,
-}
-
-impl TokenStatus {
-    const ACTIVE: &'static str = "active";
-    const USED: &'static str = "used";
-    const REVOKED: &'static str = "revoked";
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            Self::ACTIVE => Some(Self::Active),
-            Self::USED => Some(Self::Used),
-            Self::REVOKED => Some(Self::Revoked),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => Self::ACTIVE,
-            Self::Used => Self::USED,
-            Self::Revoked => Self::REVOKED,
-        }
-    }
-}
-
-/// 数据库存储的稳定注册事务状态值。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegistrationStatus {
-    Prepared,
-    Committed,
-    Expired,
-}
-
-impl RegistrationStatus {
-    const PREPARED: &'static str = "prepared";
-    const COMMITTED: &'static str = "committed";
-    const EXPIRED: &'static str = "expired";
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            Self::PREPARED => Some(Self::Prepared),
-            Self::COMMITTED => Some(Self::Committed),
-            Self::EXPIRED => Some(Self::Expired),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepared => Self::PREPARED,
-            Self::Committed => Self::COMMITTED,
-            Self::Expired => Self::EXPIRED,
-        }
-    }
-}
 
 /// prepare 阶段可安全映射到协议错误码的失败类型。
 ///
-/// 数据库和本地状态错误保留在 `Internal` 的 source 中供 Server 日志诊断，但其
-/// 详细文本绝不能回传给 Agent。
+/// 名称格式属于协议输入规则，数据库的 Token/身份冲突和持久化错误由底层错误映射而来。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PrepareRegistrationError {
     #[error("registration token is invalid")]
@@ -133,9 +22,46 @@ pub(crate) enum PrepareRegistrationError {
     #[error("Agent name is invalid")]
     InvalidAgentName,
     #[error("registration database operation failed")]
-    Database(#[from] DbErr),
+    Database(#[from] DatabaseError),
     #[error("registration state is invalid")]
     Internal(#[source] anyhow::Error),
+}
+
+impl From<PrepareAgentRegistrationError> for PrepareRegistrationError {
+    fn from(error: PrepareAgentRegistrationError) -> Self {
+        match error {
+            PrepareAgentRegistrationError::InvalidToken => Self::InvalidToken,
+            PrepareAgentRegistrationError::TokenAlreadyUsed => Self::TokenAlreadyUsed,
+            PrepareAgentRegistrationError::AgentAlreadyRegistered => Self::AgentAlreadyRegistered,
+            PrepareAgentRegistrationError::Database(error) => Self::Database(error),
+            PrepareAgentRegistrationError::Internal(error) => Self::Internal(error),
+        }
+    }
+}
+/// XXpsk3 `RegistrationPrepared` 阶段需要暂存的注册事务。
+///
+/// 该类型由数据库层创建，服务层只把它附着到 Noise 会话并在 commit 时回传。
+pub(crate) type PendingRegistration = PendingAgentRegistration;
+
+/// IK 握手通过后供业务层使用的授权结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorizedAgent {
+    pub(crate) agent_id: String,
+    pub(crate) public_key: NoisePublicKey,
+}
+
+/// IK 身份不能进入业务会话的结构化原因。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AgentAuthorizationError {
+    /// 数据库中明确记录该 Agent 已被吊销。
+    #[error("Agent is revoked")]
+    Revoked,
+    /// 公钥未知、状态损坏或 Agent 尚未激活。
+    #[error("Agent is not authorized")]
+    Unauthorized,
+    /// 授权快照查询失败。
+    #[error("Agent authorization database operation failed")]
+    Database(#[from] DatabaseError),
 }
 
 pub(crate) struct AgentRegistrar {
@@ -143,8 +69,6 @@ pub(crate) struct AgentRegistrar {
     database: Arc<ServerDatabase>,
 }
 
-/// pending 注册允许 Agent 断线重试的最长时间。
-const PENDING_REGISTRATION_TTL_MICROS: i64 = 10 * 60 * 1_000_000;
 pub(crate) const REGISTRATION_CLEANUP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
@@ -159,21 +83,7 @@ impl AgentRegistrar {
 
     /// 删除已经过期且尚未提交的注册尝试，释放公钥和 Token 的唯一索引。
     pub(crate) async fn cleanup_expired_registrations(&self) -> anyhow::Result<u64> {
-        let now = unix_timestamp_micros()?;
-        let prepared = agent_registration::Entity::delete_many()
-            .filter(agent_registration::Column::Status.eq(RegistrationStatus::Prepared.as_str()))
-            .filter(agent_registration::Column::ExpiresAt.lt(now))
-            .filter(agent_registration::Column::AgentId.is_null())
-            .exec(self.database.connection())
-            .await?
-            .rows_affected;
-        let expired = agent_registration::Entity::delete_many()
-            .filter(agent_registration::Column::Status.eq(RegistrationStatus::Expired.as_str()))
-            .filter(agent_registration::Column::AgentId.is_null())
-            .exec(self.database.connection())
-            .await?
-            .rows_affected;
-        let deleted = prepared + expired;
+        let deleted = self.database.cleanup_expired_agent_registrations().await?;
         if deleted > 0 {
             tracing::info!(deleted, "cleaned expired Agent registration attempts");
         }
@@ -214,21 +124,11 @@ impl AgentRegistrar {
     ) -> anyhow::Result<[u8; 32]> {
         validate_registration_token_id(token_id)
             .map_err(|_| anyhow::anyhow!("registration token is invalid"))?;
-        let token = registration_token::Entity::find_by_id(token_id)
-            .one(self.database.connection())
+        let psk = self
+            .database
+            .load_active_registration_psk(token_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("registration token is invalid"))?;
-        let now = unix_timestamp_micros()?;
-        if TokenStatus::parse(&token.status) != Some(TokenStatus::Active)
-            || token.used_at.is_some()
-            || token.expires_at.is_some_and(|expires_at| expires_at <= now)
-        {
-            anyhow::bail!("registration token is invalid");
-        }
-        let psk: [u8; 32] = token
-            .psk
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("registration token PSK is invalid"))?;
         tracing::debug!(
             token_id_len = token_id.len(),
             database_backend = self.database.backend_label(),
@@ -253,110 +153,23 @@ impl AgentRegistrar {
         if request_token_id != token_id {
             return Err(PrepareRegistrationError::InvalidToken);
         }
-
-        let public_key = agent_public_key.as_bytes().to_vec();
-        let now = unix_timestamp_micros().map_err(PrepareRegistrationError::Internal)?;
-        let transaction = self.database.connection().begin().await?;
-
-        let token = registration_token::Entity::find_by_id(token_id)
-            .one(&transaction)
-            .await?
-            .ok_or(PrepareRegistrationError::InvalidToken)?;
-        if TokenStatus::parse(&token.status) == Some(TokenStatus::Used) || token.used_at.is_some() {
-            return Err(PrepareRegistrationError::TokenAlreadyUsed);
-        }
-        if TokenStatus::parse(&token.status) != Some(TokenStatus::Active)
-            || token.expires_at.is_some_and(|expires_at| expires_at <= now)
-            || !constant_time_eq(&token.psk, &request_psk)
-        {
-            return Err(PrepareRegistrationError::InvalidToken);
-        }
-
-        // 首次注册还没有 Agent 行，只能使用已认证的公钥定位注册尝试。
-        // 过期尝试在同一事务中删除，从而释放公钥和 Token 的唯一约束。
-        if let Some(existing_registration) = agent_registration::Entity::find()
-            .filter(agent_registration::Column::AgentPublicKey.eq(public_key.clone()))
-            .one(&transaction)
-            .await?
-        {
-            if registration_is_expired(&existing_registration, now) {
-                agent_registration::Entity::delete_by_id(&existing_registration.registration_id)
-                    .exec(&transaction)
-                    .await?;
-            } else if existing_registration.token_id == token_id
-                && matches!(
-                    RegistrationStatus::parse(&existing_registration.status),
-                    Some(RegistrationStatus::Prepared | RegistrationStatus::Committed)
-                )
-            {
-                let registration_id = parse_registration_id(&existing_registration.registration_id)
-                    .map_err(PrepareRegistrationError::Internal)?;
-                let agent_id = existing_registration.reserved_agent_id.clone();
-                transaction.commit().await?;
-                return Ok(PendingRegistration {
-                    registration_id,
-                    agent_id,
-                });
-            } else {
-                return Err(PrepareRegistrationError::AgentAlreadyRegistered);
-            }
-        }
-
-        // 兼容旧数据：已有 Agent 记录即使缺少注册事务，也不能被另一个 Token 绑定。
-        if agent::Entity::find()
-            .filter(agent::Column::PublicKey.eq(public_key.clone()))
-            .one(&transaction)
-            .await?
-            .is_some()
-        {
-            return Err(PrepareRegistrationError::AgentAlreadyRegistered);
-        }
-
-        if let Some(existing_token_registration) = agent_registration::Entity::find()
-            .filter(agent_registration::Column::TokenId.eq(token_id))
-            .one(&transaction)
-            .await?
-        {
-            if registration_is_expired(&existing_token_registration, now) {
-                agent_registration::Entity::delete_by_id(
-                    &existing_token_registration.registration_id,
-                )
-                .exec(&transaction)
-                .await?;
-            } else {
-                return Err(PrepareRegistrationError::TokenAlreadyUsed);
-            }
-        }
-        let registration_uuid = Uuid::new_v4();
-        let registration_id = registration_uuid.into_bytes();
-        let agent_id = Uuid::new_v4().to_string();
-        agent_registration::ActiveModel {
-            registration_id: Set(registration_uuid.to_string()),
-            token_id: Set(token_id.to_owned()),
-            agent_id: Set(None),
-            reserved_agent_id: Set(agent_id.clone()),
-            agent_name: Set(agent_name.to_owned()),
-            agent_public_key: Set(public_key),
-            status: Set(RegistrationStatus::Prepared.as_str().to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            expires_at: Set(Some(now + PENDING_REGISTRATION_TTL_MICROS)),
-            committed_at: Set(None),
-        }
-        .insert(&transaction)
-        .await?;
-        transaction.commit().await?;
+        let pending = self
+            .database
+            .prepare_agent_registration(
+                token_id,
+                &request_psk,
+                agent_public_key.as_bytes(),
+                agent_name,
+            )
+            .await?;
 
         tracing::info!(
-            registration_id = %registration_uuid,
-            agent_id = %agent_id,
+            registration_id = %uuid::Uuid::from_bytes(pending.registration_id),
+            agent_id = %pending.agent_id,
             agent_key_id = ?agent_public_key.key_id(),
             "prepared database-backed Agent registration"
         );
-        Ok(PendingRegistration {
-            registration_id,
-            agent_id,
-        })
+        Ok(pending)
     }
 
     /// 原子提交注册：激活 Agent、完成注册事务并一次性消费 Token。
@@ -367,88 +180,10 @@ impl AgentRegistrar {
         &self,
         pending: &PendingRegistration,
     ) -> anyhow::Result<()> {
-        let registration_id = Uuid::from_bytes(pending.registration_id).to_string();
-        let now = unix_timestamp_micros()?;
-        let transaction = self.database.connection().begin().await?;
-        let registration = agent_registration::Entity::find_by_id(&registration_id)
-            .one(&transaction)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("registration transaction is unknown"))?;
-        if registration.reserved_agent_id != pending.agent_id {
-            anyhow::bail!("registration transaction does not match Agent");
-        }
-
-        // committed 是终态；网络确认丢失后的重试不应再次消费 Token。
-        if RegistrationStatus::parse(&registration.status) == Some(RegistrationStatus::Committed) {
-            let agent_id = registration
-                .agent_id
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("committed registration has no Agent ID"))?;
-            let existing_agent = agent::Entity::find_by_id(agent_id)
-                .one(&transaction)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("committed Agent record is missing"))?;
-            if AgentStatus::parse(&existing_agent.status) != Some(AgentStatus::Active) {
-                anyhow::bail!("committed Agent is not active");
-            }
-            transaction.commit().await?;
-            return Ok(());
-        }
-        if RegistrationStatus::parse(&registration.status) != Some(RegistrationStatus::Prepared)
-            || registration
-                .expires_at
-                .is_some_and(|expires_at| expires_at <= now)
-        {
-            anyhow::bail!("registration transaction is not committable");
-        }
-
-        let token = registration_token::Entity::find_by_id(&registration.token_id)
-            .one(&transaction)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("registration token is invalid"))?;
-        if TokenStatus::parse(&token.status) != Some(TokenStatus::Active)
-            || token.used_at.is_some()
-            || token.expires_at.is_some_and(|expires_at| expires_at <= now)
-        {
-            anyhow::bail!("registration token is invalid");
-        }
-
-        if agent::Entity::find_by_id(&registration.reserved_agent_id)
-            .one(&transaction)
-            .await?
-            .is_some()
-        {
-            anyhow::bail!("reserved Agent ID is already in use");
-        }
-
-        agent::ActiveModel {
-            agent_id: Set(registration.reserved_agent_id.clone()),
-            name: Set(registration.agent_name.clone()),
-            public_key: Set(registration.agent_public_key.clone()),
-            status: Set(AgentStatus::Active.as_str().to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            revoked_at: Set(None),
-        }
-        .insert(&transaction)
-        .await?;
-
-        let mut committed_registration: agent_registration::ActiveModel = registration.into();
-        committed_registration.agent_id = Set(Some(pending.agent_id.clone()));
-        committed_registration.status = Set(RegistrationStatus::Committed.as_str().to_owned());
-        committed_registration.updated_at = Set(now);
-        committed_registration.committed_at = Set(Some(now));
-        committed_registration.update(&transaction).await?;
-
-        let mut consumed_token: registration_token::ActiveModel = token.into();
-        consumed_token.status = Set(TokenStatus::Used.as_str().to_owned());
-        consumed_token.updated_at = Set(now);
-        consumed_token.used_at = Set(Some(now));
-        consumed_token.update(&transaction).await?;
-        transaction.commit().await?;
+        self.database.commit_agent_registration(pending).await?;
 
         tracing::info!(
-            registration_id = %registration_id,
+            registration_id = %uuid::Uuid::from_bytes(pending.registration_id),
             agent_id = %pending.agent_id,
             "committed database-backed Agent registration"
         );
@@ -462,58 +197,30 @@ impl AgentRegistrar {
     pub(crate) async fn authorize_agent(
         &self,
         agent_public_key: NoisePublicKey,
-    ) -> anyhow::Result<AuthorizedAgent> {
-        let agent = agent::Entity::find()
-            .filter(agent::Column::PublicKey.eq(agent_public_key.as_bytes().to_vec()))
-            .one(self.database.connection())
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Agent is not authorized"))?;
-        if AgentStatus::parse(&agent.status) != Some(AgentStatus::Active)
-            || agent.revoked_at.is_some()
-        {
-            anyhow::bail!("Agent is not authorized");
-        }
+    ) -> Result<AuthorizedAgent, AgentAuthorizationError> {
+        let authorization = self
+            .database
+            .find_agent_authorization(agent_public_key.as_bytes())
+            .await?;
+        let agent_id = match authorization {
+            PersistedAgentAuthorization::Authorized(agent_id) => agent_id,
+            PersistedAgentAuthorization::Revoked => {
+                return Err(AgentAuthorizationError::Revoked);
+            }
+            PersistedAgentAuthorization::Unauthorized => {
+                return Err(AgentAuthorizationError::Unauthorized);
+            }
+        };
         tracing::debug!(
-            agent_id = %agent.agent_id,
+            agent_id = %agent_id,
             agent_key_id = ?agent_public_key.key_id(),
             "authorized Agent by its Noise identity"
         );
         Ok(AuthorizedAgent {
-            agent_id: agent.agent_id,
+            agent_id,
             public_key: agent_public_key,
         })
     }
-
-    /// 检查 Agent 是否已经被吊销；吊销结果应优先于业务消息处理。
-    ///
-    /// 未登记公钥返回 `false`，因为“未知身份”和“已知但已吊销”是两个不同状态；
-    /// 调用方仍必须继续调用 [`Self::authorize_agent`]，不能把 `false` 当作已授权。
-    pub(crate) async fn is_revoked(
-        &self,
-        agent_public_key: NoisePublicKey,
-    ) -> anyhow::Result<bool> {
-        let agent = agent::Entity::find()
-            .filter(agent::Column::PublicKey.eq(agent_public_key.as_bytes().to_vec()))
-            .one(self.database.connection())
-            .await?;
-        let revoked = agent.as_ref().is_some_and(|agent| {
-            AgentStatus::parse(&agent.status) == Some(AgentStatus::Revoked)
-                || agent.revoked_at.is_some()
-        });
-        tracing::debug!(
-            agent_key_id = ?agent_public_key.key_id(),
-            agent_id = agent.as_ref().map(|agent| agent.agent_id.as_str()),
-            revoked,
-            "checked Agent revocation state"
-        );
-        Ok(revoked)
-    }
-}
-
-/// 返回统一的 Unix 微秒时间戳，供 Token 和注册事务进行跨数据库比较。
-fn unix_timestamp_micros() -> anyhow::Result<i64> {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    Ok(duration.as_micros().try_into()?)
 }
 
 /// Agent 名称沿用 Example 的保守字符集，避免后续进入路径、日志或标签时需要二次清洗。
@@ -558,34 +265,6 @@ fn hex_nibble(value: u8) -> Result<u8, PrepareRegistrationError> {
     }
 }
 
-/// 用固定循环比较数据库 PSK 和请求 PSK，避免根据首个不同字节提前返回。
-fn constant_time_eq(expected: &[u8], actual: &[u8; 32]) -> bool {
-    if expected.len() != actual.len() {
-        return false;
-    }
-    expected
-        .iter()
-        .zip(actual)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-/// 将数据库 UUID 字符串恢复为协议固定的 16 字节事务 ID。
-fn parse_registration_id(value: &str) -> anyhow::Result<[u8; 16]> {
-    Ok(Uuid::parse_str(value)?.into_bytes())
-}
-
-/// 判断注册尝试是否已经进入可清理状态。
-fn registration_is_expired(registration: &agent_registration::Model, now: i64) -> bool {
-    RegistrationStatus::parse(&registration.status) == Some(RegistrationStatus::Expired)
-        || (RegistrationStatus::parse(&registration.status) == Some(RegistrationStatus::Prepared)
-            && registration
-                .expires_at
-                .is_some_and(|expires_at| expires_at <= now))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -598,7 +277,7 @@ mod tests {
     };
     use smalux_protocol::noise::NoisePublicKey;
 
-    use super::AgentRegistrar;
+    use super::{AgentAuthorizationError, AgentRegistrar};
 
     async fn registrar_with_token() -> AgentRegistrar {
         let database = Arc::new(
@@ -894,7 +573,10 @@ mod tests {
             .prepare_registration("token-test", &token, public_key, "agent-three")
             .await
             .expect("prepare should succeed");
-        assert!(registrar.authorize_agent(public_key).await.is_err());
+        assert!(matches!(
+            registrar.authorize_agent(public_key).await,
+            Err(AgentAuthorizationError::Unauthorized)
+        ));
 
         registrar
             .commit_registration(&pending)
@@ -906,12 +588,6 @@ mod tests {
             .expect("active Agent should authorize");
         assert_eq!(authorized.agent_id, pending.agent_id);
         assert_eq!(authorized.public_key, public_key);
-        assert!(
-            !registrar
-                .is_revoked(public_key)
-                .await
-                .expect("lookup should work")
-        );
 
         let model = agent::Entity::find_by_id(&pending.agent_id)
             .one(registrar.database.connection())
@@ -926,12 +602,9 @@ mod tests {
             .await
             .expect("Agent should revoke");
 
-        assert!(
-            registrar
-                .is_revoked(public_key)
-                .await
-                .expect("lookup should work")
-        );
-        assert!(registrar.authorize_agent(public_key).await.is_err());
+        assert!(matches!(
+            registrar.authorize_agent(public_key).await,
+            Err(AgentAuthorizationError::Revoked)
+        ));
     }
 }

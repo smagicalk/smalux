@@ -9,7 +9,9 @@
 //!
 //! # 版本模型
 //!
-//! - `catalog_revision` 是 Server 侧远程 Job 集合的顺序号，变更命令必须严格 `+1`；
+//! - 增量 `catalog_revision` 是 Server 侧远程 Job 集合的顺序号，必须严格 `+1`；
+//! - `ReplaceAllJobs.catalog_revision` 是 Server 的权威快照版本，可以跨过丢失的增量，
+//!   但不能回滚到 Agent 当前版本之前；
 //! - `JobDefinition.revision` 是单个 Job 的业务配置版本，更新时必须递增；
 //! - `JobSnapshot.version` 是 Scheduler 内部的并发控制 generation，每次修改都会变化。
 //!
@@ -17,106 +19,21 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use smalux_protocol::agent::v1 as proto;
 use uuid::Uuid;
 
-use crate::{
-    scheduler::{
-        CapacityPolicy, ExecutionRetryPolicy, FailurePolicy, JobId, JobOptions, JobPatch,
-        JobPriority, JobSnapshot, JobState, MisfirePolicy, PatchValue, ReportingTask,
-        RescheduleMode, RetryCondition, Schedule, Scheduler, TaskBinding, TaskReportSink, Trigger,
-        TriggerCoalescing,
-    },
-    tasks::collect::{
-        CpuTask, DiskIoTask, HostTask, LoadTask, LocalIpTask, MemoryTask, NetworkIoTask, ProbeTask,
-        ProcessTask, PublicIpTask, SocketTask, SystemTask,
-    },
+use crate::scheduler::{
+    JobId, JobOptions, JobPatch, JobSnapshot, JobState, PatchValue, RescheduleMode, Scheduler,
+    TaskBinding, TaskReportSink, Trigger,
 };
 
-/// 已通过协议边界校验、可以安装到 Scheduler 的完整 Job。
-///
-/// “编译”只表示单个定义已经完成解析和类型转换，不会修改 Scheduler。
-pub(crate) struct CompiledJob {
-    /// Server 分配的稳定 Job UUID，同时也是 Scheduler 的主键。
-    pub(crate) id: JobId,
-    /// Server 维护的单 Job 业务版本，随 [`TaskReport`](proto::TaskReport) 上报。
-    pub(crate) revision: u64,
-    /// 安装后是否立即产生新的计划执行。
-    pub(crate) enabled: bool,
-    /// 已解析为 Scheduler 强类型的时间规则和超时策略。
-    pub(crate) trigger: Trigger,
-    /// 已合并默认值并完成范围校验的运行策略。
-    pub(crate) options: JobOptions,
-    /// 已绑定采集实现、业务 revision 和统一结果出口的类型擦除任务。
-    pub(crate) task: TaskBinding,
-}
+mod compiler;
 
-/// 根据固定 Proto Task 类型创建实现代码，并绑定统一结果出口。
-pub(crate) struct TaskFactory {
-    /// 所有固定采集 Task 共用的报告出口；具体实现可写 Channel、磁盘或网络。
-    sink: Arc<dyn TaskReportSink>,
-}
-
-impl TaskFactory {
-    /// 创建固定 Task 工厂；工厂自身不持有 Scheduler 或连接。
-    pub(crate) fn new(sink: Arc<dyn TaskReportSink>) -> Self {
-        Self { sink }
-    }
-
-    /// 将 Proto `oneof task` 映射到唯一的本地实现并完成配置校验。
-    ///
-    /// 返回的 [`TaskBinding`] 已经擦除具体类型，可以直接存入 Scheduler。
-    pub(crate) fn build(
-        &self,
-        definition: &proto::TaskDefinition,
-        job_revision: u64,
-    ) -> anyhow::Result<TaskBinding> {
-        use proto::task_definition::Task;
-
-        // `oneof` 在解码后仍可能为空，因此必须在协议边界显式拒绝。
-        let task = definition
-            .task
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("task definition is required"))?;
-        // 每个 Proto 分支只对应一个内置实现，Server 不能指定任意 Rust 类型。
-        match task {
-            Task::System(config) => Ok(self.bind(SystemTask::with_config(config), job_revision)),
-            Task::Cpu(_) => Ok(self.bind(CpuTask::new(), job_revision)),
-            Task::Memory(_) => Ok(self.bind(MemoryTask::new(), job_revision)),
-            Task::Load(_) => Ok(self.bind(LoadTask::new(), job_revision)),
-            Task::Host(_) => Ok(self.bind(HostTask::new(), job_revision)),
-            Task::DiskIo(config) => Ok(self.bind(DiskIoTask::with_config(config), job_revision)),
-            Task::NetworkIo(config) => {
-                Ok(self.bind(NetworkIoTask::with_config(config), job_revision))
-            }
-            Task::LocalIp(config) => Ok(self.bind(LocalIpTask::with_config(config), job_revision)),
-            Task::PublicIp(config) => {
-                Ok(self.bind(PublicIpTask::with_config(config)?, job_revision))
-            }
-            Task::Process(config) => {
-                Ok(self.bind(ProcessTask::try_with_config(config)?, job_revision))
-            }
-            Task::Socket(config) => Ok(self.bind(SocketTask::with_config(config)?, job_revision)),
-            Task::Probe(config) => Ok(self.bind(ProbeTask::try_with_config(config)?, job_revision)),
-        }
-    }
-
-    /// 把具体采集器、业务版本和结果出口封装成 Scheduler 可执行对象。
-    fn bind<T: ReportingTask>(&self, task: T, job_revision: u64) -> TaskBinding {
-        tracing::debug!(
-            task_kind = task.kind(),
-            job_revision,
-            "agent task binding created"
-        );
-        TaskBinding::reporting(Arc::new(task), job_revision, self.sink.clone())
-    }
-}
+use compiler::{CompiledJob, TaskFactory, compile_job, parse_uuid};
 
 #[derive(Debug, Clone, Copy)]
 struct ManagedJob {
@@ -139,7 +56,17 @@ struct ControllerState {
     cache_order: VecDeque<Uuid>,
 }
 
-/// 应用 Server 下发的 Proto Job 命令；连接、重连和本地持久化由调用方负责。
+/// 应用 Server 下发的 Proto Job 命令。
+///
+/// 控制器只负责把协议命令转换为 Scheduler 操作，并维护“远程 Job 目录”的版本和
+/// 所有权索引。网络连接、断线重连，以及把目录版本持久化到磁盘或数据库，仍由调用方负责。
+///
+/// # 目录版本规则
+///
+/// - `UpsertJob` 与 `DeleteJob` 是增量变更，版本必须恰好为当前版本加一；
+/// - 增量出现断档时，返回 `RESYNC_REQUIRED`，调用方应请求 Server 下发 `ReplaceAllJobs`；
+/// - `ReplaceAllJobs` 是权威快照，版本可高于当前版本以覆盖断档；相同版本可安全重放；
+/// - 低于当前版本的快照会被拒绝，防止过期 Server 状态覆盖较新的 Agent 目录。
 pub struct JobController {
     /// 本地调度器句柄；命令最终都通过该公开接口生效。
     scheduler: Scheduler,
@@ -172,6 +99,7 @@ impl JobController {
                 return command_error(
                     &command.command_id,
                     0,
+                    proto::JobCommandStatus::Rejected,
                     proto::JobCommandErrorCode::InvalidCommand,
                     error,
                 );
@@ -266,7 +194,7 @@ impl JobController {
             Some(Action::Delete(value)) => self.delete(state, value).await,
             Some(Action::RunNow(value)) => self.run_now(state, value).await,
             Some(Action::ReplaceAll(value)) => self.replace_all(state, value).await,
-            None => Err((
+            None => Err(ControlError::rejected(
                 proto::JobCommandErrorCode::InvalidCommand,
                 anyhow::anyhow!("job command action is required"),
             )),
@@ -280,9 +208,13 @@ impl JobController {
                 job: status,
                 error: None,
             },
-            Err((code, error)) => {
-                command_error(&command.command_id, state.catalog_revision, code, error)
-            }
+            Err(error) => command_error(
+                &command.command_id,
+                state.catalog_revision,
+                error.status,
+                error.code,
+                error.error,
+            ),
         }
     }
 
@@ -306,7 +238,10 @@ impl JobController {
                     catalog_revision = command.catalog_revision,
                     "agent rejected invalid job definition"
                 );
-                return Err((proto::JobCommandErrorCode::InvalidJob, error));
+                return Err(ControlError::rejected(
+                    proto::JobCommandErrorCode::InvalidJob,
+                    error,
+                ));
             }
         };
         let status = self.upsert_compiled(state, compiled, true).await?;
@@ -326,7 +261,7 @@ impl JobController {
             if compiled.revision < current.revision
                 || (require_increase && compiled.revision == current.revision)
             {
-                return Err((
+                return Err(ControlError::rejected(
                     proto::JobCommandErrorCode::RevisionConflict,
                     anyhow::anyhow!("job revision must increase"),
                 ));
@@ -363,7 +298,7 @@ impl JobController {
                 .await
                 .map_err(scheduler_error)?
                 .ok_or_else(|| {
-                    (
+                    ControlError::rejected(
                         proto::JobCommandErrorCode::SchedulerUnavailable,
                         anyhow::anyhow!("installed job is missing"),
                     )
@@ -386,18 +321,19 @@ impl JobController {
         command: &proto::DeleteJob,
     ) -> ControlResult<Option<proto::JobStatus>> {
         require_next_catalog(state, command.catalog_revision)?;
-        let id = parse_uuid(&command.job_id, "job_id")
-            .map_err(|error| (proto::JobCommandErrorCode::InvalidCommand, error))?;
+        let id = parse_uuid(&command.job_id, "job_id").map_err(|error| {
+            ControlError::rejected(proto::JobCommandErrorCode::InvalidCommand, error)
+        })?;
         // 只允许删除远程所有权索引中的 Job，避免误删本地任务。
         let current = state.remote_jobs.get(&id).copied().ok_or_else(|| {
-            (
+            ControlError::rejected(
                 proto::JobCommandErrorCode::NotFound,
                 anyhow::anyhow!("remote job was not found"),
             )
         })?;
         // expected_revision 是业务层乐观锁，不是 Scheduler generation。
         if command.expected_revision != current.revision {
-            return Err((
+            return Err(ControlError::rejected(
                 proto::JobCommandErrorCode::RevisionConflict,
                 anyhow::anyhow!("expected revision does not match"),
             ));
@@ -417,16 +353,17 @@ impl JobController {
         state: &mut ControllerState,
         command: &proto::RunJobNow,
     ) -> ControlResult<Option<proto::JobStatus>> {
-        let id = parse_uuid(&command.job_id, "job_id")
-            .map_err(|error| (proto::JobCommandErrorCode::InvalidCommand, error))?;
+        let id = parse_uuid(&command.job_id, "job_id").map_err(|error| {
+            ControlError::rejected(proto::JobCommandErrorCode::InvalidCommand, error)
+        })?;
         let current = state.remote_jobs.get(&id).copied().ok_or_else(|| {
-            (
+            ControlError::rejected(
                 proto::JobCommandErrorCode::NotFound,
                 anyhow::anyhow!("remote job was not found"),
             )
         })?;
         if command.expected_revision != current.revision {
-            return Err((
+            return Err(ControlError::rejected(
                 proto::JobCommandErrorCode::RevisionConflict,
                 anyhow::anyhow!("expected revision does not match"),
             ));
@@ -455,15 +392,16 @@ impl JobController {
         state: &mut ControllerState,
         command: &proto::ReplaceAllJobs,
     ) -> ControlResult<Option<proto::JobStatus>> {
-        require_next_catalog(state, command.catalog_revision)?;
+        require_replace_all_catalog(state, command.catalog_revision)?;
         // 第一阶段只解析和校验全部定义，避免普通配置错误导致部分应用。
         let mut ids = HashSet::new();
         let mut compiled_jobs = Vec::with_capacity(command.jobs.len());
         for job in &command.jobs {
-            let id = parse_uuid(&job.job_id, "job_id")
-                .map_err(|error| (proto::JobCommandErrorCode::InvalidJob, error))?;
+            let id = parse_uuid(&job.job_id, "job_id").map_err(|error| {
+                ControlError::rejected(proto::JobCommandErrorCode::InvalidJob, error)
+            })?;
             if !ids.insert(id) {
-                return Err((
+                return Err(ControlError::rejected(
                     proto::JobCommandErrorCode::InvalidJob,
                     anyhow::anyhow!("replace_all contains duplicate job_id"),
                 ));
@@ -472,7 +410,10 @@ impl JobController {
                 Ok(compiled) => compiled,
                 Err(error) => {
                     tracing::warn!(error = %error, "agent rejected invalid job in replace-all");
-                    return Err((proto::JobCommandErrorCode::InvalidJob, error));
+                    return Err(ControlError::rejected(
+                        proto::JobCommandErrorCode::InvalidJob,
+                        error,
+                    ));
                 }
             });
         }
@@ -501,7 +442,36 @@ impl JobController {
     }
 }
 
-type ControlResult<T> = Result<T, (proto::JobCommandErrorCode, anyhow::Error)>;
+type ControlResult<T> = Result<T, ControlError>;
+
+/// 控制器命令执行失败时返回的内部错误。
+///
+/// `status` 与 `code` 分开保存：目录断档需要返回 `RESYNC_REQUIRED`，普通的
+/// Job revision 冲突仍然只是 `REJECTED`。两者都可能使用 `REVISION_CONFLICT` 错误码，
+/// 因此 Server 必须根据 `status` 决定下一步：仅 `RESYNC_REQUIRED` 时请求完整快照。
+struct ControlError {
+    status: proto::JobCommandStatus,
+    code: proto::JobCommandErrorCode,
+    error: anyhow::Error,
+}
+
+impl ControlError {
+    fn rejected(code: proto::JobCommandErrorCode, error: anyhow::Error) -> Self {
+        Self {
+            status: proto::JobCommandStatus::Rejected,
+            code,
+            error,
+        }
+    }
+
+    fn resync(error: anyhow::Error) -> Self {
+        Self {
+            status: proto::JobCommandStatus::ResyncRequired,
+            code: proto::JobCommandErrorCode::RevisionConflict,
+            error,
+        }
+    }
+}
 
 /// 返回 Job 命令的稳定动作名称，日志不记录完整 Proto 内容。
 fn command_action_name(action: Option<&proto::job_command::Action>) -> &'static str {
@@ -514,12 +484,31 @@ fn command_action_name(action: Option<&proto::job_command::Action>) -> &'static 
     }
 }
 
-/// 要求集合变更命令连续到达，发现丢包或乱序时让 Server 重新同步。
+/// 要求增量集合变更命令连续到达，发现丢包或乱序时让 Server 重新同步。
+///
+/// 例如 Agent 当前目录为版本 4 而收到版本 6 的 `UpsertJob` 时，不能猜测版本 5 的内容；
+/// 这里返回 `RESYNC_REQUIRED`，保留当前目录版本 4，等待 Server 发送权威快照。
 fn require_next_catalog(state: &ControllerState, revision: u64) -> ControlResult<()> {
     if revision != state.catalog_revision + 1 {
-        return Err((
+        return Err(ControlError::resync(anyhow::anyhow!(
+            "catalog revision must be exactly current + 1"
+        )));
+    }
+    Ok(())
+}
+
+/// 校验全量目录版本。
+///
+/// 全量目录是 Server 的权威快照，可以跨过丢失的增量版本；相同版本允许重放，
+/// 旧版本则拒绝，避免过期快照回滚 Agent 当前目录。版本 0 没有可排序的业务含义，
+/// 也一律拒绝。
+fn require_replace_all_catalog(state: &ControllerState, revision: u64) -> ControlResult<()> {
+    if revision == 0 || revision < state.catalog_revision {
+        return Err(ControlError::rejected(
             proto::JobCommandErrorCode::RevisionConflict,
-            anyhow::anyhow!("catalog revision must be exactly current + 1"),
+            anyhow::anyhow!(
+                "replace-all catalog revision must be positive and not older than current"
+            ),
         ));
     }
     Ok(())
@@ -581,9 +570,7 @@ fn cache_result(state: &mut ControllerState, id: Uuid, result: proto::JobCommand
 }
 
 /// 把 Scheduler 内部错误归类为稳定的协议错误码，同时保留原始错误链。
-fn scheduler_error(
-    error: crate::scheduler::SchedulerError,
-) -> (proto::JobCommandErrorCode, anyhow::Error) {
+fn scheduler_error(error: crate::scheduler::SchedulerError) -> ControlError {
     let code = match error {
         crate::scheduler::SchedulerError::JobNotFound(_) => proto::JobCommandErrorCode::NotFound,
         crate::scheduler::SchedulerError::JobAlreadyExists(_) => {
@@ -597,27 +584,28 @@ fn scheduler_error(
         }
         _ => proto::JobCommandErrorCode::SchedulerUnavailable,
     };
-    (code, anyhow::Error::new(error))
+    ControlError::rejected(code, anyhow::Error::new(error))
 }
 
 /// 构造“Job 定义无效”的控制器内部错误，减少调用点的重复元组代码。
-fn invalid_job(message: &str) -> (proto::JobCommandErrorCode, anyhow::Error) {
-    (
+fn invalid_job(message: &str) -> ControlError {
+    ControlError::rejected(
         proto::JobCommandErrorCode::InvalidJob,
         anyhow::anyhow!(message.to_owned()),
     )
 }
 
-/// 将控制器错误包装成 Server 可关联到原命令的拒绝响应。
+/// 将控制器错误包装成 Server 可关联到原命令的结构化响应。
 fn command_error(
     command_id: &[u8],
     catalog_revision: u64,
+    status: proto::JobCommandStatus,
     code: proto::JobCommandErrorCode,
     error: anyhow::Error,
 ) -> proto::JobCommandResult {
     proto::JobCommandResult {
         command_id: command_id.to_vec(),
-        status: proto::JobCommandStatus::Rejected as i32,
+        status: status as i32,
         catalog_revision,
         job: None,
         error: Some(proto::JobCommandError {
@@ -665,8 +653,9 @@ fn timestamp_proto(value: DateTime<Utc>) -> prost_types::Timestamp {
 }
 
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)] // 测试与控制器相邻，后续私有 Proto 编译函数仍由该测试覆盖。
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::scheduler::{CallbackError, SchedulerConfig, SchedulerRuntime};
 
@@ -773,6 +762,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_all_reconciles_authoritative_snapshot_after_incremental_gap() {
+        let runtime = SchedulerRuntime::start(SchedulerConfig::default()).unwrap();
+        let scheduler = runtime.scheduler();
+        let controller = JobController::new(scheduler.clone(), sink());
+        let retained_job_id = Uuid::new_v4();
+        let replacement_job_id = Uuid::new_v4();
+
+        // Arrange: Agent 已应用目录版本 1，随后版本 2 到 6 在传输中丢失。
+        let first_increment = controller
+            .apply(command(Uuid::new_v4(), 1, definition(retained_job_id, 1)))
+            .await;
+        assert_eq!(
+            first_increment.status,
+            proto::JobCommandStatus::Applied as i32
+        );
+        assert!(scheduler.get(retained_job_id).await.unwrap().is_some());
+
+        // Act: Server 不再发送缺失的增量，而是用版本 7 的权威完整快照对账。
+        let authoritative_snapshot = proto::JobCommand {
+            command_id: Uuid::new_v4().as_bytes().to_vec(),
+            action: Some(proto::job_command::Action::ReplaceAll(
+                proto::ReplaceAllJobs {
+                    catalog_revision: 7,
+                    jobs: vec![definition(replacement_job_id, 1)],
+                },
+            )),
+        };
+
+        let result = controller.apply(authoritative_snapshot).await;
+
+        // Assert: 快照成为目录版本 7，并精确替换旧的远程 Job 集合。
+        assert_eq!(result.status, proto::JobCommandStatus::Applied as i32);
+        assert_eq!(result.catalog_revision, 7);
+        assert!(scheduler.get(retained_job_id).await.unwrap().is_none());
+        assert!(scheduler.get(replacement_job_id).await.unwrap().is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_catalog_gap_returns_resync_required_without_mutating_state() {
+        let runtime = SchedulerRuntime::start(SchedulerConfig::default()).unwrap();
+        let scheduler = runtime.scheduler();
+        let controller = JobController::new(scheduler.clone(), sink());
+        let job_id = Uuid::new_v4();
+
+        // Arrange: 当前远程目录版本为 1，且 Scheduler 已安装对应 Job。
+        let first = controller
+            .apply(command(Uuid::new_v4(), 1, definition(job_id, 1)))
+            .await;
+        assert_eq!(first.status, proto::JobCommandStatus::Applied as i32);
+        // `JobSnapshot.version` 是 Scheduler 的乐观锁 generation；任意更新都会使它变化。
+        let scheduler_version_before_gap = scheduler.get(job_id).await.unwrap().unwrap().version;
+
+        // Act: 版本 2 缺失，Agent 直接收到了版本 3 的增量更新。
+        let gap = controller
+            .apply(command(Uuid::new_v4(), 3, definition(job_id, 2)))
+            .await;
+
+        // Assert: 这是恢复信号而非普通拒绝；目录版本与 Scheduler generation 都保持不变。
+        assert_eq!(gap.status, proto::JobCommandStatus::ResyncRequired as i32);
+        assert_eq!(gap.catalog_revision, 1);
+        assert_eq!(
+            gap.error.expect("structured error").code,
+            proto::JobCommandErrorCode::RevisionConflict as i32
+        );
+        assert_eq!(
+            scheduler.get(job_id).await.unwrap().unwrap().version,
+            scheduler_version_before_gap
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_all_rejects_stale_snapshot_without_mutating_current_directory() {
+        let runtime = SchedulerRuntime::start(SchedulerConfig::default()).unwrap();
+        let scheduler = runtime.scheduler();
+        let controller = JobController::new(scheduler.clone(), sink());
+        let first_job_id = Uuid::new_v4();
+        let stale_job_id = Uuid::new_v4();
+
+        // Arrange: Agent 已从版本 5 的权威快照建立当前远程 Job 目录。
+        let first = controller
+            .apply(proto::JobCommand {
+                command_id: Uuid::new_v4().as_bytes().to_vec(),
+                action: Some(proto::job_command::Action::ReplaceAll(
+                    proto::ReplaceAllJobs {
+                        catalog_revision: 5,
+                        jobs: vec![definition(first_job_id, 1)],
+                    },
+                )),
+            })
+            .await;
+        assert_eq!(first.status, proto::JobCommandStatus::Applied as i32);
+        assert!(scheduler.get(first_job_id).await.unwrap().is_some());
+
+        // Act: 延迟到达的版本 4 快照试图用不同 Job 覆盖当前目录。
+        let stale = controller
+            .apply(proto::JobCommand {
+                command_id: Uuid::new_v4().as_bytes().to_vec(),
+                action: Some(proto::job_command::Action::ReplaceAll(
+                    proto::ReplaceAllJobs {
+                        catalog_revision: 4,
+                        jobs: vec![definition(stale_job_id, 1)],
+                    },
+                )),
+            })
+            .await;
+
+        // Assert: 只拒绝旧快照，不删除版本 5 的 Job，也不安装旧快照中的 Job。
+        assert_eq!(stale.status, proto::JobCommandStatus::Rejected as i32);
+        assert_eq!(stale.catalog_revision, 5);
+        assert_eq!(
+            stale.error.expect("structured error").code,
+            proto::JobCommandErrorCode::RevisionConflict as i32
+        );
+        assert!(scheduler.get(first_job_id).await.unwrap().is_some());
+        assert!(scheduler.get(stale_job_id).await.unwrap().is_none());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_all_replays_equal_revision_to_reconcile_scheduler_state() {
+        let runtime = SchedulerRuntime::start(SchedulerConfig::default()).unwrap();
+        let scheduler = runtime.scheduler();
+        let controller = JobController::new(scheduler.clone(), sink());
+        let job_id = Uuid::new_v4();
+
+        // Arrange: Agent 已成功应用版本 5 的完整权威快照。
+        let first = controller
+            .apply(proto::JobCommand {
+                command_id: Uuid::new_v4().as_bytes().to_vec(),
+                action: Some(proto::job_command::Action::ReplaceAll(
+                    proto::ReplaceAllJobs {
+                        catalog_revision: 5,
+                        jobs: vec![definition(job_id, 1)],
+                    },
+                )),
+            })
+            .await;
+        assert_eq!(first.status, proto::JobCommandStatus::Applied as i32);
+
+        // Act: 网络重试使用新的 command_id 重发完全相同的权威快照。
+        let replay = controller
+            .apply(proto::JobCommand {
+                command_id: Uuid::new_v4().as_bytes().to_vec(),
+                action: Some(proto::job_command::Action::ReplaceAll(
+                    proto::ReplaceAllJobs {
+                        catalog_revision: 5,
+                        jobs: vec![definition(job_id, 1)],
+                    },
+                )),
+            })
+            .await;
+
+        // Assert: 目录版本不倒退也不递增，Scheduler 中的 Job 仍与该快照一致。
+        assert_eq!(replay.status, proto::JobCommandStatus::Applied as i32);
+        assert_eq!(replay.catalog_revision, 5);
+        assert!(scheduler.get(job_id).await.unwrap().is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reporting_adapter_uses_business_revision_in_task_report() {
         let runtime = SchedulerRuntime::start(SchedulerConfig::default()).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -805,200 +956,4 @@ mod tests {
         assert!(report.result.is_some());
         runtime.shutdown().await.unwrap();
     }
-}
-
-pub(crate) fn compile_job(
-    definition: &proto::JobDefinition,
-    factory: &TaskFactory,
-) -> anyhow::Result<CompiledJob> {
-    // UUID 与业务 revision 是远程 Job 的身份边界，必须在任何装配前校验。
-    let id = parse_uuid(&definition.job_id, "job_id")?;
-    anyhow::ensure!(
-        definition.revision > 0,
-        "job revision must be greater than zero"
-    );
-    // 必填子消息在 proto3 解码后可能为 None，所以逐层显式检查。
-    let trigger = compile_trigger(
-        definition
-            .trigger
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("job trigger is required"))?,
-    )?;
-    let options = compile_options(definition.options.as_ref())?;
-    let task = factory.build(
-        definition
-            .task
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("job task is required"))?,
-        definition.revision,
-    )?;
-    // 到这里所有协议值都已变成 Scheduler 可接受的强类型。
-    Ok(CompiledJob {
-        id,
-        revision: definition.revision,
-        enabled: definition.enabled,
-        trigger,
-        options,
-        task,
-    })
-}
-
-/// 解析协议中的固定 16 字节 UUID，并在错误中保留字段名。
-pub(crate) fn parse_uuid(bytes: &[u8], field: &str) -> anyhow::Result<Uuid> {
-    Uuid::from_slice(bytes).map_err(|_| anyhow::anyhow!("{field} must contain a 16-byte UUID"))
-}
-
-/// 编译一次、固定间隔或 Cron 触发规则，并校验 Misfire 与超时。
-fn compile_trigger(value: &proto::JobTrigger) -> anyhow::Result<Trigger> {
-    use proto::job_trigger::Schedule as ProtoSchedule;
-    // oneof 保证最多一个分支，但不保证一定存在。
-    let schedule = match value.schedule.as_ref() {
-        Some(ProtoSchedule::Once(once)) => Schedule::Once {
-            at: timestamp(once.at.as_ref(), "once.at")?,
-        },
-        Some(ProtoSchedule::Interval(interval)) => Schedule::Interval {
-            every: duration(interval.every.as_ref(), "interval.every", false)?,
-            start_at: interval
-                .start_at
-                .as_ref()
-                .map(|value| timestamp(Some(value), "interval.start_at"))
-                .transpose()?,
-        },
-        Some(ProtoSchedule::Cron(cron)) => Schedule::Cron {
-            expression: cron.expression.clone(),
-            // 时区使用 chrono-tz 解析；无效 IANA 名称在安装前失败。
-            timezone: cron.timezone.parse()?,
-        },
-        None => anyhow::bail!("job schedule is required"),
-    };
-    // Misfire 不提供隐式默认值，避免 Agent 猜测 Server 的补执行意图。
-    let misfire = value
-        .misfire
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("misfire policy is required"))?;
-    let behavior = proto::MisfireBehavior::try_from(misfire.behavior)
-        .map_err(|_| anyhow::anyhow!("misfire behavior is unknown"))?;
-    let misfire = match behavior {
-        proto::MisfireBehavior::Unspecified => anyhow::bail!("misfire behavior is unspecified"),
-        proto::MisfireBehavior::Skip => MisfirePolicy::Skip,
-        proto::MisfireBehavior::FireOnce => MisfirePolicy::FireOnce,
-        proto::MisfireBehavior::CatchUp => MisfirePolicy::CatchUp {
-            max_runs: NonZeroU32::new(misfire.max_runs)
-                .ok_or_else(|| anyhow::anyhow!("catch-up max_runs must be greater than zero"))?,
-        },
-    };
-    Ok(Trigger {
-        schedule,
-        misfire,
-        timeout: value
-            .timeout
-            .as_ref()
-            .map(|value| duration(Some(value), "trigger.timeout", false))
-            .transpose()?,
-    })
-}
-
-/// 编译可选 JobOptions；整段缺失时使用 Scheduler 安全默认值。
-fn compile_options(value: Option<&proto::JobOptions>) -> anyhow::Result<JobOptions> {
-    let Some(value) = value else {
-        return Ok(JobOptions::default());
-    };
-    // 先复制默认值，再只覆盖协议明确提供的字段。
-    let defaults = JobOptions::default();
-    let mut options = JobOptions {
-        concurrency: value
-            .concurrency
-            .map(|value| {
-                NonZeroUsize::new(value as usize)
-                    .ok_or_else(|| anyhow::anyhow!("job concurrency must be greater than zero"))
-            })
-            .transpose()?,
-        max_pending: value.max_pending.map(|value| value as usize),
-        ..defaults
-    };
-    // priority 有明确范围，先完成 u32 -> u8 的无损转换再由领域类型校验。
-    if let Some(priority) = value.priority {
-        options.priority = JobPriority::new(u8::try_from(priority)?)?;
-    }
-    // Proto 枚举可能携带未知整数，try_from 会拒绝未来或损坏的值。
-    options.coalescing = match proto::TriggerCoalescing::try_from(value.coalescing)? {
-        proto::TriggerCoalescing::Unspecified => None,
-        proto::TriggerCoalescing::KeepAll => Some(TriggerCoalescing::KeepAll),
-        proto::TriggerCoalescing::KeepLatest => Some(TriggerCoalescing::KeepLatest),
-    };
-    options.capacity = match proto::CapacityPolicy::try_from(value.capacity)? {
-        proto::CapacityPolicy::Unspecified => None,
-        proto::CapacityPolicy::Backpressure => Some(CapacityPolicy::Backpressure),
-        proto::CapacityPolicy::SkipNewest => Some(CapacityPolicy::SkipNewest),
-        proto::CapacityPolicy::ReplaceOldestTrigger => Some(CapacityPolicy::ReplaceOldestTrigger),
-    };
-    if let Some(retry) = value.retry.as_ref() {
-        options.retry = compile_retry(retry)?;
-    }
-    if let Some(failure) = value.failure.as_ref() {
-        options.failure = FailurePolicy {
-            disable_after_consecutive_failures: failure
-                .disable_after_consecutive_failures
-                .map(|value| {
-                    NonZeroU32::new(value).ok_or_else(|| {
-                        anyhow::anyhow!("failure threshold must be greater than zero")
-                    })
-                })
-                .transpose()?,
-            count_timeout: failure.count_timeout,
-            count_panic: failure.count_panic,
-        };
-    }
-    Ok(options)
-}
-
-/// 将 Proto 重试 oneof 转换为 Scheduler 的无重试或指数退避策略。
-fn compile_retry(value: &proto::RetryPolicy) -> anyhow::Result<ExecutionRetryPolicy> {
-    use proto::retry_policy::Policy;
-    match value.policy.as_ref() {
-        Some(Policy::NoRetry(_)) => Ok(ExecutionRetryPolicy::None),
-        Some(Policy::Exponential(value)) => Ok(ExecutionRetryPolicy::Exponential {
-            max_attempts: NonZeroU32::new(value.max_attempts)
-                .ok_or_else(|| anyhow::anyhow!("retry max_attempts must be greater than zero"))?,
-            initial_delay: duration(value.initial_delay.as_ref(), "retry.initial_delay", true)?,
-            max_delay: duration(value.max_delay.as_ref(), "retry.max_delay", false)?,
-            retry_on: value
-                .retry_on
-                .as_ref()
-                .map(|value| RetryCondition {
-                    transient_error: value.transient_error,
-                    timeout: value.timeout,
-                    panic: value.panic,
-                })
-                .unwrap_or_default(),
-        }),
-        None => anyhow::bail!("retry policy is required when retry is present"),
-    }
-}
-
-/// 安全转换 Prost Duration，并按调用场景决定是否允许零时长。
-fn duration(
-    value: Option<&prost_types::Duration>,
-    field: &str,
-    allow_zero: bool,
-) -> anyhow::Result<Duration> {
-    let value = value.ok_or_else(|| anyhow::anyhow!("{field} is required"))?;
-    // Prost Duration 允许负值，但 Scheduler 的间隔、超时和退避均不允许。
-    anyhow::ensure!(
-        value.seconds >= 0 && (0..1_000_000_000).contains(&value.nanos),
-        "{field} is invalid"
-    );
-    let value = Duration::new(value.seconds as u64, value.nanos as u32);
-    anyhow::ensure!(
-        allow_zero || !value.is_zero(),
-        "{field} must be greater than zero"
-    );
-    Ok(value)
-}
-
-/// 将 Prost Timestamp 转为 UTC 时间，并拒绝 chrono 无法表示的范围。
-fn timestamp(value: Option<&prost_types::Timestamp>, field: &str) -> anyhow::Result<DateTime<Utc>> {
-    let value = value.ok_or_else(|| anyhow::anyhow!("{field} is required"))?;
-    DateTime::from_timestamp(value.seconds, value.nanos as u32)
-        .ok_or_else(|| anyhow::anyhow!("{field} is outside the supported timestamp range"))
 }

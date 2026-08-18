@@ -73,7 +73,7 @@ Agent 验证 Ack 后切换 incoming/outgoing
 RPC 和 Noise 状态，失败 Session 不能复用。
 
 正式 Server 不直接让 gRPC handler 修改 `ServerKeyRing`。`ServerKeyRingManager` 负责运行时
-协调：首次启动使用 `keyring_id = default` 的唯一键原子创建，轮换先在候选快照上计算，再
+协调：首次启动使用 `keyring_id = _server` 的唯一键原子创建，轮换先在候选快照上计算，再
 使用数据库 `revision` 做 CAS；CAS 成功后才替换当前握手句柄。多实例进程按固定周期读取
 更高 revision 并替换本地句柄，因此同一个数据库上的实例最终收敛，旧 revision 不会覆盖新密钥。
 

@@ -127,7 +127,9 @@ session_handle.send_job_command_result(result).await?;
 ```
 
 `catalog_revision` 表示整个远程 Job 集合版本。增量命令必须恰好等于 Agent 当前版本加一，否则 Agent
-返回 `RESYNC_REQUIRED`，Server 应发送新的 `ReplaceAllJobs`，不能继续盲目追加增量。
+返回 `RESYNC_REQUIRED`，Server 应发送新的 `ReplaceAllJobs`，不能继续盲目追加增量。`ReplaceAllJobs`
+携带 Server 的权威快照版本，可以跨过缺失的增量；相同版本可以重放，低于 Agent 当前版本的快照
+必须拒绝。
 
 一次典型对账过程是：Server 先读取 Agent 报告的目录版本；版本一致时继续发送下一条增量命令，版本
 缺失或断档时发送完整 `ReplaceAllJobs`。Agent 只有在完整目录校验并应用成功后才能提交新的
@@ -155,3 +157,150 @@ Task 的直接返回值由运行层转换为 `TaskReport`。Server 消费结果�
 
 配置 revision 更新后，旧执行实例可能仍在完成。Server 不应只按 `job_id` 覆盖结果，还要保留或检查
 revision，防止旧配置的迟到结果污染新配置序列。
+
+## JobCommand 的实际调用链
+
+Agent 收到 `JobCommand` 后，唯一推荐入口是 `JobController::apply`。连接层不应直接调用
+`Scheduler::install`，因为目录版本、命令幂等和远程所有权都必须在同一个控制器锁内处理：
+
+```text
+SessionDriver::recv
+  -> SessionEvent::JobCommand(command)
+  -> JobController::apply(command)
+       -> parse_uuid(command_id)
+       -> cached_results[command_id] 命中？返回首次结果
+       -> state.lock()
+       -> apply_locked
+          -> UpsertJob / DeleteJob / RunJobNow / ReplaceAllJobs
+       -> cache_result(command_id, result)
+  -> SessionHandle::send_job_command_result(result)
+```
+
+`command_id` 是命令级幂等键，`catalog_revision` 是远程 Job 集合版本，`JobDefinition.revision`
+是单个 Job 版本，Scheduler `JobSnapshot.version` 是进程内 generation。它们的使用位置如下：
+
+| 版本 | 由谁产生 | 校验位置 | 用来解决什么问题 |
+| --- | --- | --- | --- |
+| `command_id` | Server 命令构造器 | `JobController::apply` | 网络重试不重复执行命令。 |
+| `catalog_revision` | Server 远程目录 | `require_next_catalog` / `require_replace_all_catalog` | 检测增量丢失、乱序和旧快照。 |
+| `JobDefinition.revision` | Job 配置拥有者 | `compile_job`、`upsert_compiled` | 防止旧配置覆盖新配置。 |
+| `JobSnapshot.version` | Agent Scheduler | `update/delete/enable/disable` | 防止并发修改覆盖。 |
+
+### UpsertJob
+
+```text
+UpsertJob
+  -> require_next_catalog(catalog_revision)
+  -> compile_job(definition, TaskFactory)
+       -> parse_uuid(job_id)
+       -> validate revision/trigger/options
+       -> TaskFactory::build(TaskDefinition)
+          -> CpuTask / MemoryTask / ProcessTask / ProbeTask ...
+          -> TaskBinding::reporting(task, job_revision, sink)
+  -> existing remote Job?
+       -> Scheduler::update(id, generation, full_patch)
+       -> set_enabled(snapshot, enabled)
+     new Job?
+       -> Scheduler::install(id, generation=1, ...)
+       -> Scheduler::get(id)
+  -> remote_jobs[id] = { revision, generation }
+  -> catalog_revision = command.catalog_revision
+  -> JobCommandResult::Applied
+```
+
+编译阶段不会修改 Scheduler。这样非法的 UUID、空 `oneof`、无效时间、错误重试策略或不支持的
+Task 配置会在安装前被拒绝，不会留下半安装 Job。`compiler.rs` 只负责 Proto 到强类型的转换，
+不持有网络连接，也不推进目录状态。
+
+### DeleteJob 和 RunJobNow
+
+```text
+DeleteJob
+  -> require_next_catalog
+  -> parse_uuid(job_id)
+  -> remote_jobs 中查找并校验 expected_revision
+  -> Scheduler::delete(id, generation)
+  -> 删除远程所有权索引
+  -> 推进 catalog_revision
+
+RunJobNow
+  -> parse_uuid(job_id)
+  -> 校验 expected_revision
+  -> JobPatch { reschedule: RunNow }
+  -> Scheduler::update(id, generation, patch)
+  -> 只更新 generation，不改变 JobDefinition.revision
+```
+
+`RunJobNow` 是额外触发，不会把 interval 或 cron 的原始相位改成“从现在开始”。删除只接受
+`remote_jobs` 中的 Job，因此不会误删 Agent 本地创建的 Job。
+
+### ReplaceAllJobs
+
+全量快照分成两个阶段：
+
+```text
+阶段一：纯校验
+  遍历全部 JobDefinition
+  -> 检查 catalog_revision
+  -> 检查重复 job_id
+  -> compile_job 全部成功
+
+阶段二：应用
+  -> 逐个 upsert_compiled
+  -> 删除快照中不存在的旧远程 Job
+  -> 最后写入新的 catalog_revision
+```
+
+相同版本可以重放，用来修复 Agent 与 Server 的运行状态差异；低于当前版本的快照拒绝；高于
+当前版本的快照可以跨过丢失的增量。单个 Scheduler 写入是原子的，但多个 Job 不是跨 Job 事务，
+所以 Server 仍应在收到失败结果后重新发送权威快照，而不是假设所有项都已成功。
+
+## TaskFactory、Scheduler 和结果出口
+
+Task 的职责是“一次执行并返回结果”，不是向 gRPC 发送消息。固定 Task 的装配发生在
+`job_control/compiler.rs`：
+
+```text
+TaskDefinition.oneof
+  -> TaskFactory::build
+  -> 固定 Task::with_config / try_with_config
+  -> ReportingTask trait object
+  -> TaskBinding::reporting(task, revision, sink)
+  -> Scheduler::install/update
+```
+
+Scheduler 只读取 `Trigger`、`JobOptions` 和 `TaskBinding`，负责：
+
+- 根据 once/interval/cron 产生触发；
+- 执行全局和单 Job 并发限制；
+- 处理 Pending、coalescing、capacity 和 misfire；
+- 对临时错误、超时和 panic 应用重试策略；
+- 在取消、删除或连续失败时结束执行；
+- 为每次更新维护内部 generation。
+
+Task 通过 `TaskReportSink` 把执行结果交给调用方。Sink 可以是内存 channel、本地持久化队列或
+Protocol Session 适配器，JobController 不假设它是哪一种：
+
+```rust
+let controller = JobController::new(scheduler, report_sink);
+let result = controller.apply(command).await;
+session_handle.send_job_command_result(result).await?;
+
+// Scheduler 执行时，ReportingTask 将业务 revision 写入 TaskReport。
+// 连接层再决定是否立即发送、落盘等待重连，或批量上报。
+```
+
+这种接口是一个真正的 seam：现在至少有 Scheduler 内部结果出口和 Protocol/测试出口两类 adapter，
+更换输出方式不会修改 Collector、Task 或调度规则。
+
+## 断线、恢复和旧结果
+
+断线不会自动调用 `JobController::clear`，已安装的远程 Job 可以继续运行一段时间。重新连接后，
+Server 应根据 Agent 上报的 `catalog_revision` 选择增量同步或 `ReplaceAllJobs`。如果应用要求“断线
+超过 N 分钟自动停采”，应由连接管理器记录断线时间并显式暂停 Job，不能让 Scheduler 通过 socket
+状态隐式改变业务状态。
+
+执行结果必须同时携带 `job_id` 和业务 `revision`。配置从 revision 7 更新到 revision 8 后，旧的
+revision 7 执行可能仍在完成；Server 只能把它记录为旧版本结果或按策略丢弃，不能仅按 `job_id`
+覆盖 revision 8 的状态。Protocol 当前没有跨 Session 的 TaskReport ACK，可靠上报需要在 Sink 外部
+实现本地有界队列、重放、去重和确认。

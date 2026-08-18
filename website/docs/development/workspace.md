@@ -30,6 +30,7 @@ smalux/
 | 新增固定采集 Task | `smalux-agent/src/tasks/collect/` |
 | 修改触发、队列、并发 | `smalux-agent/src/scheduler/` |
 | 修改远程 Job 应用行为 | `smalux-agent/src/job_control.rs` |
+| 修改 Proto Job 编译和固定 Task 工厂 | `smalux-agent/src/job_control/compiler.rs` |
 | 修改公开 Task 配置/结果 | `smalux-protocol/proto/.../task/` |
 
 Collector 应尽量只返回领域数据或明确错误；Task 负责配置、采样状态和 Proto 结果；Scheduler 不理解 CPU、
@@ -58,6 +59,8 @@ Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 | 修改 Server Noise 握手 | `src/noise/server/` |
 | 修改加密 Session/rekey | `src/noise/session.rs` |
 | 修改 Tonic Client/Server | `src/tonic_transport/client.rs`、`server.rs` |
+| 修改 Session 策略、心跳统计和事件分类 | `src/tonic_transport/session/policy.rs` |
+| 修改 Tonic Session 状态机 | `src/tonic_transport/session.rs` |
 | 修改后台 Driver | `src/tonic_transport/driver.rs` |
 
 生成的 Rust 文件位于 Cargo `OUT_DIR`，不要手动修改或提交。
@@ -65,6 +68,62 @@ Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 Protocol 的高层 API 与底层 Noise 状态机有意同时保留。普通应用修改应优先落在高层 Client/Acceptor/
 Driver；只有增加传输适配或验证加密状态机时才直接操作底层 handshake/session，避免出现两个 owner 同时
 推进 nonce。
+
+## Server 的调用阅读顺序
+
+从 Server 启动或 Agent RPC 开始阅读时，按下面的顺序可以保持较好的 locality，不需要在几十个小文件
+之间来回跳转：
+
+```text
+lib.rs
+  -> bootstrap.rs                 配置、数据库、监听和优雅关闭
+  -> state.rs                     AppState、密钥环同步和清理任务
+  -> route.rs                     顶层 Router 和请求 ID/Trace 中间件
+  -> controller/agent.rs          Agent gRPC Router 装配
+  -> service/agent/server_service.rs
+       Tonic trait、OpenSession、握手前错误和 worker 生命周期
+  -> service/agent/server_service/session.rs
+       注册、授权、加密业务循环
+  -> agent_registrar.rs            Server 业务授权接口
+  -> database/agent_registration.rs
+       Token、事务和 Agent 状态的持久化实现
+```
+
+数据库配置和运行连接也已经分开：`database/config.rs` 只解析 URL、环境变量、后端 options 和连接
+池参数；`database/connection.rs` 只负责 `ServerDatabase::connect`、迁移和连接句柄。修改某个后端
+配置时不需要阅读注册事务或 KeyRing 的实现。
+
+## Agent Job 的调用阅读顺序
+
+```text
+SessionDriver / 连接层
+  -> JobController::apply
+       -> command_id 幂等缓存和 catalog_revision
+       -> compiler::compile_job
+            -> TaskFactory::build
+            -> Trigger / JobOptions 强类型校验
+       -> Scheduler::install/update/delete/enable/disable
+       -> TaskReportSink
+```
+
+`job_control.rs` 保留远程目录、命令状态和所有权；`job_control/compiler.rs` 保留 Proto 编译和
+Task 装配。不要为了添加一个采集器去修改控制器，也不要为了改变上报方式去修改 Collector。
+
+## 用接口定位修改点
+
+当一个需求跨越多个模块时，先写出调用者真正需要知道的接口，再判断实现属于哪一个 seam：
+
+| 需求 | 首先阅读 | 不要直接修改 |
+| --- | --- | --- |
+| 增加 CPU/Socket 字段 | Proto task/result、Task 和 Collector | `JobController`、Tonic Session |
+| 改 Job 版本或幂等 | `JobController::apply` 和 Job Proto | Scheduler 内部队列 |
+| 改上报目标 | `TaskReportSink` adapter、SessionHandle | Collector 和 Task |
+| 改握手超时/Token | `AgentProtocolClient`、`ServerSessionAcceptor` | Axum handler 业务逻辑 |
+| 改 Agent 授权 | `AgentRegistrar::authorize_agent`、数据库 adapter | Noise 静态密钥状态机 |
+| 改数据库连接参数 | `database/config.rs` | 注册流程和 Router |
+
+深模块的判断标准是：接口保持小而稳定，复杂性留在实现内部；adapter 是改变输出或传输方式的 seam，
+不是把一层调用机械转发到另一层的包装。新增第二种 adapter 前，先确认两种实现共享的接口和错误语义。
 
 ## 推荐开发循环
 

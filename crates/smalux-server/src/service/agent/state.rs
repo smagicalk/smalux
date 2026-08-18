@@ -1,7 +1,7 @@
 //! Agent 领域共享状态。
 //!
 //! 该状态与 Axum 的顶层 `AppState` 解耦：gRPC service 没有 Axum `State` extractor，
-//! 因此由 `AgentServer` 直接持有这个状态。数据库句柄、Noise 密钥环和注册中心在
+//! 因此由 `AgentServer` 直接持有这个状态。Noise 密钥环和注册中心在
 //! Server 启动时创建一次，所有 Agent 会话共享它们。
 
 use std::sync::Arc;
@@ -17,8 +17,8 @@ use super::keyring_manager::ServerKeyRingManager;
 /// Agent 协议服务使用的共享依赖。
 #[derive(Clone)]
 pub struct AgentState {
-    /// Server 数据库连接池句柄；注册、授权和密钥轮换都通过它访问持久化层。
-    pub(crate) database: Arc<ServerDatabase>,
+    /// 脱敏数据库后端标签，仅用于会话诊断日志。
+    pub(crate) database_backend: &'static str,
     /// Server Noise 密钥环管理器；所有握手和轮换都通过它取得一致句柄。
     pub(crate) keyring_manager: Arc<ServerKeyRingManager>,
     /// Agent 注册中心；负责 Token、注册事务、Agent 激活、授权和吊销查询。
@@ -43,12 +43,12 @@ impl AgentState {
     ) -> Self {
         tracing::info!(
             backend = database.backend_label(),
-            active_server_keys = keyring_manager.active_key_count().unwrap_or_default(),
             "creating Agent shared state"
         );
+        let database_backend = database.backend_label();
         let agent_registrar = Arc::new(AgentRegistrar::new(Arc::clone(&database)));
         Self {
-            database,
+            database_backend,
             keyring_manager,
             agent_registrar,
             session_slots: Arc::new(Semaphore::new(runtime_config.max_agent_sessions)),

@@ -1,6 +1,6 @@
 //! Server Noise 长期密钥环的持久化模型。
 //!
-//! 表只允许一个逻辑记录（`keyring_id = "default"`）。记录保存 current、next 和
+//! 表只允许一个逻辑记录（`keyring_id = "_server"`）。记录保存 current、next 和
 //! previous 三个身份的完整公私钥，以及正在进行的轮换事务 ID。私钥不会写入日志；
 //! 生产部署仍应配合数据库文件权限、磁盘加密或外部密钥管理服务保护静态数据。
 
@@ -11,7 +11,10 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "server_keyrings")]
 pub struct Model {
-    /// 逻辑密钥环 ID；当前固定为 `default`，便于未来扩展多租户密钥环。
+    /// 内部单例密钥环 ID；当前固定为 `_server`。
+    ///
+    /// 多租户或多 Server 身份不能依赖隐式默认项，届时需要扩展数据库 API，让调用方
+    /// 显式传入目标密钥环 ID。
     #[sea_orm(primary_key, auto_increment = false)]
     pub keyring_id: String,
     /// 当前 Server Noise 身份的 32 字节私钥。

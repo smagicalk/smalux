@@ -79,6 +79,127 @@ Smalux 当前适合继续开发和验证以下场景：
 
 在生产部署前仍需补齐正式持久化、权限管理、安装升级、上报队列、审计、限流和可观测性策略。
 
+## 架构审查式总图
+
+下面的图把一次请求从应用入口展开到具体实现。箭头表示调用方向；同一层的模块不应越过
+自己的 seam 直接修改另一层的状态。
+
+```text
+Server 进程启动
+  |
+  +--> bootstrap::run_server
+  |      +--> ServerDatabase::connect
+  |      |      +--> DatabaseConfig::validate / resolve_connection_url
+  |      |      +--> SeaORM connect
+  |      |      +--> Migrator::up
+  |      +--> AppState::build
+  |      |      +--> ServerKeyRingManager::load_or_create
+  |      |      +--> start_sync_task_with_shutdown
+  |      |      +--> AgentRegistrar::start_cleanup_task
+  |      +--> route::build_app_router
+  |             +--> controller::frontend::get_route
+  |             +--> controller::agent::get_route
+  |                    +--> AgentServer::new
+  |                    +--> AgentTransportServer<AgentServer>
+  |                    +--> Routes::into_axum_router
+  +--> axum::serve
+
+Agent gRPC OpenSession
+  |
+  +--> AgentServer::open_session
+         +--> try_acquire_session
+         +--> ServerSessionAcceptor::accept_incoming_with_psk_resolver
+         |      +--> XXpsk3 / IK Noise handshake
+         |      +--> AgentRegistrar::resolve_registration_psk (XXpsk3)
+         |      +--> IncomingSession::Registration / Authentication
+         +--> AgentServer::handle_established_session
+                +--> registration prepare/commit, or Agent authorization
+                +--> TonicNoiseSession::receive
+                +--> MessagesRequest echo / future Job dispatch
+```
+
+### 模块、接口和实现
+
+| 模块 | 接口承诺 | 实现集中在哪里 | 不应负责什么 |
+| --- | --- | --- | --- |
+| `bootstrap` | 只在数据库、状态和路由都成功后监听端口 | `smalux-server/src/bootstrap.rs` | 不处理业务消息 |
+| `AppState` | 持有进程级共享状态和取消令牌 | `smalux-server/src/state.rs` | 不解析 Proto |
+| Agent Controller | 把 Agent 状态装配成 Axum Router | `controller/agent.rs` | 不实现注册策略 |
+| Tonic Adapter | 接收 `OpenSession`、限流、启动 worker | `service/agent/server_service.rs` | 不直接操作注册表规则 |
+| Session Policy | 处理握手完成后的注册、授权和业务循环 | `server_service/session.rs` | 不建立 Axum 路由 |
+| `AgentRegistrar` | Token、注册事务、Agent 授权和吊销 | `service/agent/agent_registrar.rs` | 不发送 gRPC 帧 |
+| Database Adapter | 事务、CAS、状态持久化和迁移 | `database/` | 不决定协议错误文本 |
+| `JobController` | 命令幂等、目录 revision 和远程所有权 | `smalux-agent/src/job_control.rs` | 不直接发送网络消息 |
+| `compiler` | Proto 校验、Task 工厂和强类型转换 | `job_control/compiler.rs` | 不修改 Scheduler |
+| Scheduler | 时间、并发、队列、重试和 generation | `smalux-agent/src/scheduler/` | 不理解 CPU 或 gRPC |
+| Task/Collector | 一次采集和结果构造 | `smalux-agent/src/tasks/collect/` | 不决定长期调度或输出位置 |
+| Protocol Session | Noise 帧、心跳、rekey 和事件分类 | `smalux-protocol/src/tonic_transport/` | 不保存 Token 数据库 |
+
+这里的模块是带接口的实现单元；接口不只有函数签名，还包括顺序、错误、持久化和取消规则。
+例如 `AgentRegistrar::authorize_agent` 返回的“已吊销”和“未知身份”都不会让会话进入业务流，
+而 `JobController::apply` 必须在结果缓存和远程目录更新后才向调用方返回。
+
+### 为什么这些模块是深模块
+
+架构审查使用两个问题判断一个模块是否值得保留：
+
+1. 删除这个模块后，复杂度是消失，还是会分散到所有调用方？
+2. 调用方需要理解多少实现细节，才能安全调用它？
+
+`JobController`、`ServerSessionAcceptor` 和 `ServerDatabase` 都隐藏了较多实现细节，调用方只需要
+掌握较小的接口，因此具有较高 leverage。`controller/agent.rs` 过去只是转发函数，删除测试显示它
+不会承载独立规则，所以现在直接负责 Router 装配。相反，Protocol 的 `TonicNoiseSession` 虽然文件较大，
+但 `send`、`receive`、心跳和 rekey 共享 nonce 状态，继续拆分会破坏 locality，因此只把无状态的策略和
+事件类型放到 `session/policy.rs`，把状态转换留在原模块。
+
+## Server 启动调用流程
+
+正式 Server 当前从 library 入口进入，配置、数据库、状态、路由和监听按顺序完成：
+
+```rust
+// smalux-server/src/lib.rs
+run() -> config::ServerConfig::from_env()
+      -> bootstrap::run_server(config)
+
+// bootstrap::run_server
+ServerDatabase::connect(config.database)
+    -> DatabaseConfig::validate()
+    -> Database::connect()
+    -> ServerDatabase::migrate()
+    -> AppState::build(runtime_config, database)
+    -> route::build_app_router(app_state)
+    -> tokio::net::TcpListener::bind()
+    -> axum::serve(listener, router)
+```
+
+`AppState::build` 还会启动两个可取消后台任务：Server Noise 密钥环的跨实例同步，以及 Agent
+注册事务的过期清理。二者共享进程级 `CancellationToken`，关闭时由 `ShutdownOwner` 触发取消，
+不会因为普通 `AppState` clone 提前停止。
+
+路由装配时，Agent 路由会先调用 `ServerKeyRingManager::active_key_count` 做启动检查，再构造
+`AgentServer` 和 `AgentTransportServer`。因此“Router 构造成功”表示当前至少有一个可用 Server
+Noise 身份；数据库、密钥环或迁移失败时不会启动半可用监听器。
+
+## 一次业务请求的完整路径
+
+```text
+AgentProtocolClient::connect / register_agent
+  -> AgentTransportRpcClient::open_session
+  -> ProtocolFrame(NoiseHandshake)
+  -> AgentServer::open_session
+  -> ServerSessionAcceptor
+  -> TonicNoiseSession
+  -> SessionDriver 或手动 receive_event
+  -> JobController::apply / TaskReportSink
+  -> SecureMessage(ciphertext)
+  -> ProtocolFrame
+  -> Server Session Policy
+```
+
+每一层只能确认自己的动作：gRPC stream 写入成功不代表业务已经持久化，Noise 解密成功不代表
+Agent 已获得业务授权，Task 返回成功也不代表 `TaskReport` 已经送达 Server。需要可靠结果时，
+应在连接层外增加本地有界队列、重放和 ACK，而不是把这些职责塞进 Collector 或 Scheduler。
+
 ## 当前边界如何影响开发
 
 可以直接基于 crate 编写和测试新的 Collector、Task、Job 或 Protocol 行为，也可以运行 Example 验证

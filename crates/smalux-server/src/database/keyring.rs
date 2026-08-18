@@ -12,8 +12,12 @@ use smalux_protocol::noise::{NoiseIdentity, RotationId, ServerKeyRing, ServerKey
 
 use super::{DatabaseError, ServerDatabase, entity::server_keyring};
 
-/// 当前 Server 使用的单例密钥环记录 ID。
-pub const SERVER_KEYRING_ID: &str = "default";
+/// 当前 Server 唯一的 Noise 密钥环记录 ID。
+///
+/// 这里不是“多个密钥环中的默认项”：当前数据模型只支持一个 Server 身份，因此使用
+/// `_server` 明确表示内部单例记录。未来若支持多租户或多 Server 身份，应为读写方法新增
+/// 显式的 keyring ID 参数，而不是重新引入隐式默认值。
+pub const SERVER_KEYRING_SINGLETON_ID: &str = "_server";
 
 /// 数据库中的 Server 密钥环完整记录。
 ///
@@ -31,12 +35,12 @@ impl ServerDatabase {
     /// 从数据库读取 Server 密钥环快照。
     ///
     /// 返回 `Ok(None)` 表示迁移已完成但还没有密钥记录；调用方应在内存中生成新身份，
-    /// 然后调用 [`Self::save_server_keyring`]。一旦记录存在，任何字段不完整或轮换状态
-    /// 不一致都会返回错误，避免误用错误密钥。
+    /// 然后调用 [`Self::insert_server_keyring_if_absent`]。一旦记录存在，任何字段不完整
+    /// 或轮换状态不一致都会返回错误，避免误用错误密钥。
     pub async fn load_server_keyring_record(
         &self,
     ) -> Result<Option<ServerKeyRingRecord>, DatabaseError> {
-        let Some(model) = server_keyring::Entity::find_by_id(SERVER_KEYRING_ID)
+        let Some(model) = server_keyring::Entity::find_by_id(SERVER_KEYRING_SINGLETON_ID)
             .one(self.connection())
             .await?
         else {
@@ -88,16 +92,6 @@ impl ServerDatabase {
         }))
     }
 
-    /// 读取 Server 密钥环快照，不向旧调用方暴露 revision。
-    pub async fn load_server_keyring(
-        &self,
-    ) -> Result<Option<ServerKeyRingSnapshot>, DatabaseError> {
-        Ok(self
-            .load_server_keyring_record()
-            .await?
-            .map(|record| record.snapshot))
-    }
-
     /// 只在记录不存在时原子创建 Server 密钥环。
     ///
     /// 多个 Server 同时首次启动时，数据库唯一键负责仲裁；输掉竞争的进程不会把自己
@@ -113,7 +107,7 @@ impl ServerDatabase {
             export_optional_identity(&snapshot.previous);
 
         let insert = server_keyring::Entity::insert(server_keyring::ActiveModel {
-            keyring_id: sea_orm::ActiveValue::Set(SERVER_KEYRING_ID.to_owned()),
+            keyring_id: sea_orm::ActiveValue::Set(SERVER_KEYRING_SINGLETON_ID.to_owned()),
             current_private_key: sea_orm::ActiveValue::Set(
                 snapshot.current.export_private_key().as_bytes().to_vec(),
             ),
@@ -199,7 +193,7 @@ impl ServerDatabase {
             .col_expr(server_keyring::Column::RotationId, Expr::value(rotation_id))
             .col_expr(server_keyring::Column::Revision, Expr::value(next_revision))
             .col_expr(server_keyring::Column::UpdatedAt, Expr::value(now))
-            .filter(server_keyring::Column::KeyringId.eq(SERVER_KEYRING_ID))
+            .filter(server_keyring::Column::KeyringId.eq(SERVER_KEYRING_SINGLETON_ID))
             .filter(server_keyring::Column::Revision.eq(expected_revision))
             .exec(self.connection())
             .await?;
@@ -218,22 +212,6 @@ impl ServerDatabase {
         self.load_server_keyring_record()
             .await?
             .ok_or(DatabaseError::MissingServerKeyring)
-    }
-
-    /// 兼容旧调用方的安全保存入口。
-    ///
-    /// 该方法不再执行无条件覆盖：已有记录时先读取 revision，再走 CAS；并发写入发生
-    /// 时会返回 `ServerKeyringRevisionConflict`，不会静默丢失其他进程的更新。
-    pub async fn save_server_keyring(
-        &self,
-        snapshot: &ServerKeyRingSnapshot,
-    ) -> Result<ServerKeyRingRecord, DatabaseError> {
-        if let Some(record) = self.load_server_keyring_record().await? {
-            self.save_server_keyring_if_revision(record.revision, snapshot)
-                .await
-        } else {
-            self.insert_server_keyring_if_absent(snapshot).await
-        }
     }
 }
 
@@ -302,28 +280,33 @@ fn unix_timestamp_micros() -> Result<i64, DatabaseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVER_KEYRING_ID, ServerDatabase};
+    use super::{SERVER_KEYRING_SINGLETON_ID, ServerDatabase};
     use crate::database::{DatabaseConfig, DatabaseError};
     use sea_orm::EntityTrait;
     use smalux_protocol::noise::{NoiseIdentity, ServerKeyRing};
 
+    async fn test_database() -> ServerDatabase {
+        ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .expect("database should connect")
+    }
+
     #[tokio::test]
     async fn server_keyring_round_trips_current_identity() {
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("database should connect");
+        let database = test_database().await;
         let identity = NoiseIdentity::generate().expect("identity should generate");
         let keyring = ServerKeyRing::new(identity.clone());
 
         database
-            .save_server_keyring(&keyring.snapshot())
+            .insert_server_keyring_if_absent(&keyring.snapshot())
             .await
-            .expect("keyring should save");
-        let snapshot = database
-            .load_server_keyring()
+            .expect("keyring should be created");
+        let record = database
+            .load_server_keyring_record()
             .await
             .expect("keyring should load")
             .expect("keyring row should exist");
+        let snapshot = record.snapshot;
 
         assert_eq!(snapshot.current.public_key(), identity.public_key());
         assert_eq!(
@@ -333,43 +316,42 @@ mod tests {
         assert!(snapshot.next.is_none());
         assert!(snapshot.previous.is_none());
         assert!(snapshot.rotation_id.is_none());
-        assert!(
-            crate::database::entity::server_keyring::Entity::find_by_id(SERVER_KEYRING_ID)
-                .one(database.connection())
-                .await
-                .expect("row lookup should work")
-                .is_some()
-        );
+        let persisted = crate::database::entity::server_keyring::Entity::find_by_id(
+            SERVER_KEYRING_SINGLETON_ID,
+        )
+        .one(database.connection())
+        .await
+        .expect("row lookup should work")
+        .expect("singleton keyring row should exist");
+        // 持久化值以 `_` 表明它是内部单例记录，不能退回容易误解的 `default`。
+        assert_eq!(persisted.keyring_id, "_server");
     }
 
     #[tokio::test]
     async fn server_keyring_round_trips_pending_rotation() {
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("database should connect");
+        let database = test_database().await;
         let mut keyring = ServerKeyRing::new(
             NoiseIdentity::generate().expect("current identity should generate"),
         );
         keyring.prepare_rotation().expect("rotation should prepare");
         database
-            .save_server_keyring(&keyring.snapshot())
+            .insert_server_keyring_if_absent(&keyring.snapshot())
             .await
-            .expect("pending keyring should save");
+            .expect("pending keyring should be created");
 
-        let snapshot = database
-            .load_server_keyring()
+        let record = database
+            .load_server_keyring_record()
             .await
             .expect("pending keyring should load")
             .expect("keyring row should exist");
-        let restored = ServerKeyRing::from_snapshot(snapshot).expect("snapshot should validate");
+        let restored =
+            ServerKeyRing::from_snapshot(record.snapshot).expect("snapshot should validate");
         assert_eq!(restored.active_keys().len(), 2);
     }
 
     #[tokio::test]
     async fn server_keyring_cas_increments_revision() {
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("database should connect");
+        let database = test_database().await;
         let keyring =
             ServerKeyRing::new(NoiseIdentity::generate().expect("identity should generate"));
         let created = database
@@ -391,9 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_server_keyring_revision_is_rejected_without_overwrite() {
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("database should connect");
+        let database = test_database().await;
         let first =
             ServerKeyRing::new(NoiseIdentity::generate().expect("identity should generate"));
         let created = database
@@ -437,9 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn atomic_keyring_insert_keeps_the_first_identity() {
-        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
-            .await
-            .expect("database should connect");
+        let database = test_database().await;
         let first =
             ServerKeyRing::new(NoiseIdentity::generate().expect("first identity should generate"));
         let second =

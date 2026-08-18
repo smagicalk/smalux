@@ -1,29 +1,26 @@
 use crate::service::agent::{agent_registrar::PrepareRegistrationError, state::AgentState};
 use smalux_protocol::agent::v1::agent_transport_server::AgentTransport;
 use smalux_protocol::agent::v1::{
-    EchoResponse, HealthRequest, HealthResponse, Messages, MessagesResponse, ProtocolFrame,
-    SecureError, SecureErrorCode, SecureMessage, messages, messages_request, messages_response,
-    protocol_frame, secure_message,
+    HealthRequest, HealthResponse, ProtocolFrame, SecureErrorCode, protocol_frame,
 };
-use smalux_protocol::tonic_transport::{
-    IncomingSession, ServerSessionAcceptor, TonicNoiseSession, TransportError,
-};
+use smalux_protocol::tonic_transport::{ServerSessionAcceptor, TransportError};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+
+mod session;
 
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<ProtocolFrame, Status>> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct AgentServer {
     /// Agent 领域共享状态，包含数据库、密钥环和注册中心。
-    pub(crate) state: Arc<AgentState>,
-    pub(crate) next_session_id: Arc<AtomicU64>,
+    state: Arc<AgentState>,
+    next_session_id: Arc<AtomicU64>,
 }
 
 #[tonic::async_trait]
@@ -65,7 +62,7 @@ impl AgentTransport for AgentServer {
         tracing::info!(
             session_id,
             active_server_keys = keyring.active_keys().len(),
-            database_backend = self.state.database.backend_label(),
+            database_backend = self.state.database_backend,
             "Agent gRPC session accepted"
         );
 
@@ -147,301 +144,10 @@ impl AgentTransport for AgentServer {
 impl AgentServer {
     /// 使用启动阶段创建的 Agent 领域状态创建 gRPC 服务。
     pub fn new(state: Arc<AgentState>) -> Self {
-        let keyring = state.keyring_manager.current_keyring();
-        let current_key_id = keyring.as_ref().ok().and_then(|keyring| {
-            keyring
-                .active_keys()
-                .first()
-                .map(|identity| identity.key_id())
-        });
-        let active_keys = keyring
-            .as_ref()
-            .map(|keyring| keyring.active_keys().len())
-            .unwrap_or_default();
-        tracing::info!(
-            key_id = ?current_key_id,
-            active_keys,
-            database_backend = state.database.backend_label(),
-            "creating Agent server service"
-        );
         Self {
             state,
             next_session_id: Arc::new(Default::default()),
         }
-    }
-
-    /// 处理已经完成 Noise 握手的会话。
-    ///
-    /// XXpsk3 必须先完成四阶段注册状态机；IK 必须先检查吊销状态和业务授权。只有
-    /// 这些检查成功后，才把会话交给加密业务循环。注册资料错误会映射为对应的
-    /// 加密协议错误；数据库故障只返回 `Internal`，不会泄露存储细节。
-    async fn handle_established_session(
-        &self,
-        session_id: u64,
-        incoming: IncomingSession,
-    ) -> Result<(), TransportError> {
-        let (agent_id, mut session) = match incoming {
-            IncomingSession::Registration(mut registration) => {
-                let registration_permit = match self.state.try_acquire_registration() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        tracing::warn!(session_id, "Agent registration capacity reached");
-                        registration
-                            .reject(SecureError {
-                                code: SecureErrorCode::ResourceExhausted as i32,
-                                message: "registration capacity is temporarily exhausted"
-                                    .to_owned(),
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                let _registration_permit = registration_permit;
-                tracing::info!(
-                    session_id,
-                    "Agent XXpsk3 handshake completed; entering registration"
-                );
-                let peer_public_key = registration.peer_public_key();
-                let request = match registration.receive_request().await {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id,
-                            error = %error,
-                            "Agent registration request is invalid"
-                        );
-                        registration
-                            .reject(SecureError {
-                                code: SecureErrorCode::InvalidMessage as i32,
-                                message: "registration request is invalid".to_owned(),
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                };
-
-                let pending = match self
-                    .state
-                    .agent_registrar
-                    .prepare_registration(
-                        registration.registration_token_id(),
-                        &request.token,
-                        peer_public_key,
-                        &request.agent_name,
-                    )
-                    .await
-                {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        let (code, message) = registration_prepare_error(&error);
-                        tracing::warn!(
-                            session_id,
-                            error = %error,
-                            "Agent registration preparation was rejected"
-                        );
-                        registration
-                            .reject(SecureError {
-                                code: code as i32,
-                                message: message.to_owned(),
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                };
-
-                tracing::debug!(
-                    session_id,
-                    registration_id = ?pending.registration_id,
-                    agent_id_len = pending.agent_id.len(),
-                    "sending encrypted registration preparation"
-                );
-                registration
-                    .prepare(pending.registration_id, pending.agent_id.clone())
-                    .await?;
-                if let Err(error) = registration
-                    .wait_for_commit(pending.registration_id, Duration::from_secs(10))
-                    .await
-                {
-                    tracing::warn!(
-                        session_id,
-                        error = %error,
-                        "Agent did not complete registration commit"
-                    );
-                    registration
-                        .reject(SecureError {
-                            code: SecureErrorCode::InvalidMessage as i32,
-                            message: "registration commit was not completed".to_owned(),
-                        })
-                        .await?;
-                    return Ok(());
-                }
-
-                if let Err(error) = self
-                    .state
-                    .agent_registrar
-                    .commit_registration(&pending)
-                    .await
-                {
-                    tracing::warn!(
-                            session_id,
-                            error = %error,
-                            "Agent registration commit failed"
-                    );
-                    registration
-                        .reject(SecureError {
-                            code: SecureErrorCode::Internal as i32,
-                            message: "registration service is unavailable".to_owned(),
-                        })
-                        .await?;
-                    return Ok(());
-                }
-
-                let session = registration.complete(pending.registration_id).await?;
-                tracing::info!(
-                    session_id,
-                    agent_id_len = pending.agent_id.len(),
-                    "Agent registration committed"
-                );
-                (pending.agent_id, session)
-            }
-            IncomingSession::Authentication(authentication) => {
-                tracing::info!(
-                    session_id,
-                    "Agent IK handshake completed; entering authorization"
-                );
-                let peer_public_key = authentication.peer_public_key();
-                let revoked = match self.state.agent_registrar.is_revoked(peer_public_key).await {
-                    Ok(revoked) => revoked,
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id,
-                            error = %error,
-                            "Agent revocation lookup failed"
-                        );
-                        authentication
-                            .reject(SecureError {
-                                code: SecureErrorCode::Internal as i32,
-                                message: "authorization service is unavailable".to_owned(),
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                if revoked {
-                    tracing::warn!(session_id, "Agent is revoked");
-                    authentication
-                        .reject(SecureError {
-                            code: SecureErrorCode::AgentNotAuthorized as i32,
-                            message: "agent is not authorized".to_owned(),
-                        })
-                        .await?;
-                    return Ok(());
-                }
-
-                let authorized = match self
-                    .state
-                    .agent_registrar
-                    .authorize_agent(peer_public_key)
-                    .await
-                {
-                    Ok(authorized) => authorized,
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id,
-                            error = %error,
-                            "Agent authorization was rejected"
-                        );
-                        authentication
-                            .reject(SecureError {
-                                code: SecureErrorCode::AgentNotAuthorized as i32,
-                                message: "agent is not authorized".to_owned(),
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                tracing::info!(
-                    session_id,
-                    agent_key_id = ?authorized.public_key.key_id(),
-                    agent_id_len = authorized.agent_id.len(),
-                    "Agent authorization succeeded"
-                );
-                (authorized.agent_id, authentication.authorize())
-            }
-        };
-
-        self.handle_business_messages(session_id, &agent_id, &mut session)
-            .await
-    }
-
-    /// 处理 Noise transport mode 内的业务消息。
-    ///
-    /// `TonicNoiseSession::receive` 会自动处理心跳和对称密钥 rekey；这里仅负责业务
-    /// `MessagesRequest` 的回显。未来接入 Job/Task 时，应在这个边界分派到对应服务。
-    async fn handle_business_messages(
-        &self,
-        session_id: u64,
-        agent_id: &str,
-        session: &mut TonicNoiseSession,
-    ) -> Result<(), TransportError> {
-        while let Some(message) = session.receive().await? {
-            let Some(secure_message::Body::Messages(Messages {
-                body: Some(messages::Body::Request(request)),
-            })) = message.body
-            else {
-                tracing::warn!(
-                    session_id,
-                    agent_id_len = agent_id.len(),
-                    "Agent sent an unexpected encrypted business message"
-                );
-                session
-                    .send(SecureMessage {
-                        body: Some(secure_message::Body::Error(SecureError {
-                            code: SecureErrorCode::InvalidMessage as i32,
-                            message: "business session requires MessagesRequest".to_owned(),
-                        })),
-                    })
-                    .await?;
-                continue;
-            };
-
-            tracing::debug!(
-                session_id,
-                agent_id_len = agent_id.len(),
-                sequence = request.sequence,
-                "received encrypted Agent business request"
-            );
-            let response_payload = request.payload.map(|payload| match payload {
-                messages_request::Payload::BytesPayload(value) => {
-                    messages_response::Payload::BytesPayload(value)
-                }
-                messages_request::Payload::StringPayload(value) => {
-                    messages_response::Payload::StringPayload(value)
-                }
-                messages_request::Payload::EchoRequest(value) => {
-                    messages_response::Payload::EchoResponse(EchoResponse {
-                        payload: value.payload,
-                    })
-                }
-            });
-            session
-                .send(SecureMessage {
-                    body: Some(secure_message::Body::Messages(Messages {
-                        body: Some(messages::Body::Response(MessagesResponse {
-                            acknowledged_sequence: request.sequence,
-                            payload: response_payload,
-                        })),
-                    })),
-                })
-                .await?;
-            tracing::trace!(
-                session_id,
-                sequence = request.sequence,
-                "sent encrypted Agent business response"
-            );
-        }
-        tracing::info!(session_id, "Agent encrypted session disconnected");
-        Ok(())
     }
 }
 
@@ -474,7 +180,7 @@ fn registration_prepare_error(error: &PrepareRegistrationError) -> (SecureErrorC
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::DbErr;
+    use crate::database::DatabaseError;
 
     use super::{PrepareRegistrationError, SecureErrorCode, registration_prepare_error};
 
@@ -498,7 +204,7 @@ mod tests {
                 SecureErrorCode::InvalidMessage,
             ),
             (
-                PrepareRegistrationError::Database(DbErr::Custom(
+                PrepareRegistrationError::Database(DatabaseError::InvalidAgentRegistration(
                     "sensitive database detail".to_owned(),
                 )),
                 SecureErrorCode::Internal,
