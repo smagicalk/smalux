@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     agent::v1::{
-        AgentKeyRotationAccepted, JobCommand, JobCommandResult, KeyRotationMessage, Messages,
-        SecureMessage, ServerKeyAcknowledgement, TaskReport, key_rotation_message, secure_message,
+        AgentCapabilitySync, AgentJobPolicySync, AgentKeyRotationAccepted, AgentPluginSync,
+        DiagnosticMessage, JobCommand, JobCommandResult, KeyRotationMessage, SecureMessage,
+        ServerKeyAcknowledgement, TaskReport, key_rotation_message, secure_message,
     },
     noise::{AgentRotationPrepared, KeyId, RotationId, ServerRotationPrepared},
 };
@@ -65,23 +66,29 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    /// 发送原始加密业务 envelope，供高级或尚未封装的消息类型使用。
-    pub async fn send(&self, message: SecureMessage) -> Result<(), TransportError> {
+    /// 向 Driver 投递一个需要响应的命令，并统一处理命令队列或响应端关闭。
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, TransportError>>) -> DriverCommand,
+    ) -> Result<T, TransportError> {
         let (completed, result) = oneshot::channel();
-        self.commands
-            .send(DriverCommand::Send { message, completed })
-            .await
-            .map_err(|_| {
-                warn!("Noise session Driver command channel is closed while sending");
-                TransportError::Closed
-            })?;
+        self.commands.send(command(completed)).await.map_err(|_| {
+            warn!("Noise session Driver command channel is closed");
+            TransportError::Closed
+        })?;
         result.await.map_err(|_| TransportError::Closed)?
     }
 
-    /// 发送通用请求或响应消息。
-    pub async fn send_messages(&self, messages: Messages) -> Result<(), TransportError> {
+    /// 发送原始加密业务 envelope，供高级或尚未封装的消息类型使用。
+    pub async fn send(&self, message: SecureMessage) -> Result<(), TransportError> {
+        self.request(|completed| DriverCommand::Send { message, completed })
+            .await
+    }
+
+    /// 发送示例或链路诊断请求/响应。
+    pub async fn send_diagnostic(&self, message: DiagnosticMessage) -> Result<(), TransportError> {
         self.send(SecureMessage {
-            body: Some(secure_message::Body::Messages(messages)),
+            body: Some(secure_message::Body::Diagnostic(message)),
         })
         .await
     }
@@ -113,62 +120,64 @@ impl SessionHandle {
         .await
     }
 
+    /// 发送 Agent Job 策略查询、完整快照或确认。
+    pub async fn send_agent_job_policy(
+        &self,
+        message: AgentJobPolicySync,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentJobPolicy(message)),
+        })
+        .await
+    }
+
+    /// 发送 Agent 能力查询或完整快照。
+    pub async fn send_agent_capability(
+        &self,
+        message: AgentCapabilitySync,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentCapability(message)),
+        })
+        .await
+    }
+
+    /// 发送 Plus 插件查询、清单、运行时快照或确认。
+    pub async fn send_agent_plugin(&self, message: AgentPluginSync) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentPlugin(message)),
+        })
+        .await
+    }
+
     /// 手动发送加密 Ping；自动 Driver 通常会按 HeartbeatPolicy 自行发送。
     pub async fn ping(&self, nonce: u64) -> Result<(), TransportError> {
         debug!(
             nonce,
             "queueing manual heartbeat ping in Noise session Driver"
         );
-        let (completed, result) = oneshot::channel();
-        self.commands
-            .send(DriverCommand::Ping { nonce, completed })
+        self.request(|completed| DriverCommand::Ping { nonce, completed })
             .await
-            .map_err(|_| {
-                warn!(
-                    nonce,
-                    "Noise session Driver command channel is closed while pinging"
-                );
-                TransportError::Closed
-            })?;
-        result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// Agent/initiator 立即发起当前连接的同步 rekey，并返回新 generation。
     pub async fn request_rekey(&self) -> Result<u64, TransportError> {
         info!("queueing initiator Noise rekey in session Driver");
-        let (completed, result) = oneshot::channel();
-        self.commands
-            .send(DriverCommand::RequestRekey { completed })
+        self.request(|completed| DriverCommand::RequestRekey { completed })
             .await
-            .map_err(|_| {
-                warn!("Noise session Driver command channel is closed while requesting rekey");
-                TransportError::Closed
-            })?;
-        result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// Server/responder 通知 Agent 发起同步 rekey。
     pub async fn require_rekey(&self) -> Result<u64, TransportError> {
         info!("queueing responder Noise rekey requirement in session Driver");
-        let (completed, result) = oneshot::channel();
-        self.commands
-            .send(DriverCommand::RequireRekey { completed })
+        self.request(|completed| DriverCommand::RequireRekey { completed })
             .await
-            .map_err(|_| {
-                warn!("Noise session Driver command channel is closed while requiring rekey");
-                TransportError::Closed
-            })?;
-        result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// 查询 Driver 当前维护的心跳统计和最近一次 RTT 样本。
     pub async fn heartbeat_stats(&self) -> Result<HeartbeatStats, TransportError> {
-        let (completed, result) = oneshot::channel();
-        self.commands
-            .send(DriverCommand::HeartbeatStats { completed })
+        self.request(|completed| DriverCommand::HeartbeatStats { completed })
             .await
-            .map_err(|_| TransportError::Closed)?;
-        result.await.map_err(|_| TransportError::Closed)?
     }
 
     /// Agent 发送已经持久化 pending 私钥的静态公钥轮换请求。

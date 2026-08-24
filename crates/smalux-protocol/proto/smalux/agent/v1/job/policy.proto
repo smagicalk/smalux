@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// Agent 本地远程 Job 策略的会话内同步消息。
+message AgentJobPolicySync {
+  // Query、完整快照和确认互斥；空 body 属于无效业务消息。
+  oneof body {
+    // Server 请求 Agent 立即上报当前完整策略。
+    AgentJobPolicyQuery query = 1;
+    // Agent 主动上报或响应 Query 的完整策略。
+    AgentJobPolicySnapshot snapshot = 2;
+    // Server 确认当前会话已经接受指定 revision。
+    AgentJobPolicyAck acknowledgement = 3;
+  }
+}
+
+// Server 的策略查询不携带状态；Agent 始终返回最新完整快照。
+message AgentJobPolicyQuery {}
+
+// Agent 持久化并拥有的远程 Job 策略快照。
+message AgentJobPolicySnapshot {
+  // 策略真实变化时单调递增；相同 revision 的内容必须完全一致。
+  uint64 revision = 1;
+  // true 时拒绝所有 Server 下发的远程 Job。
+  bool deny_all = 2;
+  // 按稳定外层 Task kind 拒绝；发送前必须排序和去重。
+  repeated string denied_task_kinds = 3;
+}
+
+// Server 对策略快照的会话内确认。
+message AgentJobPolicyAck {
+  // Server 当前会话已经接受的最新策略 revision。
+  uint64 revision = 1;
+}

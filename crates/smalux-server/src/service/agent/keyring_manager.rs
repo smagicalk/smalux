@@ -1,13 +1,15 @@
 //! Server Noise 密钥环运行时管理器。
 //!
-//! `smalux-protocol` 中的 [`ServerKeyRing`] 仍然是纯状态机，不知道数据库、并发和
-//! 多进程。这个模块把三件运行时工作集中到一个 seam：
+//! `smalux-protocol` 中的 [`smalux_protocol::noise::ServerKeyRing`] 仍然是纯状态机，
+//! 不知道数据库、并发和多进程。这个模块把三件运行时工作集中到一个边界：
 //!
 //! 1. 启动时从数据库读取，缺失时使用数据库唯一键原子创建；
 //! 2. 轮换先在候选状态上计算，再用 revision CAS 持久化，成功后才替换内存句柄；
 //! 3. 周期性读取更高 revision，使同一个数据库上的其他 Server 进程最终收敛。
 //!
-//! 握手只需要调用 [`ServerKeyRingManager::current_keyring`] 取得一个 `Arc`。读句柄
+//! 握手只需要调用
+//! [`ServerKeyRingManager::current_keyring`](crate::service::agent::keyring_manager::ServerKeyRingManager::current_keyring)
+//! 取得一个 `Arc`。读句柄
 //! 一旦复制出来就不再持有管理器锁，因此数据库轮换和同步不会把 I/O 等待带入握手。
 
 use std::sync::{Arc, RwLock};

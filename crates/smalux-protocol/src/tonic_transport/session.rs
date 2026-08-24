@@ -10,21 +10,21 @@ use std::{
 
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     agent::v1::{
-        AgentKeyRotationAccepted, JobCommand, JobCommandResult, KeyRotationMessage, Ping, Pong,
-        ProtocolFrame, RekeyAck, RekeyRequest, RekeyRequired, SecureMessage,
-        ServerKeyAcknowledgement, SessionControl, TaskReport, key_rotation_message, secure_message,
-        session_control,
+        AgentCapabilitySync, AgentJobPolicySync, AgentKeyRotationAccepted, AgentPluginSync,
+        JobCommand, JobCommandResult, KeyRotationMessage, Ping, ProtocolFrame, RekeyRequest,
+        RekeyRequired, SecureMessage, ServerKeyAcknowledgement, SessionControl, TaskReport,
+        key_rotation_message, secure_message, session_control,
     },
     noise::{AgentRotationPrepared, NoiseError, RotationId, SecureSession, ServerRotationPrepared},
 };
 
 use super::TransportError;
-use super::driver::DriverCommand;
-
+mod control;
+mod driver_loop;
 mod policy;
 
 pub use policy::{
@@ -40,6 +40,16 @@ enum Outbound {
     Server(mpsc::Sender<Result<ProtocolFrame, Status>>),
 }
 
+/// Noise 会话在握手中的密码学角色。
+///
+/// 当前 Agent 是 initiator、Server 是 responder；这里保留 Noise 术语，避免把部署身份
+/// 与握手角色混为一谈。角色会影响密钥方向和哪一侧可以主动发起同步 rekey。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoiseSessionRole {
+    Initiator,
+    Responder,
+}
+
 /// 已建立的 Tonic + Noise 会话。所有方法使用 `&mut self`，保证 nonce 严格串行。
 pub struct TonicNoiseSession {
     /// 当前端对应的有界响应/请求 channel。
@@ -48,12 +58,10 @@ pub struct TonicNoiseSession {
     inbound: Streaming<ProtocolFrame>,
     /// 持有双向 AEAD key 和 nonce 的底层 Noise 会话。
     secure: SecureSession,
-    /// Agent/Client 为 initiator；Server 为 responder。
-    initiator: bool,
+    /// 当前会话的 Noise 密码学角色。
+    role: NoiseSessionRole,
     /// 当前 generation 建立时间，用于 max_age 判断。
     established_at: Instant,
-    /// 最近一次成功发送加密帧的时间。
-    last_sent: Instant,
     /// 最近一次成功解密入站帧的时间。
     last_received: Instant,
     /// 自动 Ping 使用的本地递增关联值。
@@ -77,7 +85,12 @@ impl TonicNoiseSession {
         inbound: Streaming<ProtocolFrame>,
         secure: SecureSession,
     ) -> Self {
-        Self::new(Outbound::Client(outbound), inbound, secure, true)
+        Self::new(
+            Outbound::Client(outbound),
+            inbound,
+            secure,
+            NoiseSessionRole::Initiator,
+        )
     }
 
     pub(crate) fn server(
@@ -85,7 +98,12 @@ impl TonicNoiseSession {
         inbound: Streaming<ProtocolFrame>,
         secure: SecureSession,
     ) -> Self {
-        Self::new(Outbound::Server(outbound), inbound, secure, false)
+        Self::new(
+            Outbound::Server(outbound),
+            inbound,
+            secure,
+            NoiseSessionRole::Responder,
+        )
     }
 
     /// 初始化两端共用的时间基准、心跳策略和 rekey 策略。
@@ -93,17 +111,16 @@ impl TonicNoiseSession {
         outbound: Outbound,
         inbound: Streaming<ProtocolFrame>,
         secure: SecureSession,
-        initiator: bool,
+        role: NoiseSessionRole,
     ) -> Self {
         let now = Instant::now();
-        info!(initiator, "created Tonic Noise session");
+        info!(?role, "created Tonic Noise session");
         Self {
             outbound,
             inbound,
             secure,
-            initiator,
+            role,
             established_at: now,
-            last_sent: now,
             last_received: now,
             next_ping_nonce: 1,
             pending_pings: std::collections::HashMap::new(),
@@ -141,14 +158,14 @@ impl TonicNoiseSession {
         self.heartbeat_stats.last_sample
     }
 
-    /// 最近没有成功发送达到 `interval` 时返回 `true`。
+    /// 最近没有成功接收达到 `interval` 时返回 `true`，需要主动 Ping 验证反向链路。
     pub fn should_ping(&self) -> bool {
-        self.last_sent.elapsed() >= self.heartbeat.interval
+        elapsed_since(self.last_received, self.heartbeat.interval)
     }
 
     /// 最近没有成功接收达到 `timeout` 时返回 `true`。
     pub fn heartbeat_expired(&self) -> bool {
-        self.last_received.elapsed() >= self.heartbeat.timeout
+        elapsed_since(self.last_received, self.heartbeat.timeout)
     }
 
     /// 判断当前 generation 是否达到自动 rekey 的时长或帧数阈值。
@@ -163,7 +180,7 @@ impl TonicNoiseSession {
         MaintenanceStatus {
             heartbeat_expired: self.heartbeat_expired(),
             ping_due: self.should_ping(),
-            rekey_due: self.initiator && self.should_rekey(),
+            rekey_due: self.role == NoiseSessionRole::Initiator && self.should_rekey(),
         }
     }
 
@@ -203,7 +220,6 @@ impl TonicNoiseSession {
         let message_kind = secure_message_kind(&message);
         let frame = self.secure.encrypt(&message)?;
         self.send_frame(frame).await?;
-        self.last_sent = Instant::now();
         trace!(
             message_kind,
             generation = self.secure.generation(),
@@ -240,6 +256,39 @@ impl TonicNoiseSession {
         .await
     }
 
+    /// 发送 Agent Job 策略查询、完整快照或确认。
+    pub async fn send_agent_job_policy(
+        &mut self,
+        message: AgentJobPolicySync,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentJobPolicy(message)),
+        })
+        .await
+    }
+
+    /// 发送 Agent 能力查询或完整快照。
+    pub async fn send_agent_capability(
+        &mut self,
+        message: AgentCapabilitySync,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentCapability(message)),
+        })
+        .await
+    }
+
+    /// 发送 Plus 插件查询、清单、运行时快照或确认。
+    pub async fn send_agent_plugin(
+        &mut self,
+        message: AgentPluginSync,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::AgentPlugin(message)),
+        })
+        .await
+    }
+
     /// 接收下一条强类型业务事件；心跳和 rekey 控制帧仍在内部处理。
     pub async fn receive_event(&mut self) -> Result<Option<SessionEvent>, TransportError> {
         self.receive()
@@ -261,7 +310,7 @@ impl TonicNoiseSession {
                 return Ok(Some(message));
             }
             // 只有 initiator 发起同步 rekey，防止双方同时切 key 造成方向失步。
-            if self.initiator && self.should_rekey() {
+            if self.role == NoiseSessionRole::Initiator && self.should_rekey() {
                 debug!(
                     generation = self.secure.generation(),
                     "initiator rekey threshold reached while receiving"
@@ -292,23 +341,8 @@ impl TonicNoiseSession {
                 info!("remote closed Noise session stream");
                 return Ok(None);
             };
-            let message = self.secure.decrypt(frame)?;
-            self.last_received = Instant::now();
-            trace!(
-                message_kind = secure_message_kind(&message),
-                "received encrypted Noise session message"
-            );
-            match message.body {
-                Some(secure_message::Body::SessionControl(control)) => {
-                    trace!("received encrypted Noise session control message");
-                    match self.handle_control(control).await {
-                        Err(TransportError::RekeyRequired) if self.initiator => {
-                            self.request_rekey().await?;
-                        }
-                        result => result?,
-                    }
-                }
-                _ => return Ok(Some(message)),
+            if let Some(message) = self.process_inbound_frame(frame).await? {
+                return Ok(Some(message));
             }
         }
     }
@@ -358,7 +392,7 @@ impl TonicNoiseSession {
     ///
     /// 只有 responder 可以调用；返回值是期望的下一 generation。
     pub async fn require_rekey(&mut self) -> Result<u64, TransportError> {
-        if self.initiator {
+        if self.role == NoiseSessionRole::Initiator {
             warn!("initiator attempted to require a responder rekey");
             return Err(TransportError::Protocol(
                 "only the Noise responder may require rekey".to_owned(),
@@ -437,7 +471,7 @@ impl TonicNoiseSession {
     /// Ack 仍由旧 key 加密；验证成功后双方才按固定方向顺序切换密钥。
     pub async fn request_rekey(&mut self) -> Result<u64, TransportError> {
         // responder 只能调用 require_rekey，不能直接进入 initiator 状态机。
-        if !self.initiator {
+        if self.role != NoiseSessionRole::Initiator {
             warn!("responder attempted to request an initiator rekey");
             return Err(TransportError::Protocol(
                 "only the Noise initiator may request rekey".to_owned(),
@@ -525,267 +559,30 @@ impl TonicNoiseSession {
         );
     }
 
-    /// 处理一条已经解密的 `SessionControl`。
-    async fn handle_control(&mut self, control: SessionControl) -> Result<(), TransportError> {
-        match control.body {
-            Some(session_control::Body::Ping(ping)) => {
-                trace!(nonce = ping.nonce, "received encrypted heartbeat ping");
-                // 记录 responder 的墙上时钟时间；发送端的 RTT 仍使用本地 Instant 计算。
-                let responder_received_at_unix_micros = unix_micros();
-                let responder_sent_at_unix_micros = unix_micros();
-                // Pong 原样返回关联 nonce 和 Ping 诊断时间，便于发送端生成完整样本。
-                self.send(control_message(session_control::Body::Pong(Pong {
-                    nonce: ping.nonce,
-                    echoed_sent_at_unix_micros: ping.sent_at_unix_micros,
-                    responder_received_at_unix_micros,
-                    responder_sent_at_unix_micros,
-                })))
-                .await
-            }
-            Some(session_control::Body::Pong(pong)) => {
-                let Some(sent_at) = self.pending_pings.remove(&pong.nonce) else {
-                    // 迟到或重复 Pong 不应让正常 Session 失效。
-                    warn!(nonce = pong.nonce, "received an unmatched heartbeat pong");
-                    return Ok(());
-                };
-                let sample = HeartbeatSample {
-                    nonce: pong.nonce,
-                    rtt: sent_at.elapsed(),
-                    sent_at_unix_micros: pong.echoed_sent_at_unix_micros,
-                    responder_received_at_unix_micros: pong.responder_received_at_unix_micros,
-                    responder_sent_at_unix_micros: pong.responder_sent_at_unix_micros,
-                    received_at_unix_micros: unix_micros(),
-                };
-                self.record_heartbeat_sample(sample);
-                Ok(())
-            }
-            Some(session_control::Body::RekeyRequest(request)) if !self.initiator => {
-                info!(
-                    generation = request.generation,
-                    "responder received Noise rekey request"
-                );
-                // responder 只接受严格的下一代，拒绝重复、跳代和回放。
-                if request.generation != self.secure.generation().saturating_add(1) {
-                    warn!(
-                        requested_generation = request.generation,
-                        current_generation = self.secure.generation(),
-                        "received unexpected Noise rekey generation"
-                    );
-                    return Err(TransportError::Protocol(
-                        "unexpected rekey generation".to_owned(),
-                    ));
-                }
-                self.secure.rekey_incoming();
-                self.send(control_message(session_control::Body::RekeyAck(RekeyAck {
-                    generation: request.generation,
-                })))
-                .await?;
-                self.secure.rekey_outgoing();
-                self.secure.finish_rekey(request.generation);
-                self.established_at = Instant::now();
-                info!(
-                    generation = request.generation,
-                    "responder completed Noise rekey"
-                );
-                Ok(())
-            }
-            Some(session_control::Body::RekeyRequired(_)) if self.initiator => {
-                // 把控制权交给 Agent 主循环，由它显式调用 request_rekey。
-                debug!("initiator received a Server rekey requirement");
-                Err(TransportError::RekeyRequired)
-            }
-            Some(session_control::Body::RekeyAck(_)) => {
-                warn!("received an unexpected Noise rekey acknowledgement");
-                Err(TransportError::Protocol(
-                    "unexpected rekey acknowledgement".to_owned(),
-                ))
-            }
-            _ => {
-                warn!("received an invalid encrypted session control message");
-                Err(TransportError::Protocol(
-                    "invalid session control message".to_owned(),
-                ))
-            }
-        }
-    }
-
-    /// 运行可选 Driver 的单所有者事件循环。
-    pub(crate) async fn run_driver(
-        mut self,
-        mut commands: mpsc::Receiver<DriverCommand>,
-        events: mpsc::Sender<Result<SessionEvent, TransportError>>,
-    ) {
-        info!(initiator = self.initiator, "Noise session driver started");
-        // interval 的第一次 tick 会立即完成，先消费它，避免 Driver 启动后无条件发送 Ping。
-        let tick_period = self.heartbeat.interval.max(Duration::from_millis(1));
-        let mut maintenance = tokio::time::interval(tick_period);
-        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        maintenance.tick().await;
-
-        loop {
-            tokio::select! {
-                // 入站优先，尽快处理 Ping、rekey 等控制帧，降低对端等待时间。
-                biased;
-                inbound = self.inbound.message() => {
-                    let frame = match inbound {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) => {
-                            info!("remote closed stream; stopping Noise session driver");
-                            let _ = events.send(Err(TransportError::Closed)).await;
-                            return;
-                        }
-                        Err(error) => {
-                            error!(error = %error, "inbound gRPC stream failed in Noise session driver");
-                            let _ = events.send(Err(TransportError::Status(error))).await;
-                            return;
-                        }
-                    };
-                    match self.process_driver_frame(frame).await {
-                        Ok(Some(event)) => {
-                            if events.send(Ok(event)).await.is_err() {
-                                debug!("business event receiver dropped; stopping Noise session driver");
-                                return;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            error!(error = %error, "failed to process inbound Noise frame in driver");
-                            let _ = events.send(Err(error)).await;
-                            return;
-                        }
-                    }
-                    if self.flush_buffered_events(&events).await.is_err() {
-                        return;
-                    }
-                }
-                command = commands.recv() => {
-                    match command {
-                        Some(DriverCommand::Send { message, completed }) => {
-                            match self.send(message).await {
-                                Ok(()) => {
-                                    let _ = completed.send(Ok(()));
-                                }
-                                Err(error) => {
-                                    error!(error = %error, "Driver failed to send encrypted message");
-                                    let _ = completed.send(Err(error));
-                                    return;
-                                }
-                            }
-                        }
-                        Some(DriverCommand::Shutdown { completed }) => {
-                            info!("Noise session driver shutdown requested");
-                            let _ = completed.send(());
-                            return;
-                        }
-                        Some(DriverCommand::Ping { nonce, completed }) => {
-                            let failed = match self.ping(nonce).await {
-                                Ok(()) => {
-                                    let _ = completed.send(Ok(()));
-                                    false
-                                }
-                                Err(error) => {
-                                    warn!(error = %error, "Driver failed to send heartbeat ping");
-                                    let _ = completed.send(Err(error));
-                                    true
-                                }
-                            };
-                            if failed {
-                                return;
-                            }
-                        }
-                        Some(DriverCommand::RequestRekey { completed }) => {
-                            let failed = match self.request_rekey().await {
-                                Ok(generation) => {
-                                    let _ = completed.send(Ok(generation));
-                                    false
-                                }
-                                Err(error) => {
-                                    warn!(error = %error, "Driver failed to request Noise rekey");
-                                    let _ = completed.send(Err(error));
-                                    true
-                                }
-                            };
-                            if failed {
-                                return;
-                            }
-                            if self.flush_buffered_events(&events).await.is_err() {
-                                return;
-                            }
-                        }
-                        Some(DriverCommand::RequireRekey { completed }) => {
-                            let failed = match self.require_rekey().await {
-                                Ok(generation) => {
-                                    let _ = completed.send(Ok(generation));
-                                    false
-                                }
-                                Err(error) => {
-                                    warn!(error = %error, "Driver failed to require Noise rekey");
-                                    let _ = completed.send(Err(error));
-                                    true
-                                }
-                            };
-                            if failed {
-                                return;
-                            }
-                        }
-                        Some(DriverCommand::HeartbeatStats { completed }) => {
-                            let _ = completed.send(Ok(self.heartbeat_stats()));
-                        }
-                        None => {
-                            info!("all Noise session driver command senders dropped");
-                            return;
-                        }
-                    }
-                }
-                _ = maintenance.tick() => {
-                    if let Err(error) = self.perform_maintenance().await {
-                        error!(error = %error, "Noise session maintenance failed in driver");
-                        let _ = events.send(Err(error)).await;
-                        return;
-                    }
-                    if self.flush_buffered_events(&events).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// 解密 Driver 收到的一帧，并在返回业务事件前完成所有内部控制动作。
-    async fn process_driver_frame(
+    /// 解密一帧，并让 Manual 与 Driver 共用同一套控制消息和 rekey 语义。
+    pub(super) async fn process_inbound_frame(
         &mut self,
         frame: ProtocolFrame,
-    ) -> Result<Option<SessionEvent>, TransportError> {
+    ) -> Result<Option<SecureMessage>, TransportError> {
         let message = self.secure.decrypt(frame)?;
         self.last_received = Instant::now();
         trace!(
             message_kind = secure_message_kind(&message),
-            "Driver received encrypted Noise session message"
+            "received encrypted Noise session message"
         );
-        match message.body {
-            Some(secure_message::Body::SessionControl(control)) => {
-                match self.handle_control(control).await {
-                    Err(TransportError::RekeyRequired) if self.initiator => {
-                        self.request_rekey().await?;
-                    }
-                    result => result?,
-                }
-                Ok(None)
-            }
-            _ => SessionEvent::try_from(message).map(Some),
-        }
-    }
 
-    /// 把 rekey 等待期间缓存的业务消息按原始接收顺序交给 Driver 事件队列。
-    async fn flush_buffered_events(
-        &mut self,
-        events: &mpsc::Sender<Result<SessionEvent, TransportError>>,
-    ) -> Result<(), ()> {
-        while let Some(message) = self.buffered_messages.pop_front() {
-            let event = SessionEvent::try_from(message);
-            events.send(event).await.map_err(|_| ())?;
+        let Some(secure_message::Body::SessionControl(control)) = message.body else {
+            return Ok(Some(message));
+        };
+
+        trace!("received encrypted Noise session control message");
+        match self.handle_control(control).await {
+            Err(TransportError::RekeyRequired) if self.role == NoiseSessionRole::Initiator => {
+                self.request_rekey().await?;
+            }
+            result => result?,
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn send_frame(&self, frame: ProtocolFrame) -> Result<(), TransportError> {
@@ -802,8 +599,15 @@ impl TonicNoiseSession {
     }
 }
 
+/// 判断对端最后一次入站活动距今是否已达到给定时长。
+///
+/// Ping 与超时都依据入站活动：本地持续发送数据不能证明对端仍可接收或回包。
+fn elapsed_since(last_received: Instant, duration: Duration) -> bool {
+    last_received.elapsed() >= duration
+}
+
 /// 返回当前系统时钟的 Unix 微秒值，仅供心跳诊断字段使用。
-fn unix_micros() -> u64 {
+pub(super) fn unix_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_micros().min(u64::MAX as u128) as u64)
@@ -815,7 +619,7 @@ fn control(body: session_control::Body) -> SecureMessage {
     control_message(body)
 }
 
-fn control_message(body: session_control::Body) -> SecureMessage {
+pub(super) fn control_message(body: session_control::Body) -> SecureMessage {
     SecureMessage {
         body: Some(secure_message::Body::SessionControl(SessionControl {
             body: Some(body),
@@ -835,11 +639,14 @@ fn rotation(body: key_rotation_message::Body) -> SecureMessage {
 fn secure_message_kind(message: &SecureMessage) -> &'static str {
     match message.body.as_ref() {
         Some(secure_message::Body::RegistrationMessage(_)) => "registration",
-        Some(secure_message::Body::Messages(_)) => "messages",
+        Some(secure_message::Body::Diagnostic(_)) => "diagnostic",
         Some(secure_message::Body::KeyRotation(_)) => "key_rotation",
         Some(secure_message::Body::JobCommand(_)) => "job_command",
         Some(secure_message::Body::JobCommandResult(_)) => "job_command_result",
         Some(secure_message::Body::TaskReport(_)) => "task_report",
+        Some(secure_message::Body::AgentJobPolicy(_)) => "agent_job_policy",
+        Some(secure_message::Body::AgentCapability(_)) => "agent_capability",
+        Some(secure_message::Body::AgentPlugin(_)) => "agent_plugin",
         Some(secure_message::Body::SessionControl(_)) => "session_control",
         Some(secure_message::Body::Error(_)) => "error",
         None => "empty",
@@ -850,5 +657,20 @@ impl From<NoiseError> for TransportError {
     /// 允许加解密和控制状态机使用 `?` 把核心错误提升为传输层错误。
     fn from(error: NoiseError) -> Self {
         Self::Noise(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::elapsed_since;
+
+    #[test]
+    fn heartbeat_ping_due_is_based_on_inbound_idle_time() {
+        let last_received = Instant::now() - Duration::from_millis(20);
+
+        assert!(elapsed_since(last_received, Duration::from_millis(1)));
+        assert!(!elapsed_since(last_received, Duration::from_secs(1)));
     }
 }

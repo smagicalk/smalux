@@ -48,7 +48,7 @@ Noise 会话已经具有测试覆盖；Server 的生产存储、正式管理 API
 Server / 本地配置
         |
         v
-   JobCommand -----> Agent JobController
+   JobCommand -----> Agent RemoteJobController
                           |
                           v
                   Scheduler + ReportingTask

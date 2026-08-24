@@ -12,6 +12,8 @@ pub struct Model {
     pub token_id: String,
     /// XXpsk3 使用的 32 字节 PSK；生产环境应由应用层加密或使用密钥管理系统保护。
     pub psk: Vec<u8>,
+    /// Server 签发 Token 时指定的可选展示名称；为空时注册阶段使用生成的 Agent ID。
+    pub display_name: Option<String>,
     /// active、used 或 revoked；状态值由注册中心统一解析。
     pub status: String,
     /// 创建时间，Unix 微秒。

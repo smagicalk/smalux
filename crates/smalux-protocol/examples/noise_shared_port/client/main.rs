@@ -11,13 +11,13 @@ use std::{
 };
 
 use common::{
-    AGENT_DATA_DIR_ENV, AGENT_NAME_ENV, DEFAULT_AGENT_DATA_DIR, DEFAULT_AGENT_NAME,
-    DEFAULT_ENDPOINT, ENDPOINT_ENV, ExampleMode, GRPC_PREFIX, example_heartbeat_observe_window,
-    example_heartbeat_policy, print_heartbeat_stats,
+    AGENT_DATA_DIR_ENV, DEFAULT_AGENT_DATA_DIR, DEFAULT_ENDPOINT, ENDPOINT_ENV, ExampleMode,
+    GRPC_PREFIX, example_heartbeat_observe_window, example_heartbeat_policy, print_heartbeat_stats,
 };
 use smalux_protocol::{
     agent::v1::{
-        Messages, MessagesRequest, SecureMessage, messages, messages_request, secure_message,
+        DiagnosticMessage, DiagnosticRequest, SecureMessage, diagnostic_message,
+        diagnostic_request, secure_message,
     },
     noise::{NoiseIdentity, NoisePublicKey},
     tonic_transport::{
@@ -91,11 +91,10 @@ async fn register_agent(
     let token = read_registration_token()?;
     let credential = parse_registration_credential(&token)?;
     info!(token_id = %credential.token_id, "parsed registration credential; secret PSK is not logged");
-    let agent_name = env::var(AGENT_NAME_ENV).unwrap_or_else(|_| DEFAULT_AGENT_NAME.to_owned());
     // Agent 在本地生成长期静态密钥；私钥从不通过 gRPC 发送。
     let stored = load_or_generate_identity(&data_dir.join("noise"))?;
     let noise = NoiseIdentity::from_parts(&stored.private_key, &stored.public_key)?;
-    debug!(agent_key_id = ?noise.key_id(), agent_name = %agent_name, "prepared local Agent Noise identity and display name for XXpsk3");
+    debug!(agent_key_id = ?noise.key_id(), "prepared local Agent Noise identity for XXpsk3");
     let mut client = AgentProtocolClient::new(endpoint);
     client.set_grpc_prefix(GRPC_PREFIX);
     // prepare 只执行到 Server 保存 pending；此时还没有最终消费 Token。
@@ -105,7 +104,6 @@ async fn register_agent(
             &credential.psk,
             credential.token_id,
             token,
-            agent_name,
         )
         .await?;
 
@@ -122,7 +120,9 @@ async fn register_agent(
         "saved pending Agent registration before commit"
     );
     // commit 等待 Server 激活 Agent 并返回 RegistrationCommitted。
-    let outcome = pending.commit().await?;
+    let outcome = pending
+        .send_registration_commit_and_receive_committed()
+        .await?;
     mark_registration_committed(data_dir)?;
 
     // 到这里 Server 已被 PSK 认证，才把刚学到的 Server 公钥加入长期身份。
@@ -217,10 +217,10 @@ async fn run_messages_manual(
         debug!(sequence, "Client sending encrypted metric batch");
         session
             .send(SecureMessage {
-                body: Some(secure_message::Body::Messages(Messages {
-                    body: Some(messages::Body::Request(MessagesRequest {
+                body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                    body: Some(diagnostic_message::Body::Request(DiagnosticRequest {
                         sequence,
-                        payload: Some(messages_request::Payload::StringPayload(payload)),
+                        payload: Some(diagnostic_request::Payload::StringPayload(payload)),
                     })),
                 })),
             })
@@ -231,8 +231,8 @@ async fn run_messages_manual(
             .receive_event()
             .await?
             .ok_or("Server closed the session")?;
-        let SessionEvent::Messages(Messages {
-            body: Some(messages::Body::Response(response)),
+        let SessionEvent::Diagnostic(DiagnosticMessage {
+            body: Some(diagnostic_message::Body::Response(response)),
         }) = response
         else {
             return Err("Server returned an unexpected response".into());
@@ -240,9 +240,9 @@ async fn run_messages_manual(
         if response.acknowledged_sequence != sequence
             || response.payload
                 != Some(
-                    smalux_protocol::agent::v1::messages_response::Payload::StringPayload(format!(
-                        "metric-batch-{sequence}"
-                    )),
+                    smalux_protocol::agent::v1::diagnostic_response::Payload::StringPayload(
+                        format!("metric-batch-{sequence}"),
+                    ),
                 )
         {
             return Err("Server returned an invalid ACK".into());
@@ -300,10 +300,10 @@ async fn run_messages_driver(
         let payload = format!("metric-batch-{sequence}");
         running
             .handle
-            .send_messages(Messages {
-                body: Some(messages::Body::Request(MessagesRequest {
+            .send_diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(DiagnosticRequest {
                     sequence,
-                    payload: Some(messages_request::Payload::StringPayload(payload)),
+                    payload: Some(diagnostic_request::Payload::StringPayload(payload)),
                 })),
             })
             .await?;
@@ -312,8 +312,8 @@ async fn run_messages_driver(
             .recv()
             .await
             .ok_or("SessionDriver stopped before returning an event")??;
-        let SessionEvent::Messages(Messages {
-            body: Some(messages::Body::Response(response)),
+        let SessionEvent::Diagnostic(DiagnosticMessage {
+            body: Some(diagnostic_message::Body::Response(response)),
         }) = event
         else {
             return Err("Server returned an unexpected Driver event".into());

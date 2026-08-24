@@ -6,10 +6,9 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::SocketTaskConfig;
 use smalux_protocol::agent::v1::{
-    CollectionMode, SampleMetadata, SocketAddressFamily, SocketAddressFamilySelection,
-    SocketAvailability, SocketCollectionStatus, SocketEntry, SocketProtocol,
-    SocketProtocolSelection, SocketSnapshot, TaskResult, TcpConnectionState, TcpStateCount,
-    task_result,
+    CollectionMode, SocketAddressFamily, SocketAddressFamilySelection, SocketAvailability,
+    SocketCollectionStatus, SocketEntry, SocketProtocol, SocketProtocolSelection, SocketSnapshot,
+    TaskResult, TcpConnectionState, TcpStateCount, task_result,
 };
 
 use crate::{
@@ -21,7 +20,7 @@ use crate::{
     },
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// Socket Proto 配置无法编译为可执行参数。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,7 +41,7 @@ pub enum SocketConfigError {
 
 /// 使用独立阻塞查询采集 TCP/UDP socket 的调度任务。
 pub struct SocketTask {
-    state: CollectState<SocketCollector>,
+    state: BlockingCollectorState<SocketCollector>,
     config: SocketTaskConfig,
     mode: CollectionMode,
     protocols: SocketProtocolSelection,
@@ -86,7 +85,7 @@ impl SocketTask {
             })
             .transpose()?;
         Ok(Self {
-            state: CollectState::new(SocketCollector),
+            state: BlockingCollectorState::new(SocketCollector),
             config,
             mode,
             protocols,
@@ -121,15 +120,9 @@ impl ReportingTask for SocketTask {
                     .map_err(|error| anyhow!(error))
             })
             .await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Socket(into_proto_snapshot(
-                output.snapshot,
-            ))),
-        })
+        Ok(output.into_task_result(|snapshot| {
+            task_result::Result::Socket(into_proto_snapshot(snapshot))
+        }))
     }
 
     fn kind(&self) -> &'static str {

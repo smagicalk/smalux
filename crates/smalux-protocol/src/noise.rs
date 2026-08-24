@@ -137,7 +137,6 @@ mod tests {
                 RegistrationMessage {
                     body: Some(registration_message::Body::Request(RegistrationRequest {
                         token: "token".to_owned(),
-                        agent_name: "agent".to_owned(),
                     })),
                 },
             )),
@@ -222,7 +221,6 @@ mod tests {
                 RegistrationMessage {
                     body: Some(registration_message::Body::Request(RegistrationRequest {
                         token: "before".to_owned(),
-                        agent_name: "agent".to_owned(),
                     })),
                 },
             )),
@@ -245,7 +243,6 @@ mod tests {
                 RegistrationMessage {
                     body: Some(registration_message::Body::Request(RegistrationRequest {
                         token: "after".to_owned(),
-                        agent_name: "agent".to_owned(),
                     })),
                 },
             )),

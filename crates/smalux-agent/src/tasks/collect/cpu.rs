@@ -1,18 +1,18 @@
 //! CPU 周期采集任务。
 
 use async_trait::async_trait;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::system::SystemCollector,
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// 独立维护 CPU 采样基线的调度任务。
 pub struct CpuTask {
-    state: CollectState<SystemCollector>,
+    state: BlockingCollectorState<SystemCollector>,
 }
 
 impl CpuTask {
@@ -22,7 +22,7 @@ impl CpuTask {
     /// 创建拥有独立 CPU 采样基线的 Task。
     pub fn new() -> Self {
         Self {
-            state: CollectState::new(SystemCollector::new()),
+            state: BlockingCollectorState::new(SystemCollector::new()),
         }
     }
 }
@@ -40,13 +40,7 @@ impl ReportingTask for CpuTask {
             .state
             .collect(context, SystemCollector::collect_cpu)
             .await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Cpu(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::Cpu))
     }
 
     fn kind(&self) -> &'static str {

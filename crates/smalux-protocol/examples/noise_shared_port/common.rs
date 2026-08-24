@@ -67,8 +67,6 @@ pub const ADDRESS_ENV: &str = "SMALUX_EXAMPLE_ADDR";
 pub const ENDPOINT_ENV: &str = "SMALUX_EXAMPLE_ENDPOINT";
 pub const SERVER_DATA_DIR_ENV: &str = "SMALUX_EXAMPLE_SERVER_DATA_DIR";
 pub const AGENT_DATA_DIR_ENV: &str = "SMALUX_EXAMPLE_AGENT_DATA_DIR";
-pub const AGENT_NAME_ENV: &str = "SMALUX_EXAMPLE_AGENT_NAME";
-pub const DEFAULT_AGENT_NAME: &str = "example-agent";
 pub const REVOKE_AGENT_ENV: &str = "SMALUX_EXAMPLE_REVOKE_AGENT";
 /// 可选的 Server TLS 证书链 PEM 路径；不设置时 Server 使用 h2c。
 pub const TLS_CERT_ENV: &str = "SMALUX_EXAMPLE_TLS_CERT";

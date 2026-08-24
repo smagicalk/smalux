@@ -42,6 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .compile_with_config(grpc_config, &grpc_protos, &[proto_root, protoc_include])?;
 
+    // 逐个监听文件，避免 Windows/IDE 增量构建继续使用旧的 OUT_DIR 生成代码。
+    // 目录监听保留用于捕获新增或删除的 proto 文件。
     println!("cargo:rerun-if-changed={}", proto_v1.display());
+    for proto in &grpc_protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
+    }
     Ok(())
 }

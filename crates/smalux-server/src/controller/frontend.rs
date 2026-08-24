@@ -13,7 +13,7 @@ use crate::{database::ServerDatabase, state::AppState};
 pub(crate) const HEALTH_PATH: &str = "/api/v1/health";
 
 /// 装配前端/普通 HTTP 路由。
-pub(crate) fn get_route() -> Router<AppState> {
+pub(crate) fn router() -> Router<AppState> {
     tracing::debug!(path = HEALTH_PATH, "mounting frontend HTTP routes");
     Router::new().route(HEALTH_PATH, get(health))
 }

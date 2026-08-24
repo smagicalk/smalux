@@ -2,11 +2,12 @@ use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use smalux_protocol::{
     agent::v1::{
-        HealthRequest, HealthResponse, Messages, MessagesResponse, ProtocolErrorCode,
+        DiagnosticMessage, DiagnosticResponse, HealthRequest, HealthResponse, ProtocolErrorCode,
         ProtocolFrame, SecureError, SecureErrorCode, SecureMessage,
         agent_transport_client::AgentTransportClient,
         agent_transport_server::{AgentTransport, AgentTransportServer},
-        messages, messages_request, messages_response, protocol_frame, secure_message,
+        diagnostic_message, diagnostic_request, diagnostic_response, protocol_frame,
+        secure_message,
     },
     noise::{ClientXxHandshake, NoiseIdentity, ServerKeyRing},
     tonic_transport::{
@@ -88,6 +89,38 @@ fn secure_messages_are_classified_as_typed_session_events() {
     assert_eq!(report.job_revision, 7);
 }
 
+#[test]
+fn agent_job_policy_snapshot_is_classified_as_a_typed_session_event() {
+    use smalux_protocol::{
+        agent::v1::{
+            AgentJobPolicySnapshot, AgentJobPolicySync, agent_job_policy_sync, secure_message,
+        },
+        tonic_transport::SessionEvent,
+    };
+
+    let event = SessionEvent::try_from(SecureMessage {
+        body: Some(secure_message::Body::AgentJobPolicy(AgentJobPolicySync {
+            body: Some(agent_job_policy_sync::Body::Snapshot(
+                AgentJobPolicySnapshot {
+                    revision: 7,
+                    deny_all: false,
+                    denied_task_kinds: vec!["smalux.collect.process.v1".to_owned()],
+                },
+            )),
+        })),
+    })
+    .unwrap();
+
+    let SessionEvent::AgentJobPolicy(message) = event else {
+        panic!("expected a typed Agent Job policy event");
+    };
+    let Some(agent_job_policy_sync::Body::Snapshot(snapshot)) = message.body else {
+        panic!("expected an Agent Job policy snapshot");
+    };
+    assert_eq!(snapshot.revision, 7);
+    assert_eq!(snapshot.denied_task_kinds, ["smalux.collect.process.v1"]);
+}
+
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<ProtocolFrame, Status>> + Send + 'static>>;
 
 #[derive(Clone)]
@@ -157,10 +190,10 @@ impl TestService {
         let mut session = match incoming {
             IncomingSession::Registration(mut registration) => {
                 let peer_key = registration.peer_public_key();
-                let request = registration.receive_request().await?;
+                let request = registration.receive_registration_request().await?;
                 if request.token != "test-token" {
                     registration
-                        .reject(SecureError {
+                        .send_rejection(SecureError {
                             code: SecureErrorCode::InvalidToken as i32,
                             message: "invalid token".to_owned(),
                         })
@@ -171,16 +204,18 @@ impl TestService {
                 // 测试 Server 分配稳定 ID；展示名称不得直接充当业务身份。
                 let agent_id = "server-assigned-agent-id".to_owned();
                 registration
-                    .prepare(registration_id, agent_id.clone())
+                    .send_registration_prepared(registration_id, agent_id.clone())
                     .await?;
                 registration
-                    .wait_for_commit(registration_id, self.handshake_timeout)
+                    .receive_registration_commit(registration_id, self.handshake_timeout)
                     .await?;
                 self.agents
                     .lock()
                     .await
                     .insert(peer_key.as_bytes().to_vec(), agent_id);
-                registration.complete(registration_id).await?
+                registration
+                    .send_registration_committed(registration_id)
+                    .await?
             }
             IncomingSession::Authentication(authentication) => {
                 let peer_key = authentication.peer_public_key();
@@ -198,10 +233,10 @@ impl TestService {
                 // 故意在 Agent 发起 rekey 前插入业务帧，验证等待 Ack 时会缓存而不是报错。
                 session
                     .send(SecureMessage {
-                        body: Some(secure_message::Body::Messages(Messages {
-                            body: Some(messages::Body::Response(MessagesResponse {
+                        body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                            body: Some(diagnostic_message::Body::Response(DiagnosticResponse {
                                 acknowledged_sequence: 999,
-                                payload: Some(messages_response::Payload::StringPayload(
+                                payload: Some(diagnostic_response::Payload::StringPayload(
                                     "queued-before-rekey".to_owned(),
                                 )),
                             })),
@@ -214,28 +249,28 @@ impl TestService {
         // 注册成功的 XX 与已登记的 IK 都已完成授权，随后共享同一业务消息阶段。
         // 持续读取而不是只处理一条消息，才能让测试覆盖长流中的自动 Ping/Pong。
         while let Some(message) = session.receive().await? {
-            let Some(secure_message::Body::Messages(Messages {
-                body: Some(messages::Body::Request(request)),
+            let Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(request)),
             })) = message.body
             else {
                 return Err(smalux_protocol::tonic_transport::TransportError::Protocol(
-                    "expected MessagesRequest".to_owned(),
+                    "expected DiagnosticRequest".to_owned(),
                 ));
             };
             session
                 .send(SecureMessage {
-                    body: Some(secure_message::Body::Messages(Messages {
-                        body: Some(messages::Body::Response(MessagesResponse {
+                    body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                        body: Some(diagnostic_message::Body::Response(DiagnosticResponse {
                             acknowledged_sequence: request.sequence,
                             payload: request.payload.map(|payload| match payload {
-                                messages_request::Payload::BytesPayload(value) => {
-                                    messages_response::Payload::BytesPayload(value)
+                                diagnostic_request::Payload::BytesPayload(value) => {
+                                    diagnostic_response::Payload::BytesPayload(value)
                                 }
-                                messages_request::Payload::StringPayload(value) => {
-                                    messages_response::Payload::StringPayload(value)
+                                diagnostic_request::Payload::StringPayload(value) => {
+                                    diagnostic_response::Payload::StringPayload(value)
                                 }
-                                messages_request::Payload::EchoRequest(value) => {
-                                    messages_response::Payload::EchoResponse(
+                                diagnostic_request::Payload::EchoRequest(value) => {
+                                    diagnostic_response::Payload::EchoResponse(
                                         smalux_protocol::agent::v1::EchoResponse {
                                             payload: value.payload,
                                         },
@@ -281,7 +316,6 @@ async fn registration_session_handles_business_then_ik_reconnects() {
             &[9; 32],
             "test-token-id",
             "test-token".to_owned(),
-            "agent-1".to_owned(),
         )
         .await
         .unwrap();
@@ -291,11 +325,11 @@ async fn registration_session_handles_business_then_ik_reconnects() {
     registration
         .session
         .send(SecureMessage {
-            body: Some(secure_message::Body::Messages(Messages {
-                body: Some(messages::Body::Request(
-                    smalux_protocol::agent::v1::MessagesRequest {
+            body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(
+                    smalux_protocol::agent::v1::DiagnosticRequest {
                         sequence: 1,
-                        payload: Some(messages_request::Payload::StringPayload(
+                        payload: Some(diagnostic_request::Payload::StringPayload(
                             "first-registration-report".to_owned(),
                         )),
                     },
@@ -305,11 +339,11 @@ async fn registration_session_handles_business_then_ik_reconnects() {
         .await
         .unwrap();
     let first_response = registration.session.receive().await.unwrap().unwrap();
-    let Some(secure_message::Body::Messages(Messages {
-        body: Some(messages::Body::Response(first_response)),
+    let Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+        body: Some(diagnostic_message::Body::Response(first_response)),
     })) = first_response.body
     else {
-        panic!("expected MessagesResponse on registration session");
+        panic!("expected DiagnosticResponse on registration session");
     };
     assert_eq!(first_response.acknowledged_sequence, 1);
     drop(registration.session);
@@ -322,8 +356,8 @@ async fn registration_session_handles_business_then_ik_reconnects() {
     assert_eq!(session.request_rekey().await.unwrap(), 1);
     assert_eq!(session.generation(), 1);
     let queued = session.receive().await.unwrap().unwrap();
-    let Some(secure_message::Body::Messages(Messages {
-        body: Some(messages::Body::Response(queued)),
+    let Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+        body: Some(diagnostic_message::Body::Response(queued)),
     })) = queued.body
     else {
         panic!("expected the business message buffered during rekey");
@@ -331,12 +365,12 @@ async fn registration_session_handles_business_then_ik_reconnects() {
     assert_eq!(queued.acknowledged_sequence, 999);
     session
         .send(SecureMessage {
-            body: Some(secure_message::Body::Messages(Messages {
-                body: Some(messages::Body::Request(
-                    smalux_protocol::agent::v1::MessagesRequest {
+            body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(
+                    smalux_protocol::agent::v1::DiagnosticRequest {
                         sequence: 7,
                         payload: Some(
-                            smalux_protocol::agent::v1::messages_request::Payload::StringPayload(
+                            smalux_protocol::agent::v1::diagnostic_request::Payload::StringPayload(
                                 "metric".to_owned(),
                             ),
                         ),
@@ -347,11 +381,11 @@ async fn registration_session_handles_business_then_ik_reconnects() {
         .await
         .unwrap();
     let response = session.receive().await.unwrap().unwrap();
-    let Some(secure_message::Body::Messages(Messages {
-        body: Some(messages::Body::Response(response)),
+    let Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+        body: Some(diagnostic_message::Body::Response(response)),
     })) = response.body
     else {
-        panic!("expected MessagesResponse");
+        panic!("expected DiagnosticResponse");
     };
     assert_eq!(response.acknowledged_sequence, 7);
     let _ = shutdown_tx.send(());
@@ -388,7 +422,6 @@ async fn session_driver_sends_and_receives_typed_events() {
             &[9; 32],
             "test-token-id",
             "test-token".to_owned(),
-            "driver-agent".to_owned(),
         )
         .await
         .unwrap();
@@ -402,11 +435,11 @@ async fn session_driver_sends_and_receives_typed_events() {
     assert_eq!(running.handle.request_rekey().await.unwrap(), 1);
     running
         .handle
-        .send_messages(Messages {
-            body: Some(messages::Body::Request(
-                smalux_protocol::agent::v1::MessagesRequest {
+        .send_diagnostic(DiagnosticMessage {
+            body: Some(diagnostic_message::Body::Request(
+                smalux_protocol::agent::v1::DiagnosticRequest {
                     sequence: 41,
-                    payload: Some(messages_request::Payload::StringPayload(
+                    payload: Some(diagnostic_request::Payload::StringPayload(
                         "driver".to_owned(),
                     )),
                 },
@@ -420,11 +453,11 @@ async fn session_driver_sends_and_receives_typed_events() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let SessionEvent::Messages(Messages {
-        body: Some(messages::Body::Response(response)),
+    let SessionEvent::Diagnostic(DiagnosticMessage {
+        body: Some(diagnostic_message::Body::Response(response)),
     }) = event
     else {
-        panic!("expected a typed Messages response");
+        panic!("expected a typed Diagnostic response");
     };
     assert_eq!(response.acknowledged_sequence, 41);
     let heartbeat_stats = tokio::time::timeout(Duration::from_secs(2), async {
@@ -478,7 +511,6 @@ async fn registration_returns_the_encrypted_token_error() {
             &[9; 32],
             "test-token-id",
             "wrong-token".to_owned(),
-            "agent-1".to_owned(),
         )
         .await;
     let error = match result {

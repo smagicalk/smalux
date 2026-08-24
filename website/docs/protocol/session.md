@@ -35,13 +35,15 @@ let token =
     "token-001.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
 
 let pending = client
-    .prepare_registration(identity, &psk, token, agent_name)
+    .prepare_registration(identity, &psk, token)
     .await?;
 
 // 业务存储：先保存私钥、Server 公钥、Agent ID 和事务 ID。
 store.save_pending(&pending)?;
 
-let registered = pending.commit().await?;
+let registered = pending
+  .send_registration_commit_and_receive_committed()
+  .await?;
 store.mark_committed(registered.registration_id)?;
 
 // XX Session 已授权，当前连接直接进入业务阶段。
@@ -50,6 +52,9 @@ let session = registered.session;
 
 `RegistrationPrepared` 只表示双方都保存了 pending 所需信息，不表示注册完成。只有收到匹配事务 ID 的
 `RegistrationCommitted` 后，本地状态才能进入 committed 并允许后续 IK。
+
+Agent 不在 `RegistrationRequest` 中上报展示名称。Server 签发 Token 时可以绑定展示名称；
+未绑定时，Server 在 prepare 阶段把新生成的 `agent_id` 同时作为默认展示名称。
 
 ### 注册中断如何恢复
 
@@ -114,7 +119,7 @@ sender.send_task_report(report).await?;
 while let Some(event) = running.events.recv().await {
     match event? {
         SessionEvent::JobCommand(command) => {
-            let result = controller.apply(command).await;
+            let result = controller.apply_command(command).await;
             running.handle.send_job_command_result(result).await?;
         }
         event => handle_event(event).await?,
@@ -177,10 +182,12 @@ client.set_handshake_timeout(Duration::from_secs(5));
 
 // 首次注册：prepare 返回 pending，持久化完成后再 commit。
 let pending = client
-    .prepare_registration(identity, &psk, credential, "edge-01".to_owned())
+    .prepare_registration(identity, &psk, credential)
     .await?;
 store.save_pending(&pending)?;
-let registered = pending.commit().await?;
+let registered = pending
+  .send_registration_commit_and_receive_committed()
+  .await?;
 store.save_committed(&registered)?;
 
 // 后续连接：只读取本地 identity 和已保存的 Server 公钥。
@@ -201,11 +208,13 @@ AgentProtocolClient::prepare_registration
   -> TonicNoiseSession::send(RegistrationRequest)
   -> TonicNoiseSession::receive(RegistrationPrepared)
   -> AgentPendingRegistration
-  -> AgentPendingRegistration::commit
+  -> AgentPendingRegistration::send_registration_commit_and_receive_committed
 ```
 
-`register_agent` 是 `prepare_registration(...).commit()` 的便捷组合，适合不需要在两阶段之间
-自行落库的简单调用；需要崩溃恢复的正式 Agent 应使用显式 prepare/保存/commit 顺序。
+`register_agent` 是
+`prepare_registration(...).send_registration_commit_and_receive_committed()` 的便捷组合，
+适合不需要在两阶段之间自行落库的简单调用；需要崩溃恢复的正式 Agent 应使用显式
+prepare/保存/commit 顺序。
 
 ### Server 侧入口
 
@@ -217,10 +226,10 @@ AgentTransport::open_session(request)
   -> create bounded outbound channel
   -> ServerSessionAcceptor::accept_incoming_with_psk_resolver
        -> next_handshake(first frame)
-       -> XXpsk3: AgentRegistrar::resolve_registration_psk(token_id)
+       -> XXpsk3: AgentRegistry::resolve_registration_psk(token_id)
        -> IK: ServerKeyRing::find_active(responder_key_id)
        -> IncomingSession::Registration / Authentication
-  -> AgentServer::handle_established_session
+  -> AgentTransportService::run_session_worker
 ```
 
 握手失败时 Server 只能通过未加密的 `ProtocolError` 返回粗粒度错误；握手成功后，注册、授权和
@@ -228,21 +237,24 @@ AgentTransport::open_session(request)
 
 ## 注册四阶段的真实状态
 
-XXpsk3 建立加密通道后，`server_service/session.rs` 按以下顺序调用：
+XXpsk3 建立加密通道后，`transport/session.rs` 按以下顺序调用：
 
 ```text
 IncomingSession::Registration
   -> AgentState::try_acquire_registration
   -> ServerRegistration::receive_request
-  -> AgentRegistrar::prepare_registration
+  -> AgentRegistry::prepare_registration
        -> ServerDatabase::load_active_registration_psk / prepare_agent_registration
        -> 写入 pending registration
   -> ServerRegistration::prepare(registration_id, agent_id)
   -> ServerRegistration::wait_for_commit(registration_id, 10s)
-  -> AgentRegistrar::commit_registration
+  -> AgentRegistry::commit_registration
        -> 原子激活 Agent + 提交 registration + 消费 Token
   -> ServerRegistration::complete(registration_id)
-  -> handle_business_messages
+  -> run_business_session
+       -> Server 发送 AgentJobPolicyQuery
+       -> Agent 上报 AgentJobPolicySnapshot
+       -> Server ACK revision 后才允许主动下发 Job
 ```
 
 四个协议阶段的含义不同：
@@ -265,7 +277,7 @@ IK 只证明 Agent 拥有长期私钥，业务授权仍由 Server 的注册中�
 ```text
 IncomingSession::Authentication
   -> authentication.peer_public_key()
-  -> AgentRegistrar::authorize_agent(public_key)
+  -> AgentRegistry::authorize_agent(public_key)
        -> ServerDatabase::find_agent_authorization(public_key)
           -> Authorized(agent_id)
           -> Revoked
@@ -278,6 +290,16 @@ IncomingSession::Authentication
 即使 Noise IK 成功，`active` 状态和 `revoked_at == None` 仍是进入业务循环的必要条件。授权结果
 不会把数据库实体泄漏到 Protocol；`AgentAuthorizationError` 是 Server service 的稳定错误接口，
 数据库 adapter 只负责返回持久化快照。
+
+## Agent Job 策略同步
+
+进入业务循环后，Server 立即发送 `AgentJobPolicyQuery`，Agent 同时主动上报当前完整
+`AgentJobPolicySnapshot`。重复快照按持久化 revision 幂等确认；Server 在当前会话接受策略前
+不会主动下发 Job。黑名单只保存在 Agent 本地，Server 断线后不保留副本。
+
+Agent 本地增加规则时立即停用匹配 Job；解除规则只上报新快照，等待 Server 的 Job Provider
+重新发送权威 `ReplaceAllJobs`。因此 `AgentJobPolicyAck` 只确认策略同步，不代表
+Job 已恢复。具体 CLI 和停用行为见 [Job 与 Task](../usage/job-task.md#动态远程-job-黑名单)。
 
 ## Driver 的调用和所有权
 
@@ -296,11 +318,11 @@ handle.request_rekey().await?;
 while let Some(event) = events.recv().await {
     match event? {
         SessionEvent::JobCommand(command) => {
-            let result = job_controller.apply(command).await;
+            let result = remote_jobs.apply_command(command).await;
             handle.send_job_command_result(result).await?;
         }
         SessionEvent::TaskReport(report) => store_report(report).await?,
-        SessionEvent::Messages(messages) => handle_messages(messages).await?,
+        SessionEvent::Diagnostic(message) => handle_diagnostic(message).await?,
         SessionEvent::KeyRotation(message) => handle_rotation(message).await?,
         SessionEvent::Registration(_) | SessionEvent::JobCommandResult(_) => {}
     }

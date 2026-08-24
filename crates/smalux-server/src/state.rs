@@ -13,7 +13,7 @@ use crate::service::agent::keyring_manager::{
 };
 use crate::service::agent::state::AgentState;
 use axum::extract::FromRef;
-use smalux_core::config::default::DEFAULT_AGENT_PRIFIX;
+use smalux_core::config::default::DEFAULT_AGENT_PREFIX;
 use tokio_util::sync::CancellationToken;
 
 /// Axum 顶层共享状态。
@@ -25,6 +25,8 @@ pub(crate) struct AppState {
     pub(crate) agent: Arc<AgentState>,
     /// 进程级关闭通知，长期 Session 和后台任务共享同一个取消源。
     pub(crate) shutdown: CancellationToken,
+    /// CLI 与未来管理 API 共用的应用服务。
+    pub(crate) management: Arc<crate::management::AdminService>,
     /// 只有最后一个 AppState 所有者释放时才取消后台任务，避免普通 Clone 提前关闭。
     _shutdown_owner: Arc<ShutdownOwner>,
 }
@@ -61,10 +63,18 @@ impl AppState {
             &runtime_config,
             shutdown.clone(),
         ));
-        agent.agent_registrar.start_cleanup_task(shutdown.clone());
+        agent.agent_registry.start_cleanup_task(shutdown.clone());
+        let management = Arc::new(crate::management::AdminService::new(
+            Arc::clone(&database),
+            Arc::clone(&agent.agent_registry),
+            Arc::clone(&agent.keyring_manager),
+            agent.sessions.clone(),
+            runtime_config.clone(),
+            shutdown.clone(),
+        ));
 
         tracing::debug!(
-            agent_prefix = DEFAULT_AGENT_PRIFIX,
+            agent_prefix = DEFAULT_AGENT_PREFIX,
             address = %runtime_config.address,
             port = runtime_config.port,
             "Server application state assembled"
@@ -73,6 +83,7 @@ impl AppState {
             database,
             agent,
             shutdown,
+            management,
             _shutdown_owner: shutdown_owner,
         })
     }

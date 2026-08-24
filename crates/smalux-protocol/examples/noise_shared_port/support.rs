@@ -92,6 +92,8 @@ pub struct AgentRegistry {
 #[derive(Debug)]
 struct RegistryData {
     tokens: HashMap<String, String>,
+    /// Token ID 到 Server 预设展示名称的映射；未设置时注册阶段回退到 Agent ID。
+    token_names: HashMap<String, String>,
     /// Noise 公钥到稳定 Agent 身份的授权映射；名称只存作展示字段。
     agents: HashMap<Vec<u8>, AgentRecord>,
     registrations: HashMap<Vec<u8>, RegistrationRecord>,
@@ -167,7 +169,7 @@ impl AgentRegistry {
                 return Err("invalid persisted Agent ID".into());
             }
             let name = fs::read_to_string(directory.join("name.txt"))?;
-            if !valid_agent_name(&name) {
+            if !valid_agent_display_name(&name) {
                 return Err("invalid persisted Agent name".into());
             }
             let key = fs::read(directory.join("public.key"))?;
@@ -188,7 +190,7 @@ impl AgentRegistry {
                 return Err("invalid pending Agent ID".into());
             }
             let agent_name = fs::read_to_string(directory.join("agent-name.txt"))?;
-            if !valid_agent_name(&agent_name) {
+            if !valid_agent_display_name(&agent_name) {
                 return Err("invalid pending Agent name".into());
             }
             let token = fs::read_to_string(directory.join("token.txt"))?;
@@ -212,9 +214,23 @@ impl AgentRegistry {
         }
 
         let mut tokens = HashMap::new();
+        let mut token_names = HashMap::new();
         for entry in fs::read_dir(&tokens_dir)? {
-            let token = fs::read_to_string(entry?.path())?;
-            tokens.insert(registration_token_id(&token).to_owned(), token);
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("token") {
+                continue;
+            }
+            let token = fs::read_to_string(&path)?;
+            let token_id = registration_token_id(&token).to_owned();
+            let name_path = path.with_extension("name");
+            if name_path.exists() {
+                let display_name = fs::read_to_string(name_path)?;
+                if !valid_agent_display_name(&display_name) {
+                    return Err("invalid persisted Token display name".into());
+                }
+                token_names.insert(token_id.clone(), display_name);
+            }
+            tokens.insert(token_id, token);
         }
         if let Some(token) = token {
             let initial_id = registration_token_id(&token).to_owned();
@@ -224,6 +240,7 @@ impl AgentRegistry {
         Ok(Self {
             data: Mutex::new(RegistryData {
                 tokens,
+                token_names,
                 agents,
                 registrations,
                 agents_dir,
@@ -237,12 +254,8 @@ impl AgentRegistry {
     pub fn prepare(
         &self,
         token: &str,
-        agent_name: &str,
         public_key: &[u8],
     ) -> Result<PreparedRegistration, RegistrationError> {
-        if !valid_agent_name(agent_name) {
-            return Err(RegistrationError::InvalidAgentName);
-        }
         validate_public_key(public_key).map_err(|_| RegistrationError::InvalidPublicKey)?;
         let mut data = self.data.lock().map_err(|_| RegistrationError::Storage)?;
         if let Some(existing) = data.registrations.get(public_key) {
@@ -270,11 +283,16 @@ impl AgentRegistry {
         let mut agent_id_bytes = [0_u8; 16];
         getrandom::fill(&mut agent_id_bytes).map_err(|_| RegistrationError::Storage)?;
         let agent_id = public_key_hex(&agent_id_bytes);
+        let agent_name = data
+            .token_names
+            .get(registration_token_id(token))
+            .cloned()
+            .unwrap_or_else(|| agent_id.clone());
         let record = RegistrationRecord {
             registration_id,
             token: token.to_owned(),
             agent_id: agent_id.clone(),
-            agent_name: agent_name.to_owned(),
+            agent_name,
             public_key: public_key.to_vec(),
             committed: false,
         };
@@ -327,14 +345,10 @@ impl AgentRegistry {
         Ok(record.agent_id)
     }
 
-    /// 验证 Token 和 XX 公钥后分配稳定 ID；名称只作为允许重复的展示字段保存。
-    pub fn register(
-        &self,
-        token: &str,
-        agent_name: &str,
-        public_key: &[u8],
-    ) -> Result<String, RegistrationError> {
-        let prepared = self.prepare(token, agent_name, public_key)?;
+    /// 验证 Token 和 XX 公钥后分配稳定 ID；展示名称来自 Token 的 Server 侧记录，
+    /// 只作为允许重复的展示字段保存。
+    pub fn register(&self, token: &str, public_key: &[u8]) -> Result<String, RegistrationError> {
+        let prepared = self.prepare(token, public_key)?;
         self.commit(prepared.registration_id, public_key)
     }
 
@@ -367,12 +381,27 @@ impl AgentRegistry {
     }
 
     /// 签发一条只允许绑定一台 Agent 的随机注册凭据。
-    pub fn issue_registration_token(&self) -> Result<String, RegistrationError> {
+    pub fn issue_registration_token(
+        &self,
+        display_name: Option<&str>,
+    ) -> Result<String, RegistrationError> {
+        if display_name.is_some_and(|name| !valid_agent_display_name(name)) {
+            return Err(RegistrationError::InvalidAgentDisplayName);
+        }
         let token = random_registration_token().map_err(|_| RegistrationError::Storage)?;
         let mut data = self.data.lock().map_err(|_| RegistrationError::Storage)?;
         let token_id = registration_token_id(&token).to_owned();
         fs::write(data.tokens_dir.join(format!("{token_id}.token")), &token)
             .map_err(|_| RegistrationError::Storage)?;
+        if let Some(display_name) = display_name {
+            fs::write(
+                data.tokens_dir.join(format!("{token_id}.name")),
+                display_name,
+            )
+            .map_err(|_| RegistrationError::Storage)?;
+            data.token_names
+                .insert(token_id.clone(), display_name.to_owned());
+        }
         data.tokens.insert(token_id, token.clone());
         Ok(token)
     }
@@ -401,6 +430,11 @@ impl AgentRegistry {
         if path.exists() {
             fs::remove_file(path).map_err(|_| RegistrationError::Storage)?;
         }
+        let name_path = data.tokens_dir.join(format!("{token_id}.name"));
+        if name_path.exists() {
+            fs::remove_file(name_path).map_err(|_| RegistrationError::Storage)?;
+        }
+        data.token_names.remove(token_id);
         let removed = data.tokens.remove(token_id).is_some();
         Ok(removed)
     }
@@ -440,9 +474,14 @@ impl AgentRegistry {
             .retain(|_, record| record.agent_id != agent_id);
         for token_id in token_ids {
             data.tokens.remove(&token_id);
+            data.token_names.remove(&token_id);
             let token_path = data.tokens_dir.join(format!("{token_id}.token"));
             if token_path.exists() {
                 fs::remove_file(token_path).map_err(|_| RegistrationError::Storage)?;
+            }
+            let name_path = data.tokens_dir.join(format!("{token_id}.name"));
+            if name_path.exists() {
+                fs::remove_file(name_path).map_err(|_| RegistrationError::Storage)?;
             }
         }
         Ok(before != data.agents.len())
@@ -454,7 +493,7 @@ impl AgentRegistry {
 pub enum RegistrationError {
     InvalidToken,
     TokenAlreadyUsed,
-    InvalidAgentName,
+    InvalidAgentDisplayName,
     InvalidPublicKey,
     AgentAlreadyRegistered,
     UnknownRegistration,
@@ -468,7 +507,7 @@ impl fmt::Display for RegistrationError {
         formatter.write_str(match self {
             Self::InvalidToken => "invalid registration token",
             Self::TokenAlreadyUsed => "registration token already used",
-            Self::InvalidAgentName => "invalid Agent name",
+            Self::InvalidAgentDisplayName => "invalid Agent display name",
             Self::InvalidPublicKey => "invalid Noise public key",
             Self::AgentAlreadyRegistered => "Agent is already registered",
             Self::UnknownRegistration => "registration transaction does not exist",
@@ -541,7 +580,7 @@ fn validate_public_key(public_key: &[u8]) -> ExampleResult<()> {
     }
 }
 
-fn valid_agent_name(name: &str) -> bool {
+fn valid_agent_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -595,7 +634,7 @@ mod tests {
         let directory = temp_directory();
         let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
         let key = vec![7; 32];
-        let agent_id = registry.register("token", "example-agent", &key).unwrap();
+        let agent_id = registry.register("token", &key).unwrap();
 
         let reloaded = AgentRegistry::load("next".to_owned(), &directory).unwrap();
         assert_eq!(reloaded.authenticate(&key), Ok(agent_id));
@@ -608,8 +647,8 @@ mod tests {
         let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
         let key = vec![8; 32];
 
-        let first = registry.prepare("token", "example-agent", &key).unwrap();
-        let retried = registry.prepare("token", "example-agent", &key).unwrap();
+        let first = registry.prepare("token", &key).unwrap();
+        let retried = registry.prepare("token", &key).unwrap();
         assert_eq!(first.registration_id, retried.registration_id);
         assert_eq!(
             registry.authenticate(&key),
@@ -618,7 +657,7 @@ mod tests {
 
         registry.commit(first.registration_id, &key).unwrap();
         assert_eq!(registry.authenticate(&key), Ok(first.agent_id.clone()));
-        let completed_retry = registry.prepare("token", "example-agent", &key).unwrap();
+        let completed_retry = registry.prepare("token", &key).unwrap();
         assert_eq!(first.registration_id, completed_retry.registration_id);
         assert!(completed_retry.already_committed);
 
@@ -630,18 +669,18 @@ mod tests {
         let directory = temp_directory();
         let key = vec![9; 32];
         let first = AgentRegistry::load("token".to_owned(), &directory).unwrap();
-        let prepared = first.prepare("token", "restart-agent", &key).unwrap();
+        let prepared = first.prepare("token", &key).unwrap();
         drop(first);
 
         let reloaded = AgentRegistry::load("token".to_owned(), &directory).unwrap();
-        let recovered = reloaded.prepare("token", "restart-agent", &key).unwrap();
+        let recovered = reloaded.prepare("token", &key).unwrap();
         assert_eq!(recovered.registration_id, prepared.registration_id);
         assert!(!recovered.already_committed);
         reloaded.commit(recovered.registration_id, &key).unwrap();
         drop(reloaded);
 
         let completed = AgentRegistry::load("token".to_owned(), &directory).unwrap();
-        let recovered = completed.prepare("token", "restart-agent", &key).unwrap();
+        let recovered = completed.prepare("token", &key).unwrap();
         assert_eq!(recovered.registration_id, prepared.registration_id);
         assert!(recovered.already_committed);
         assert_eq!(completed.authenticate(&key), Ok(prepared.agent_id));
@@ -652,10 +691,10 @@ mod tests {
     fn registration_token_cannot_be_rebound_to_another_public_key() {
         let directory = temp_directory();
         let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
-        registry.prepare("token", "first-agent", &[1; 32]).unwrap();
+        registry.prepare("token", &[1; 32]).unwrap();
 
         assert_eq!(
-            registry.prepare("token", "second-agent", &[2; 32]),
+            registry.prepare("token", &[2; 32]),
             Err(RegistrationError::TokenAlreadyUsed)
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -667,14 +706,10 @@ mod tests {
         let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
 
         assert_eq!(
-            registry.register("wrong", "example-agent", &[1; 32]),
+            registry.register("wrong", &[1; 32]),
             Err(RegistrationError::InvalidToken)
         );
-        assert!(
-            registry
-                .register("token", "example-agent", &[1; 32])
-                .is_ok()
-        );
+        assert!(registry.register("token", &[1; 32]).is_ok());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -683,7 +718,7 @@ mod tests {
         let directory = temp_directory();
         let registry = AgentRegistry::load("token".to_owned(), &directory).unwrap();
         let key = vec![3; 32];
-        let agent_id = registry.register("token", "example-agent", &key).unwrap();
+        let agent_id = registry.register("token", &key).unwrap();
 
         assert!(registry.revoke(&agent_id).unwrap());
         assert_eq!(
@@ -696,15 +731,15 @@ mod tests {
     #[test]
     fn registered_agents_are_identified_and_revoked_by_id() {
         let directory = temp_directory();
-        let first_token = random_registration_token().unwrap();
-        let registry = AgentRegistry::load(first_token.clone(), &directory).unwrap();
-        let second_token = registry.issue_registration_token().unwrap();
-        let first_id = registry
-            .register(&first_token, "shared-name", &[4; 32])
+        let registry = AgentRegistry::load_without_token(&directory).unwrap();
+        let first_token = registry
+            .issue_registration_token(Some("shared-name"))
             .unwrap();
-        let second_id = registry
-            .register(&second_token, "shared-name", &[5; 32])
+        let second_token = registry
+            .issue_registration_token(Some("shared-name"))
             .unwrap();
+        let first_id = registry.register(&first_token, &[4; 32]).unwrap();
+        let second_id = registry.register(&second_token, &[5; 32]).unwrap();
 
         let agents = registry.registered_agents().unwrap();
         assert_eq!(agents.len(), 2);
@@ -799,14 +834,10 @@ mod tests {
         let directory = temp_directory();
         let first_token = random_registration_token().unwrap();
         let registry = AgentRegistry::load(first_token.clone(), &directory).unwrap();
-        let second_token = registry.issue_registration_token().unwrap();
+        let second_token = registry.issue_registration_token(None).unwrap();
 
-        let first_id = registry
-            .register(&first_token, "first-agent", &[11; 32])
-            .unwrap();
-        let second_id = registry
-            .register(&second_token, "second-agent", &[12; 32])
-            .unwrap();
+        let first_id = registry.register(&first_token, &[11; 32]).unwrap();
+        let second_id = registry.register(&second_token, &[12; 32]).unwrap();
 
         let agents = registry.registered_agents().unwrap();
         assert_eq!(agents.len(), 2);
@@ -820,7 +851,7 @@ mod tests {
         let directory = temp_directory();
         let initial = random_registration_token().unwrap();
         let registry = AgentRegistry::load(initial, &directory).unwrap();
-        let issued = registry.issue_registration_token().unwrap();
+        let issued = registry.issue_registration_token(None).unwrap();
         let credential = parse_registration_credential(&issued).unwrap();
         drop(registry);
 
@@ -852,12 +883,12 @@ mod tests {
     fn revoking_agent_also_prevents_its_token_from_being_reused() {
         let directory = temp_directory();
         let registry = AgentRegistry::load_without_token(&directory).unwrap();
-        let token = registry.issue_registration_token().unwrap();
-        let agent_id = registry.register(&token, "first-agent", &[21; 32]).unwrap();
+        let token = registry.issue_registration_token(None).unwrap();
+        let agent_id = registry.register(&token, &[21; 32]).unwrap();
 
         assert!(registry.revoke(&agent_id).unwrap());
         assert_eq!(
-            registry.register(&token, "second-agent", &[22; 32]),
+            registry.register(&token, &[22; 32]),
             Err(RegistrationError::InvalidToken)
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -867,11 +898,9 @@ mod tests {
     fn revoked_registration_token_stays_revoked_after_restart() {
         let directory = temp_directory();
         let registry = AgentRegistry::load_without_token(&directory).unwrap();
-        let token = registry.issue_registration_token().unwrap();
+        let token = registry.issue_registration_token(None).unwrap();
         let credential = parse_registration_credential(&token).unwrap();
-        registry
-            .prepare(&token, "pending-agent", &[23; 32])
-            .unwrap();
+        registry.prepare(&token, &[23; 32]).unwrap();
 
         assert!(
             registry

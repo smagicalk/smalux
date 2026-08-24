@@ -32,10 +32,11 @@ use common::{
 };
 use smalux_protocol::{
     agent::v1::{
-        HealthRequest, HealthResponse, Messages, MessagesResponse, ProtocolFrame, SecureError,
-        SecureErrorCode, SecureMessage,
+        DiagnosticMessage, DiagnosticResponse, HealthRequest, HealthResponse, ProtocolFrame,
+        SecureError, SecureErrorCode, SecureMessage,
         agent_transport_server::{AgentTransport, AgentTransportServer},
-        messages, messages_request, messages_response, protocol_frame, secure_message,
+        diagnostic_message, diagnostic_request, diagnostic_response, protocol_frame,
+        secure_message,
     },
     noise::{NoiseIdentity, ServerKeyRing},
     tonic_transport::{
@@ -205,7 +206,7 @@ impl ExampleService {
                     Err(error) => {
                         warn!(session_id, error = %error, "Agent authorization failed");
                         authentication
-                            .reject(registration_secure_error(error))
+                            .send_rejection(registration_secure_error(error))
                             .await?;
                         return Ok(());
                     }
@@ -250,7 +251,7 @@ impl ExampleService {
             "Server waiting for encrypted RegistrationRequest"
         );
         let remote_public_key = registration.peer_public_key();
-        let request = match registration.receive_request().await {
+        let request = match registration.receive_registration_request().await {
             Ok(request) => request,
             Err(_) => {
                 warn!(
@@ -258,7 +259,7 @@ impl ExampleService {
                     "Server received an invalid encrypted registration request"
                 );
                 registration
-                    .reject(SecureError {
+                    .send_rejection(SecureError {
                         code: SecureErrorCode::InvalidMessage as i32,
                         message: "XXpsk3 session requires RegistrationRequest".to_owned(),
                     })
@@ -266,16 +267,15 @@ impl ExampleService {
                 return Ok(None);
             }
         };
-        let prepared = match self.registry.prepare(
-            &request.token,
-            &request.agent_name,
-            remote_public_key.as_bytes(),
-        ) {
+        let prepared = match self
+            .registry
+            .prepare(&request.token, remote_public_key.as_bytes())
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 warn!(session_id, error = %error, "Server rejected registration request");
                 registration
-                    .reject(registration_secure_error(error))
+                    .send_rejection(registration_secure_error(error))
                     .await?;
                 return Ok(None);
             }
@@ -291,22 +291,24 @@ impl ExampleService {
             "Server prepared Agent registration"
         );
         registration
-            .prepare(prepared.registration_id, prepared.agent_id.clone())
+            .send_registration_prepared(prepared.registration_id, prepared.agent_id.clone())
             .await?;
         registration
-            .wait_for_commit(prepared.registration_id, Duration::from_secs(10))
+            .receive_registration_commit(prepared.registration_id, Duration::from_secs(10))
             .await?;
         let agent_id = self
             .registry
             .commit(prepared.registration_id, remote_public_key.as_bytes())
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        let session = registration.complete(prepared.registration_id).await?;
+        let session = registration
+            .send_registration_committed(prepared.registration_id)
+            .await?;
         println!("[server][rpc:{session_id}][xxpsk3] committed agent={agent_id}");
         info!(session_id, agent_id = %agent_id, "Server committed Agent registration");
         Ok(Some((agent_id, session)))
     }
 
-    /// 循环处理已授权 IK 会话中的业务 Messages 请求。
+    /// 循环处理已授权 IK 会话中的链路诊断请求。
     async fn messages_loop_manual(
         &self,
         session: &mut TonicNoiseSession,
@@ -314,11 +316,11 @@ impl ExampleService {
     ) -> Result<(), TransportError> {
         // receive() 已在内部处理 Ping/Pong 和 responder rekey。
         while let Some(message) = session.receive().await? {
-            let Some(secure_message::Body::Messages(Messages {
-                body: Some(messages::Body::Request(request)),
+            let Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(request)),
             })) = message.body
             else {
-                // 非 MessagesRequest 返回加密错误，但不关闭整个 Server。
+                // 非 DiagnosticRequest 返回加密错误，但不关闭整个 Server。
                 warn!(
                     agent_id,
                     "Server received an unexpected business message type"
@@ -326,7 +328,7 @@ impl ExampleService {
                 send_secure_error(
                     session,
                     SecureErrorCode::InvalidMessage,
-                    "IK session requires MessagesRequest",
+                    "IK session requires DiagnosticRequest",
                 )
                 .await?;
                 continue;
@@ -342,14 +344,14 @@ impl ExampleService {
             );
             // oneof payload 按类型映射，展示 bytes、string 和 typed Echo 的处理方式。
             let response_payload = request.payload.map(|payload| match payload {
-                messages_request::Payload::BytesPayload(value) => {
-                    messages_response::Payload::BytesPayload(value)
+                diagnostic_request::Payload::BytesPayload(value) => {
+                    diagnostic_response::Payload::BytesPayload(value)
                 }
-                messages_request::Payload::StringPayload(value) => {
-                    messages_response::Payload::StringPayload(value)
+                diagnostic_request::Payload::StringPayload(value) => {
+                    diagnostic_response::Payload::StringPayload(value)
                 }
-                messages_request::Payload::EchoRequest(value) => {
-                    messages_response::Payload::EchoResponse(
+                diagnostic_request::Payload::EchoRequest(value) => {
+                    diagnostic_response::Payload::EchoResponse(
                         smalux_protocol::agent::v1::EchoResponse {
                             payload: value.payload,
                         },
@@ -359,8 +361,8 @@ impl ExampleService {
             // acknowledged_sequence 把响应关联到原请求。
             session
                 .send(SecureMessage {
-                    body: Some(secure_message::Body::Messages(Messages {
-                        body: Some(messages::Body::Response(MessagesResponse {
+                    body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                        body: Some(diagnostic_message::Body::Response(DiagnosticResponse {
                             acknowledged_sequence: request.sequence,
                             payload: response_payload,
                         })),
@@ -401,8 +403,8 @@ impl ExampleService {
                     return Err(error);
                 }
             };
-            let SessionEvent::Messages(Messages {
-                body: Some(messages::Body::Request(request)),
+            let SessionEvent::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(request)),
             }) = event
             else {
                 warn!(
@@ -414,7 +416,7 @@ impl ExampleService {
                     .send(SecureMessage {
                         body: Some(secure_message::Body::Error(SecureError {
                             code: SecureErrorCode::InvalidMessage as i32,
-                            message: "business session requires MessagesRequest".to_owned(),
+                            message: "business session requires DiagnosticRequest".to_owned(),
                         })),
                     })
                     .await?;
@@ -430,14 +432,14 @@ impl ExampleService {
                 "Server Driver received encrypted metric batch"
             );
             let response_payload = request.payload.map(|payload| match payload {
-                messages_request::Payload::BytesPayload(value) => {
-                    messages_response::Payload::BytesPayload(value)
+                diagnostic_request::Payload::BytesPayload(value) => {
+                    diagnostic_response::Payload::BytesPayload(value)
                 }
-                messages_request::Payload::StringPayload(value) => {
-                    messages_response::Payload::StringPayload(value)
+                diagnostic_request::Payload::StringPayload(value) => {
+                    diagnostic_response::Payload::StringPayload(value)
                 }
-                messages_request::Payload::EchoRequest(value) => {
-                    messages_response::Payload::EchoResponse(
+                diagnostic_request::Payload::EchoRequest(value) => {
+                    diagnostic_response::Payload::EchoResponse(
                         smalux_protocol::agent::v1::EchoResponse {
                             payload: value.payload,
                         },
@@ -446,8 +448,8 @@ impl ExampleService {
             });
             running
                 .handle
-                .send_messages(Messages {
-                    body: Some(messages::Body::Response(MessagesResponse {
+                .send_diagnostic(DiagnosticMessage {
+                    body: Some(diagnostic_message::Body::Response(DiagnosticResponse {
                         acknowledged_sequence: request.sequence,
                         payload: response_payload,
                     })),
@@ -599,7 +601,7 @@ async fn main() -> ExampleResult<()> {
 
     println!("[server] Noise public key (Client learns it during XXpsk3): {server_public}");
     println!("[server] session mode={mode:?}");
-    println!("[server] run `token generate` to issue an Agent registration token");
+    println!("[server] run `token generate [display-name]` to issue an Agent registration token");
     println!("[server] REST status: http://{address}{STATUS_PATH}");
     println!("[server] WebSocket echo: ws://{address}{WEBSOCKET_PATH}");
     println!("[server][console] type 'help' for interactive commands");
@@ -686,16 +688,26 @@ async fn console_loop(registry: Arc<AgentRegistry>, shutdown_sender: oneshot::Se
             "" => {}
             "help" => {
                 println!("  help                 show commands");
-                println!("  token generate       issue a new one-Agent registration token");
-                println!("  token create         alias for token generate");
+                println!("  token generate [name]  issue a new one-Agent registration token");
+                println!("  token create [name]    alias for token generate");
                 println!("  token list           list public registration token IDs");
                 println!("  token revoke <id>    revoke a registration token");
                 println!("  agents               list registered Agent IDs and names");
                 println!("  revoke <agent-id>    revoke an Agent for future IK sessions");
                 println!("  quit                 gracefully stop the example Server");
             }
-            "token" | "token create" | "token generate" => {
-                match registry.issue_registration_token() {
+            _ if command == "token"
+                || command == "token create"
+                || command == "token generate"
+                || command.starts_with("token create ")
+                || command.starts_with("token generate ") =>
+            {
+                let display_name = command
+                    .strip_prefix("token generate")
+                    .or_else(|| command.strip_prefix("token create"))
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                match registry.issue_registration_token(display_name) {
                     Ok(token) => {
                         info!(
                             "issued a registration token; token value is printed only for the example operator"
@@ -783,7 +795,7 @@ fn registration_secure_error(error: RegistrationError) -> SecureError {
         RegistrationError::TokenAlreadyUsed => SecureErrorCode::TokenAlreadyUsed,
         RegistrationError::UnknownAgent => SecureErrorCode::AgentNotAuthorized,
         RegistrationError::AgentAlreadyRegistered => SecureErrorCode::AgentAlreadyRegistered,
-        RegistrationError::InvalidAgentName
+        RegistrationError::InvalidAgentDisplayName
         | RegistrationError::InvalidPublicKey
         | RegistrationError::UnknownRegistration
         | RegistrationError::InvalidRegistrationId => SecureErrorCode::InvalidMessage,

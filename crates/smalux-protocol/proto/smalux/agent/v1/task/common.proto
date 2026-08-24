@@ -13,6 +13,7 @@ import "smalux/agent/v1/task/process.proto";
 import "smalux/agent/v1/task/probe.proto";
 import "smalux/agent/v1/task/socket.proto";
 import "smalux/agent/v1/task/system.proto";
+import "smalux/agent/v1/plugin.proto";
 
 // 固定 Task 类型及其完整配置。
 message TaskDefinition {
@@ -42,6 +43,8 @@ message TaskDefinition {
     SocketTaskConfig socket = 20;
     // 对多个节点执行 ICMP、TCP Connect 或 HTTP 探测。
     ProbeTaskConfig probe = 21;
+    // 由当前会话已确认的 Plus Worker 执行插件私有 Task。
+    PluginTaskConfig plugin = 22;
   }
 }
 
@@ -75,6 +78,8 @@ message TaskResult {
     SocketSnapshot socket = 20;
     // 与 ProbeTaskConfig 对应的探测快照。
     ProbeSnapshot probe = 21;
+    // Plus Worker 的通用业务结果；其 payload 只由对应插件版本解释。
+    PluginTaskResult plugin = 22;
   }
 }
 

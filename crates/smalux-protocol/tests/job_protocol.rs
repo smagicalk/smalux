@@ -2,10 +2,10 @@
 
 use prost::Message;
 use smalux_protocol::agent::v1::{
-    CollectionMode, CpuTaskConfig, JobCommand, JobCommandResult, JobCommandStatus, JobDefinition,
-    ProcessDetails, ProcessEntry, ProcessRanking, ProcessSelection, ProcessSnapshot,
-    ProcessTaskConfig, TaskDefinition, TaskResult, UpsertJob, job_command, task_definition,
-    task_result,
+    AgentPluginSync, CollectionMode, CpuTaskConfig, JobCommand, JobCommandResult, JobCommandStatus,
+    JobDefinition, PluginPauseAck, PluginPauseNotice, ProcessDetails, ProcessEntry, ProcessRanking,
+    ProcessSelection, ProcessSnapshot, ProcessTaskConfig, TaskDefinition, TaskResult, UpsertJob,
+    agent_plugin_sync, job_command, task_definition, task_result,
 };
 
 #[test]
@@ -112,4 +112,39 @@ fn upsert_command_preserves_catalog_and_command_identity() {
         error: None,
     };
     assert_eq!(result.status(), JobCommandStatus::Applied);
+}
+
+#[test]
+fn plugin_pause_notice_round_trips_through_agent_plugin_sync() {
+    let sync = AgentPluginSync {
+        body: Some(agent_plugin_sync::Body::PauseNotice(PluginPauseNotice {
+            plugin_id: "smalux.plus.echo".to_owned(),
+            plugin_version: "1.0.0".to_owned(),
+            runtime_revision: 7,
+            failure_count: 3,
+            failure_window_started_at_ms: 100,
+            paused_at_ms: 200,
+            last_exit_reason: "exit code 1".to_owned(),
+            last_error: "worker stopped".to_owned(),
+        })),
+    };
+    let decoded = AgentPluginSync::decode(sync.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, sync);
+
+    let ack = PluginPauseAck {
+        plugin_id: "smalux.plus.echo".to_owned(),
+        plugin_version: "1.0.0".to_owned(),
+        runtime_revision: 7,
+        accepted: true,
+        error: None,
+    };
+    let encoded_ack = AgentPluginSync {
+        body: Some(agent_plugin_sync::Body::PauseAcknowledgement(ack.clone())),
+    };
+    assert_eq!(
+        AgentPluginSync::decode(encoded_ack.encode_to_vec().as_slice())
+            .unwrap()
+            .body,
+        Some(agent_plugin_sync::Body::PauseAcknowledgement(ack))
+    );
 }

@@ -16,7 +16,7 @@ pub struct Model {
     pub agent_id: Option<String>,
     /// Server 在 prepare 阶段分配的稳定 Agent ID。
     pub reserved_agent_id: String,
-    /// Client 在加密注册请求中提交的名称。
+    /// Server 从注册 Token 复制的展示名称；Token 未指定时等于 `reserved_agent_id`。
     pub agent_name: String,
     /// XXpsk3 认证得到的 Agent Noise 静态公钥，固定 32 字节。
     pub agent_public_key: Vec<u8>,
@@ -30,9 +30,6 @@ pub struct Model {
     pub expires_at: Option<i64>,
     /// 完成提交的时间；未完成时为空。
     pub committed_at: Option<i64>,
-    /// 当前事务预分配的 Agent；prepare 阶段通过预分配 ID 关联，commit 后外键才回填。
-    #[sea_orm(belongs_to, from = "reserved_agent_id", to = "agent_id")]
-    pub agent: BelongsTo<super::agent::Entity>,
     /// 当前事务使用的注册 Token。
     #[sea_orm(belongs_to, from = "token_id", to = "token_id")]
     pub token: BelongsTo<super::registration_token::Entity>,

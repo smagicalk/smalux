@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 当前连接的心跳和对称 cipher rekey 控制消息。
+// 这些消息由 transport 状态机内部消费，不应作为普通 SessionEvent 暴露给业务调用方。
+message SessionControl {
+  oneof body {
+    Ping ping = 1;
+    Pong pong = 2;
+    RekeyRequired rekey_required = 3;
+    RekeyRequest rekey_request = 4;
+    RekeyAck rekey_ack = 5;
+  }
+}
+
+message Ping {
+  // 发送方生成的关联值，不是 AEAD nonce。
+  uint64 nonce = 1;
+  // 仅用于日志和跨机器诊断；RTT 仍使用发送方单调时钟计算。
+  uint64 sent_at_unix_micros = 2;
+}
+
+message Pong {
+  // 原样复制对应 Ping.nonce。
+  uint64 nonce = 1;
+  uint64 echoed_sent_at_unix_micros = 2;
+  uint64 responder_received_at_unix_micros = 3;
+  uint64 responder_sent_at_unix_micros = 4;
+}
+
+message RekeyRequired {
+  // Responder 期望 initiator 发起的下一 generation。
+  uint64 next_generation = 1;
+}
+
+message RekeyRequest {
+  // 双方准备提交的目标 generation；跳代或重放必须拒绝。
+  uint64 generation = 1;
+}
+
+message RekeyAck {
+  // 必须匹配 RekeyRequest.generation。
+  uint64 generation = 1;
+}

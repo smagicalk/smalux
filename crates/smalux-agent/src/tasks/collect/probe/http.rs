@@ -47,7 +47,7 @@ pub(super) async fn probe(
             expected_status,
             follow_redirects,
         } => (url.clone(), *expected_status, *follow_redirects),
-        ProbeTarget::IcmpEcho | ProbeTarget::TcpConnect { .. } => {
+        ProbeTarget::IcmpEcho | ProbeTarget::TcpConnect { .. } | ProbeTarget::UdpRequest { .. } => {
             unreachable!("HTTP executor received a non-HTTP node")
         }
     };

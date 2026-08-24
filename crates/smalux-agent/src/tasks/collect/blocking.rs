@@ -20,11 +20,11 @@ struct CollectInner<C> {
 }
 
 /// 串行维护同步 collector，并把阻塞刷新移出 Tokio 工作线程。
-pub(crate) struct CollectState<C> {
+pub(crate) struct BlockingCollectorState<C> {
     inner: Arc<Mutex<CollectInner<C>>>,
 }
 
-impl<C> CollectState<C>
+impl<C> BlockingCollectorState<C>
 where
     C: Send + 'static,
 {
@@ -185,7 +185,7 @@ mod tests {
 
     use crate::scheduler::TaskContext;
 
-    use super::CollectState;
+    use super::BlockingCollectorState;
 
     fn context() -> TaskContext {
         TaskContext {
@@ -201,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_state_preserves_state_and_sampling_interval() {
-        let state = CollectState::new(0_u64);
+        let state = BlockingCollectorState::new(0_u64);
 
         let first = state
             .collect(context(), |value| {
@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_collect_maps_query_errors_to_transient_and_allows_reuse() {
-        let state = CollectState::new(0_u64);
+        let state = BlockingCollectorState::new(0_u64);
 
         let error = state
             .try_collect(context(), |_| -> anyhow::Result<()> {
@@ -242,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_state_propagates_panic_and_rejects_reuse() {
-        let state = CollectState::new(());
+        let state = BlockingCollectorState::new(());
 
         let panic = AssertUnwindSafe(state.collect(context(), |_| -> () {
             panic!("collector failed");

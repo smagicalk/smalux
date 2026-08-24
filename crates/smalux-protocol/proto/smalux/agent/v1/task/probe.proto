@@ -16,7 +16,7 @@ message ProbeTaskConfig {
 message ProbeNodeConfig {
   // Server 分配的人类可读节点名，在结果中原样返回。
   string name = 1;
-  // ICMP/TCP 使用的主机名或 IP；HTTP 也保留该字段用于统一展示。
+  // ICMP/TCP/UDP 使用的主机名或 IP；HTTP 也保留该字段用于统一展示。
   string host = 2;
   // 本次 Task 对该节点的尝试次数，必须大于零。
   uint32 attempts = 3;
@@ -33,6 +33,8 @@ message ProbeNodeConfig {
     TcpConnectTarget tcp_connect = 11;
     // 发起 HTTP 请求并校验响应状态码。
     HttpTarget http = 12;
+    // 发送 UDP 数据报并等待目标端返回数据报。
+    UdpRequestTarget udp_request = 13;
   }
 }
 
@@ -43,6 +45,16 @@ message IcmpEchoTarget {}
 message TcpConnectTarget {
   // 目标 TCP 端口，范围 1..65535。
   uint32 port = 1;
+}
+
+// UDP 请求/响应探测目标和成功条件。
+message UdpRequestTarget {
+  // 目标 UDP 端口，范围 1..65535。
+  uint32 port = 1;
+  // 每次尝试发送的原始数据，必须包含 1..4096 字节。
+  bytes request_payload = 2;
+  // 可选的响应前缀；缺失或为空时，收到任意目标数据报即成功。
+  optional bytes expected_response_prefix = 3;
 }
 
 // HTTP 探测目标和成功条件。
@@ -75,7 +87,7 @@ message ProbeNodeSnapshot {
   string host = 2;
   // 实际执行的探测协议。
   ProbeProtocol protocol = 3;
-  // TCP 探测端口；其他协议缺失。
+  // TCP 或 UDP 探测端口；其他协议缺失。
   optional uint32 port = 4;
   // HTTP 探测 URL；其他协议缺失。
   optional string url = 5;
@@ -121,4 +133,6 @@ enum ProbeProtocol {
   PROBE_PROTOCOL_TCP_CONNECT = 2;
   // HTTP 请求与状态码校验。
   PROBE_PROTOCOL_HTTP = 3;
+  // UDP 请求与响应数据报。
+  PROBE_PROTOCOL_UDP_REQUEST = 4;
 }

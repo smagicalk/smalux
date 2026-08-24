@@ -52,7 +52,7 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-测试覆盖 Agent Scheduler、采集配置、JobController、Proto round-trip、Noise 握手、注册恢复、
+测试覆盖 Agent Scheduler、采集配置、RemoteJobController、Proto round-trip、Noise 握手、注册恢复、
 Driver 收发和错误路径。
 
 ## 4. 运行安全协议示例
@@ -64,10 +64,10 @@ cargo run -p smalux-protocol --example noise_shared_port_server
 ```
 
 Server 默认监听 `127.0.0.1:8080`。保持 Server 运行，在 Server 控制台执行
-`token generate` 生成一次性 Token：
+`token generate [display-name]` 生成一次性 Token，并可由 Server 预先绑定展示名称：
 
 ```powershell
-server> token generate
+server> token generate edge-agent-01
 ```
 
 然后在另一个终端启动 Client。Client 会提示 `paste registration token:`，把刚才生成的完整

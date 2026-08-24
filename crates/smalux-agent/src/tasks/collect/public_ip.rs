@@ -5,17 +5,17 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::PublicIpTaskConfig;
-use smalux_protocol::agent::v1::{PublicIpStatus, SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{PublicIpStatus, TaskResult, task_result};
 use tokio::sync::Mutex;
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
-    tasks::collect::collectors::ip::collect_public_families,
+    tasks::collect::collectors::ip::collect_public_families_with_client,
 };
 
 use super::{
     IpFamilySelection,
-    sample::{duration_ms, unix_timestamp_ms},
+    sample::{MetricSample, duration_ms, unix_timestamp_ms},
     selection::requested_ip_families,
 };
 
@@ -38,6 +38,7 @@ pub struct PublicIpTask {
     config: PublicIpTaskConfig,
     timeout: Duration,
     family: IpFamilySelection,
+    client: reqwest::Client,
     last_sampled_at: Mutex<Option<Instant>>,
 }
 
@@ -69,6 +70,7 @@ impl PublicIpTask {
             config,
             timeout,
             family,
+            client: reqwest::Client::new(),
             last_sampled_at: Mutex::new(None),
         })
     }
@@ -104,7 +106,8 @@ impl ReportingTask for PublicIpTask {
             _ = cancellation.cancelled() => {
                 return Err(TaskError::Transient(anyhow!("public IP collection cancelled")));
             }
-            snapshot = collect_public_families(
+            snapshot = collect_public_families_with_client(
+                &self.client,
                 self.timeout,
                 request_ipv4,
                 request_ipv6,
@@ -137,13 +140,10 @@ impl ReportingTask for PublicIpTask {
             }
         }
 
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms,
-                sample_interval_ms,
-            }),
-            result: Some(task_result::Result::PublicIp(snapshot)),
-        })
+        Ok(
+            MetricSample::new(sampled_at_ms, sample_interval_ms, snapshot)
+                .into_task_result(task_result::Result::PublicIp),
+        )
     }
 
     fn kind(&self) -> &'static str {

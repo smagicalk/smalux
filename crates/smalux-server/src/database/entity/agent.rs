@@ -22,9 +22,6 @@ pub struct Model {
     pub updated_at: i64,
     /// 吊销时间；未吊销时为空。
     pub revoked_at: Option<i64>,
-    /// 该 Agent 关联的所有注册事务。
-    #[sea_orm(has_many)]
-    pub registrations: HasMany<super::agent_registration::Entity>,
 }
 
 // SeaORM 要求实体的 ActiveModel 实现该行为接口；后续可在这里添加保存前后的业务钩子。

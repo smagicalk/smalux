@@ -29,12 +29,12 @@ smalux/
 | 新增原始系统读取 | `smalux-agent/src/tasks/collect/collectors/` |
 | 新增固定采集 Task | `smalux-agent/src/tasks/collect/` |
 | 修改触发、队列、并发 | `smalux-agent/src/scheduler/` |
-| 修改远程 Job 应用行为 | `smalux-agent/src/job_control.rs` |
-| 修改 Proto Job 编译和固定 Task 工厂 | `smalux-agent/src/job_control/compiler.rs` |
+| 修改远程 Job 应用行为 | `smalux-agent/src/remote_jobs.rs` |
+| 修改 Proto Job 编译和固定 Task 工厂 | `smalux-agent/src/remote_jobs/compiler.rs` |
 | 修改公开 Task 配置/结果 | `smalux-protocol/proto/.../task/` |
 
 Collector 应尽量只返回领域数据或明确错误；Task 负责配置、采样状态和 Proto 结果；Scheduler 不理解 CPU、
-Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
+Socket 或 Probe 业务；`RemoteJobController` 不直接执行具体 Task。
 
 判断修改归属时可以按问题提问：
 
@@ -43,7 +43,7 @@ Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 | “操作系统原始数据怎么读？” | Collector。 |
 | “配置如何筛选、排序并变成结果？” | Task。 |
 | “什么时候执行、拥堵如何处理？” | Scheduler/JobDefinition。 |
-| “Server 如何创建、更新或删除定义？” | JobController 与 Job Proto。 |
+| “Server 如何创建、更新或删除定义？” | RemoteJobController 与 Job Proto。 |
 | “消息如何跨 Agent/Server 传输？” | Protocol。 |
 | “结果如何保存、查询和展示？” | Server 应用与存储层。 |
 
@@ -60,7 +60,7 @@ Socket 或 Probe 业务；`JobController` 不直接执行具体 Task。
 | 修改加密 Session/rekey | `src/noise/session.rs` |
 | 修改 Tonic Client/Server | `src/tonic_transport/client.rs`、`server.rs` |
 | 修改 Session 策略、心跳统计和事件分类 | `src/tonic_transport/session/policy.rs` |
-| 修改 Tonic Session 状态机 | `src/tonic_transport/session.rs` |
+| 修改 Tonic Session 状态机 | `src/tonic_transport/session.rs` 及 `session/` 内部模块 |
 | 修改后台 Driver | `src/tonic_transport/driver.rs` |
 
 生成的 Rust 文件位于 Cargo `OUT_DIR`，不要手动修改或提交。
@@ -80,16 +80,16 @@ lib.rs
   -> state.rs                     AppState、密钥环同步和清理任务
   -> route.rs                     顶层 Router 和请求 ID/Trace 中间件
   -> controller/agent.rs          Agent gRPC Router 装配
-  -> service/agent/server_service.rs
+  -> service/agent/transport.rs
        Tonic trait、OpenSession、握手前错误和 worker 生命周期
-  -> service/agent/server_service/session.rs
+  -> service/agent/transport/session.rs
        注册、授权、加密业务循环
-  -> agent_registrar.rs            Server 业务授权接口
+  -> agent_registry.rs             Server 注册、授权与吊销接口
   -> database/agent_registration.rs
        Token、事务和 Agent 状态的持久化实现
 ```
 
-数据库配置和运行连接也已经分开：`database/config.rs` 只解析 URL、环境变量、后端 options 和连接
+数据库配置和运行连接也已经分开：`config/database.rs` 只解析 URL、环境变量、后端 options 和连接
 池参数；`database/connection.rs` 只负责 `ServerDatabase::connect`、迁移和连接句柄。修改某个后端
 配置时不需要阅读注册事务或 KeyRing 的实现。
 
@@ -97,7 +97,7 @@ lib.rs
 
 ```text
 SessionDriver / 连接层
-  -> JobController::apply
+  -> RemoteJobController::apply_command
        -> command_id 幂等缓存和 catalog_revision
        -> compiler::compile_job
             -> TaskFactory::build
@@ -106,7 +106,7 @@ SessionDriver / 连接层
        -> TaskReportSink
 ```
 
-`job_control.rs` 保留远程目录、命令状态和所有权；`job_control/compiler.rs` 保留 Proto 编译和
+`remote_jobs.rs` 保留远程目录、命令状态和所有权；`remote_jobs/compiler.rs` 保留 Proto 编译和
 Task 装配。不要为了添加一个采集器去修改控制器，也不要为了改变上报方式去修改 Collector。
 
 ## 用接口定位修改点
@@ -115,12 +115,12 @@ Task 装配。不要为了添加一个采集器去修改控制器，也不要为
 
 | 需求 | 首先阅读 | 不要直接修改 |
 | --- | --- | --- |
-| 增加 CPU/Socket 字段 | Proto task/result、Task 和 Collector | `JobController`、Tonic Session |
-| 改 Job 版本或幂等 | `JobController::apply` 和 Job Proto | Scheduler 内部队列 |
+| 增加 CPU/Socket 字段 | Proto task/result、Task 和 Collector | `RemoteJobController`、Tonic Session |
+| 改 Job 版本或幂等 | `RemoteJobController::apply_command` 和 Job Proto | Scheduler 内部队列 |
 | 改上报目标 | `TaskReportSink` adapter、SessionHandle | Collector 和 Task |
 | 改握手超时/Token | `AgentProtocolClient`、`ServerSessionAcceptor` | Axum handler 业务逻辑 |
-| 改 Agent 授权 | `AgentRegistrar::authorize_agent`、数据库 adapter | Noise 静态密钥状态机 |
-| 改数据库连接参数 | `database/config.rs` | 注册流程和 Router |
+| 改 Agent 授权 | `AgentRegistry::authorize_agent`、数据库 adapter | Noise 静态密钥状态机 |
+| 改数据库连接参数 | `config/database.rs` | 注册流程和 Router |
 
 深模块的判断标准是：接口保持小而稳定，复杂性留在实现内部；adapter 是改变输出或传输方式的 seam，
 不是把一层调用机械转发到另一层的包装。新增第二种 adapter 前，先确认两种实现共享的接口和错误语义。

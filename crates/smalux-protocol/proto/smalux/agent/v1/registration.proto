@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 首次 XXpsk3 建立密文通道后的可靠注册状态机。
+// Server 必须先持久化 pending 注册再发送 prepared；Agent 必须先持久化身份材料再发送
+// commit；Server 激活 Agent 并消费 Token 后发送 committed。四个阶段均可在断线后安全重试。
+message RegistrationMessage {
+  // 同一帧只能承载一个阶段，空 body 属于无效注册消息。
+  oneof body {
+    RegistrationRequest request = 1;
+    RegistrationPrepared prepared = 2;
+    RegistrationCommit commit = 3;
+    RegistrationCommitted committed = 4;
+  }
+}
+
+// Agent 在 Noise 密文中提交的一次性注册凭据。
+message RegistrationRequest {
+  // 一次性 Token 只允许出现在 Noise 密文中，成功提交后由 Server 消费。
+  string token = 1;
+  // 展示名称由 Server 签发 Token 时确定，Agent 不参与设置。
+  reserved 2;
+}
+
+// Server 已持久化 pending 注册后返回的事务信息。
+message RegistrationPrepared {
+  // Server 生成的注册事务 UUID，固定 16 字节。
+  bytes registration_id = 1;
+  // Server 分配的稳定 Agent 业务 ID。
+  string agent_id = 2;
+}
+
+// Agent 确认本地已经持久化注册所需身份材料。
+message RegistrationCommit {
+  // 必须匹配对应 RegistrationPrepared.registration_id。
+  bytes registration_id = 1;
+}
+
+// Server 确认 Agent 已激活且 Token 已消费。
+message RegistrationCommitted {
+  // 必须匹配对应 RegistrationCommit.registration_id。
+  bytes registration_id = 1;
+}

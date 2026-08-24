@@ -3,10 +3,8 @@
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
 
-use super::{
-    config::{DatabaseBackend, DatabaseConfig, DatabaseError},
-    migration::Migrator,
-};
+use super::{DatabaseError, migration::Migrator};
+use crate::config::{DatabaseBackend, DatabaseConfig};
 
 /// Server 进程持有的数据库句柄。
 ///

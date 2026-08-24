@@ -1,0 +1,17 @@
+{
+  "plugin_id": "smalux.plus.echo",
+  "display_name": "Smalux Echo Plus",
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "abi_version": 1,
+  "platform": "windows",
+  "entrypoint": "smalux-plus-echo-worker.exe",
+  "protocol_version": 1,
+  "schema_file": "schema.pb",
+  "task_types": [
+    "smalux.plus.echo.v1"
+  ]
+}

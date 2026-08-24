@@ -1,6 +1,6 @@
 ---
 title: 网络探测
-description: 配置多个 ICMP、TCP Connect 和 HTTP 探测节点。
+description: 配置多个 ICMP、TCP Connect、UDP Request 和 HTTP 探测节点。
 ---
 
 # 网络探测
@@ -13,14 +13,15 @@ description: 配置多个 ICMP、TCP Connect 和 HTTP 探测节点。
 | 字段 | 说明 |
 | --- | --- |
 | `name` | Server 分配的人类可读名称，结果中原样返回。 |
-| `host` | ICMP/TCP 使用的域名或 IP；HTTP 中用于统一展示。 |
+| `host` | ICMP/TCP/UDP 使用的域名或 IP；HTTP 中用于统一展示。 |
 | `attempts` | 本次 Task 内的尝试次数，必须大于零。 |
 | `timeout` | 每次尝试的独立超时。 |
 | `interval` | 相邻尝试之间的等待时长，可以为零。 |
-| `target` | `icmp_echo`、`tcp_connect` 或 `http` 之一。 |
+| `target` | `icmp_echo`、`tcp_connect`、`udp_request` 或 `http` 之一。 |
 
-配置转换阶段会拒绝缺失 target、零 attempts、零 timeout、非法端口、非法 URL，以及 HTTP 成功状态范围
-颠倒等错误。应在 Job 应用时失败，而不是等到每个调度周期都重复产生相同运行错误。
+配置转换阶段会拒绝缺失 target、零 attempts、零 timeout、非法端口、空或超过 4096 字节的 UDP 请求、
+非法 URL，以及 HTTP 成功状态范围颠倒等错误。应在 Job 应用时失败，而不是等到每个调度周期都重复
+产生相同运行错误。
 
 ## ICMP Echo
 
@@ -52,6 +53,30 @@ target: tcp_connect
 ```
 
 它能证明目标端口接受连接，但不能证明数据库认证、查询或业务逻辑正常。
+
+## UDP Request
+
+UDP 没有连接握手，因此“本机成功发送数据报”不能证明目标服务可达。本探测会发送请求并等待同一目标
+返回数据报，只有收到响应并满足可选前缀条件时才成功：
+
+```text
+name: dns
+host: 192.0.2.53
+port: 53
+request_payload: <原始 DNS 查询字节>
+expected_response_prefix: <可选的响应前缀字节>
+attempts: 3
+timeout: 2s
+target: udp_request
+```
+
+`request_payload` 必须包含 1 到 4096 字节。`expected_response_prefix` 缺失或为空时接受任意响应数据报；
+设置后可排除端口上与本次探测无关的响应。执行器使用 connected UDP socket，只接收所选目标地址返回的
+数据报；DNS 同时返回 IPv4 和 IPv6 时会竞争可用地址，首个有效响应获胜。请求内容和响应内容不会写入
+结果或日志，避免意外泄露协议载荷。
+
+UDP 响应前缀只能做轻量匹配，不能代替 DNS、NTP 等协议的结构化校验。后续需要验证事务 ID、响应码或
+字段内容时，应增加对应的专用探测类型，而不是继续扩展通用 UDP 配置。
 
 ## HTTP
 
@@ -112,7 +137,8 @@ attempts * timeout + (attempts - 1) * interval
 | --- | --- | --- |
 | 判断基础网络可达与延迟 | ICMP | 可能被防火墙丢弃，也可能需要系统权限。 |
 | 判断端口是否接受连接 | TCP Connect | 不验证应用认证和业务响应。 |
+| 判断 UDP 服务能否完成请求/响应 | UDP Request | 需要提供无副作用请求；通用模式只校验响应前缀。 |
 | 判断真实服务健康 | HTTP | 成本更高，但能验证 TLS、路由和状态码。 |
 
-生产监控常同时配置 TCP 与 HTTP：TCP 用于定位连接层故障，HTTP 用于判断业务入口。两者结果不同并不
-矛盾，例如 TCP 成功而 HTTP 失败通常说明服务已监听，但路由、TLS 或应用逻辑异常。
+生产监控常同时配置传输层和应用层探测：TCP/UDP 用于定位基础链路故障，HTTP 或专用协议探测用于判断
+业务入口。结果不同并不矛盾，例如 TCP 成功而 HTTP 失败通常说明服务已监听，但路由、TLS 或应用逻辑异常。

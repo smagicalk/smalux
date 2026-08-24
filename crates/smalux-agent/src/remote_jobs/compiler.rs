@@ -14,6 +14,7 @@ use smalux_protocol::agent::v1 as proto;
 use uuid::Uuid;
 
 use crate::{
+    plugins::{PluginManager, PluginReportingTask},
     scheduler::{
         CapacityPolicy, ExecutionRetryPolicy, FailurePolicy, JobId, JobOptions, JobPriority,
         MisfirePolicy, ReportingTask, RetryCondition, Schedule, TaskBinding, TaskReportSink,
@@ -23,6 +24,7 @@ use crate::{
         CpuTask, DiskIoTask, HostTask, LoadTask, LocalIpTask, MemoryTask, NetworkIoTask, ProbeTask,
         ProcessTask, PublicIpTask, SocketTask, SystemTask,
     },
+    tasks::task_kind,
 };
 
 /// 已通过协议边界校验、可以安装到 Scheduler 的完整 Job。
@@ -41,18 +43,30 @@ pub(super) struct CompiledJob {
     pub(super) options: JobOptions,
     /// 已绑定采集实现、业务 revision 和统一结果出口的类型擦除任务。
     pub(super) task: TaskBinding,
+    /// 与类型擦除 Task 一致的稳定标识。
+    pub(super) task_kind: String,
+    /// Plus Task 的插件身份；内置 Task 为 `None`。
+    pub(super) plugin: Option<(String, String)>,
 }
 
 /// 根据固定 Proto Task 类型创建实现代码，并绑定统一结果出口。
 pub(super) struct TaskFactory {
     /// 所有固定采集 Task 共用的报告出口；具体实现可写 Channel、磁盘或网络。
     sink: Arc<dyn TaskReportSink>,
+    /// 会话内已确认的 Plus Worker；内置 Task 不依赖它。
+    plugins: Arc<PluginManager>,
 }
 
 impl TaskFactory {
     /// 创建固定 Task 工厂；工厂自身不持有 Scheduler 或连接。
+    #[cfg(test)]
     pub(super) fn new(sink: Arc<dyn TaskReportSink>) -> Self {
-        Self { sink }
+        Self::with_plugins(sink, Arc::new(PluginManager::empty()))
+    }
+
+    /// 创建同时支持内置和已确认 Plus Worker 的工厂。
+    pub(super) fn with_plugins(sink: Arc<dyn TaskReportSink>, plugins: Arc<PluginManager>) -> Self {
+        Self { sink, plugins }
     }
 
     /// 将 Proto `oneof task` 映射到唯一的本地实现并完成配置校验。
@@ -90,6 +104,24 @@ impl TaskFactory {
             }
             Task::Socket(config) => Ok(self.bind(SocketTask::with_config(config)?, job_revision)),
             Task::Probe(config) => Ok(self.bind(ProbeTask::try_with_config(config)?, job_revision)),
+            Task::Plugin(config) => {
+                anyhow::ensure!(!config.plugin_id.is_empty(), "plugin_id is required");
+                anyhow::ensure!(
+                    !config.plugin_version.is_empty(),
+                    "plugin_version is required"
+                );
+                anyhow::ensure!(!config.task_kind.is_empty(), "plugin task_kind is required");
+                anyhow::ensure!(
+                    !self
+                        .plugins
+                        .is_paused(&config.plugin_id, &config.plugin_version),
+                    "Plus plugin is paused after repeated Worker failures"
+                );
+                Ok(self.bind(
+                    PluginReportingTask::new(self.plugins.clone(), config),
+                    job_revision,
+                ))
+            }
         }
     }
 
@@ -123,13 +155,20 @@ pub(super) fn compile_job(
             .ok_or_else(|| anyhow::anyhow!("job trigger is required"))?,
     )?;
     let options = compile_options(definition.options.as_ref())?;
-    let task = factory.build(
-        definition
-            .task
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("job task is required"))?,
-        definition.revision,
-    )?;
+    let task_definition = definition
+        .task
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("job task is required"))?;
+    let stable_task_kind =
+        task_kind(task_definition).ok_or_else(|| anyhow::anyhow!("task definition is required"))?;
+    let plugin = match task_definition.task.as_ref() {
+        Some(proto::task_definition::Task::Plugin(config)) => {
+            Some((config.plugin_id.clone(), config.plugin_version.clone()))
+        }
+        _ => None,
+    };
+    let task = factory.build(task_definition, definition.revision)?;
+    debug_assert_eq!(task.kind(), stable_task_kind);
     // 到这里所有协议值都已变成 Scheduler 可接受的强类型。
     Ok(CompiledJob {
         id,
@@ -138,6 +177,8 @@ pub(super) fn compile_job(
         trigger,
         options,
         task,
+        task_kind: stable_task_kind,
+        plugin,
     })
 }
 

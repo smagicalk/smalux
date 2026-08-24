@@ -1,0 +1,24 @@
+[package]
+name = "smalux-plus-echo"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "smalux-plus-echo-worker"
+path = "src/main.rs"
+
+[dependencies]
+smalux-plus-core = { path = "../smalux-plus-core" }
+async-trait = "0.1.89"
+prost = "0.14.4"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "io-util", "process", "fs"] }
+
+[dev-dependencies]
+tokio-util = { version = "0.7.18", features = ["rt"] }
+uuid = { version = "1.16.0", features = ["v4"] }
+
+[build-dependencies]
+prost = "0.14.4"
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"

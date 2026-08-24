@@ -6,21 +6,21 @@ description: 使用 Proto JobDefinition 配置 Agent 调度任务。
 # Job 与 Task
 
 Smalux 不再维护 JSON Job 模型。Server、本地存储和 Agent 之间共享的配置以 Proto
-`JobDefinition` 为准，连接层收到 `JobCommand` 后可直接交给 `JobController::apply`。
+`JobDefinition` 为准，连接层收到 `JobCommand` 后可直接交给 `RemoteJobController::apply_command`。
 
 完整执行链如下：
 
 ```text
 Server 构造 JobCommand
   -> Protocol 会话发送命令
-  -> Agent 的 JobController 校验 revision 和幂等键
+  -> Agent 的 RemoteJobController 校验 revision 和幂等键
   -> JobFactory 把 Proto Task 配置转换为可执行 Task
   -> Scheduler 根据 Trigger 产生执行实例
   -> Task 返回 TaskResult
   -> Agent 包装 TaskReport 并通过会话上报
 ```
 
-`JobController` 负责远程目录和命令语义，`Scheduler` 负责时间、队列与并发，Task 只负责一次业务执行。
+`RemoteJobController` 负责远程目录和命令语义，`Scheduler` 负责时间、队列与并发，Task 只负责一次业务执行。
 不要让 Task 自己发送网络消息，否则 Task 会同时依赖采集、连接状态和重试策略，难以测试和复用。
 
 ## JobDefinition
@@ -122,7 +122,7 @@ timezone   = "Asia/Shanghai"
 避免网络重试重复执行 `RunJobNow`。
 
 ```rust
-let result = job_controller.apply(command).await;
+let result = remote_jobs.apply_command(command).await;
 session_handle.send_job_command_result(result).await?;
 ```
 
@@ -137,11 +137,37 @@ session_handle.send_job_command_result(result).await?;
 
 ## 本地 Job 与远程 Job
 
-本地 Job 由 Agent 本地配置或内置策略创建，远程 Job 由 `JobController` 管理。两者可以共用 Scheduler，
+本地 Job 由 Agent 本地配置或内置策略创建，远程 Job 由 `RemoteJobController` 管理。两者可以共用 Scheduler，
 但必须保持所有权：`ReplaceAllJobs` 和 `clear()` 只操作远程 Job，不得删除本地 Job。
 
 连接断开后远程 Job 会继续运行。若希望只离线执行一段时间，应由 Agent 连接管理层记录断开时间，超过
 策略窗口后显式暂停远程 Job；这不是 Scheduler 根据 socket 状态自行判断的职责。
+
+## 动态远程 Job 黑名单
+
+黑名单是 Agent 本地策略，不由 Server 数据库拥有。使用本机 IPC 修改：
+
+```powershell
+smalux-agent jobs policy show
+smalux-agent jobs policy add-task smalux.collect.process.v1
+smalux-agent jobs policy remove-task smalux.collect.process.v1
+smalux-agent jobs policy deny-all
+smalux-agent jobs policy allow-all
+```
+
+`add-task` 只接受 `smalux-agent tasks list` 显示的完整稳定 kind。加入后，匹配的远程 Job
+立即变为 Disabled，定时器、Pending 和重试被清理，正在运行的实例收到取消信号；本地 Job
+不受影响。规则只匹配外层 Task kind，CPU 不会连带匹配 System。
+
+`remove-task` 和 `allow-all` 不直接启用旧定义。Agent 上报新策略后，Server 应重新读取权威
+目录并发送 `ReplaceAllJobs`。`allow-all` 只解除 `deny_all`，不会清空逐项黑名单。
+
+策略保存在 `<data_dir>/agent/job-policy.json`。离线修改会显示 `server_sync=pending`，重连后
+自动上报最新完整快照。文件损坏时 Agent 拒绝非交互启动；使用
+`smalux-agent jobs policy repair --reset` 备份损坏文件并恢复空策略。
+
+完整 Wire 顺序和 revision 幂等规则见
+[协议会话](../protocol/session.md#agent-job-策略同步)。
 
 ## TaskReport
 
@@ -160,13 +186,13 @@ revision，防止旧配置的迟到结果污染新配置序列。
 
 ## JobCommand 的实际调用链
 
-Agent 收到 `JobCommand` 后，唯一推荐入口是 `JobController::apply`。连接层不应直接调用
+Agent 收到 `JobCommand` 后，唯一推荐入口是 `RemoteJobController::apply_command`。连接层不应直接调用
 `Scheduler::install`，因为目录版本、命令幂等和远程所有权都必须在同一个控制器锁内处理：
 
 ```text
 SessionDriver::recv
   -> SessionEvent::JobCommand(command)
-  -> JobController::apply(command)
+  -> RemoteJobController::apply_command(command)
        -> parse_uuid(command_id)
        -> cached_results[command_id] 命中？返回首次结果
        -> state.lock()
@@ -181,7 +207,7 @@ SessionDriver::recv
 
 | 版本 | 由谁产生 | 校验位置 | 用来解决什么问题 |
 | --- | --- | --- | --- |
-| `command_id` | Server 命令构造器 | `JobController::apply` | 网络重试不重复执行命令。 |
+| `command_id` | Server 命令构造器 | `RemoteJobController::apply_command` | 网络重试不重复执行命令。 |
 | `catalog_revision` | Server 远程目录 | `require_next_catalog` / `require_replace_all_catalog` | 检测增量丢失、乱序和旧快照。 |
 | `JobDefinition.revision` | Job 配置拥有者 | `compile_job`、`upsert_compiled` | 防止旧配置覆盖新配置。 |
 | `JobSnapshot.version` | Agent Scheduler | `update/delete/enable/disable` | 防止并发修改覆盖。 |
@@ -258,7 +284,7 @@ RunJobNow
 ## TaskFactory、Scheduler 和结果出口
 
 Task 的职责是“一次执行并返回结果”，不是向 gRPC 发送消息。固定 Task 的装配发生在
-`job_control/compiler.rs`：
+`remote_jobs/compiler.rs`：
 
 ```text
 TaskDefinition.oneof
@@ -279,11 +305,11 @@ Scheduler 只读取 `Trigger`、`JobOptions` 和 `TaskBinding`，负责：
 - 为每次更新维护内部 generation。
 
 Task 通过 `TaskReportSink` 把执行结果交给调用方。Sink 可以是内存 channel、本地持久化队列或
-Protocol Session 适配器，JobController 不假设它是哪一种：
+Protocol Session 适配器，RemoteJobController 不假设它是哪一种：
 
 ```rust
-let controller = JobController::new(scheduler, report_sink);
-let result = controller.apply(command).await;
+let controller = RemoteJobController::new(scheduler, report_sink);
+let result = controller.apply_command(command).await;
 session_handle.send_job_command_result(result).await?;
 
 // Scheduler 执行时，ReportingTask 将业务 revision 写入 TaskReport。
@@ -295,7 +321,7 @@ session_handle.send_job_command_result(result).await?;
 
 ## 断线、恢复和旧结果
 
-断线不会自动调用 `JobController::clear`，已安装的远程 Job 可以继续运行一段时间。重新连接后，
+断线不会自动调用 `RemoteJobController::clear`，已安装的远程 Job 可以继续运行一段时间。重新连接后，
 Server 应根据 Agent 上报的 `catalog_revision` 选择增量同步或 `ReplaceAllJobs`。如果应用要求“断线
 超过 N 分钟自动停采”，应由连接管理器记录断线时间并显式暂停 Job，不能让 Scheduler 通过 socket
 状态隐式改变业务状态。

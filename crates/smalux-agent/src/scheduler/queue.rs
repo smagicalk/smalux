@@ -200,29 +200,19 @@ impl ReadyQueue {
 
     /// KeepLatest 使用：删除该 Job 所有尚未执行的正常 Trigger。
     pub fn remove_normal_triggers(&mut self, job_id: JobId) -> Vec<PendingExecution> {
-        let run_ids = self
-            .pending
-            .values()
-            .filter(|pending| pending.job_id == job_id && pending.kind.is_replaceable_trigger())
-            .map(|pending| pending.run_id)
-            .collect::<Vec<_>>();
-        run_ids
-            .into_iter()
-            .filter_map(|run_id| self.pending.remove(&run_id))
+        self.pending
+            .extract_if(|_, pending| {
+                pending.job_id == job_id && pending.kind.is_replaceable_trigger()
+            })
+            .map(|(_, pending)| pending)
             .collect()
     }
 
     /// 删除指定 Job 的全部 Pending，并返回被移除记录用于事件或统计。
     pub fn remove_job(&mut self, job_id: JobId) -> Vec<PendingExecution> {
-        let run_ids = self
-            .pending
-            .values()
-            .filter(|pending| pending.job_id == job_id)
-            .map(|pending| pending.run_id)
-            .collect::<Vec<_>>();
-        run_ids
-            .into_iter()
-            .filter_map(|run_id| self.pending.remove(&run_id))
+        self.pending
+            .extract_if(|_, pending| pending.job_id == job_id)
+            .map(|(_, pending)| pending)
             .collect()
     }
 

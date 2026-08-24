@@ -92,10 +92,11 @@ Task::NewType(config)   -> NewTypeTask
 
 ## 6. 更新能力协商
 
-不同 Agent 构建可能支持不同 Task。正式连接协议应上报 Agent 版本、协议版本、Task 类型和配置版本；Server
-只向声明支持的 Agent 下发 Job。当前能力协商仍是待完善边界，新增 Plus Task 时尤其不能假设所有 Agent
-已经包含它。
+不同 Agent 构建可能支持不同 Task。正式 Agent 连接后会发送 `AgentCapabilitySnapshot`，包含 Agent
+版本、排序后的稳定 Task kind 和 Probe 协议；Server 也可以通过 `AgentCapabilityQuery` 要求重发。
+新增内置 Task 时必须同步更新 Capability Registry，否则 Server 无法知道该二进制已经支持它。
 
-在能力协商完成前，Server 应把 `UNSUPPORTED_TASK` 视为明确的兼容结果并停止重复下发，而不是不断重试。
+当前 Server 已校验并保留会话内快照，但权威 Job Provider 尚未依据能力过滤目录。完成该过滤前，Server
+仍应把 `UNSUPPORTED_TASK` 视为明确兼容结果并停止重复下发，而不是不断重试。
 Task 配置本身若需要独立演进，可以增加配置版本或新的 oneof 分支；不要让同一字段随 Agent 版本静默改变
 含义。

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::SystemTaskConfig;
-use smalux_protocol::agent::v1::{SampleMetadata, SystemSnapshot, TaskResult, task_result};
+use smalux_protocol::agent::v1::{SystemSnapshot, TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    blocking::CollectState,
+    blocking::BlockingCollectorState,
     process::into_proto_snapshot as into_proto_process_snapshot,
     selection::{filter_disk, filter_local_ip, filter_network},
     socket::into_proto_snapshot as into_proto_socket_snapshot,
@@ -18,7 +18,7 @@ use super::{
 
 /// 使用独立组合 collector 生成完整本机快照的调度任务。
 pub struct SystemTask {
-    state: CollectState<HostMetricsCollector>,
+    state: BlockingCollectorState<HostMetricsCollector>,
     config: SystemTaskConfig,
 }
 
@@ -34,7 +34,7 @@ impl SystemTask {
     /// 使用显式资源筛选配置创建 Task。
     pub fn with_config(config: SystemTaskConfig) -> Self {
         Self {
-            state: CollectState::new(HostMetricsCollector::new()),
+            state: BlockingCollectorState::new(HostMetricsCollector::new()),
             config,
         }
     }
@@ -84,15 +84,9 @@ impl ReportingTask for SystemTask {
         {
             filter_local_ip(&mut output.snapshot.ip, selection);
         }
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::System(Box::new(into_proto_snapshot(
-                output.snapshot,
-            )))),
-        })
+        Ok(output.into_task_result(|snapshot| {
+            task_result::Result::System(Box::new(into_proto_snapshot(snapshot)))
+        }))
     }
 
     fn kind(&self) -> &'static str {

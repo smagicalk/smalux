@@ -103,7 +103,7 @@ smalux-protocol/
 
 ```text
 Server 或本地存储生成 JobDefinition
-    -> Agent JobController::apply(JobCommand)
+    -> Agent RemoteJobController::apply_command(JobCommand)
     -> 校验 job_id、revision、trigger、options 和具体 TaskConfig
     -> TaskFactory 创建固定 ReportingTask
     -> Scheduler 使用 Server UUID 和私有 generation 执行
@@ -115,7 +115,7 @@ Server 或本地存储生成 JobDefinition
 启动的旧执行，两者不能混用。`ReplaceAllJobs` 只替换远程所有权 Job，不应删除 Agent
 本地 Job。相同 `command_id` 必须返回缓存结果，尤其不能重复执行 `RunJobNow`。
 
-### JobController 方法
+### RemoteJobController 方法
 
 | 方法 | 输入 | 行为 |
 | --- | --- | --- |
@@ -136,11 +136,11 @@ let sink: Arc<dyn TaskReportSink> = Arc::new(|report: TaskReport| async move {
         .map_err(CallbackError::Transient)
 });
 
-// JobController 只管理通过自身安装的远程 Job。
-let controller = JobController::new(runtime.scheduler(), sink);
+// RemoteJobController 只管理通过自身安装的远程 Job。
+let controller = RemoteJobController::new(runtime.scheduler(), sink);
 
 // 网络层解码出 JobCommand 后直接交给控制器；返回值应原样关联到 command_id 上报。
-let result = controller.apply(command).await;
+let result = controller.apply_command(command).await;
 send_command_result(result).await?;
 ```
 
@@ -235,7 +235,7 @@ Task::RusticBackup(config) -> PlusTaskFactory -> RusticBackupTask
 - 创建实现 `ReportingTask` 的固定 Task；
 - 把领域结果包装为对应的 `TaskResult` 分支。
 
-Scheduler、`JobController` 和 `TaskReportSink` 不应理解 Rustic 或其他 Plus 的业务细节。这样
+Scheduler、`RemoteJobController` 和 `TaskReportSink` 不应理解 Rustic 或其他 Plus 的业务细节。这样
 新增 Plus 能力时，变化只集中在 Proto、Plus 实现和工厂注册位置。
 
 ### 能力协商
@@ -260,7 +260,7 @@ CPU、内存、网络等采集通常是只读操作；备份、更新、脚本�
 - 最大运行时间、并发限制和取消能否真正终止底层操作；
 - 运行日志、安全审计、结果保留和失败恢复方式。
 
-`JobController` 当前的 `command_id` 缓存是进程内有限窗口，适合防止网络重发导致的重复
+`RemoteJobController` 当前的 `command_id` 缓存是进程内有限窗口，适合防止网络重发导致的重复
 `RunNow`，但不能替代有副作用任务的持久化幂等。备份等任务需要把业务运行 ID、执行状态
 和最终结果保存在数据库或本地文件中，Agent 重启后仍应能够识别已经开始或完成的操作。
 
@@ -279,11 +279,11 @@ smalux-plus-rustic
 smalux-agent/task_factory
     将协议 Task 分支映射到内置或 Plus 实现
 
-smalux-agent/job_control
+smalux-agent/remote_jobs
     处理命令幂等、业务版本、所有权和 Scheduler 装配
 ```
 
-协议 crate 不访问数据库、文件或 KMS；Plus crate 不处理 gRPC 会话；`JobController` 不实现
+协议 crate 不访问数据库、文件或 KMS；Plus crate 不处理 gRPC 会话；`RemoteJobController` 不实现
 具体任务。持久化、连接和业务实现通过明确的方法与 trait 组合，避免后期扩展反向耦合到
 Scheduler 或传输层。
 
@@ -330,10 +330,13 @@ ServerSessionAcceptor
 | 消息 | 用途 |
 | --- | --- |
 | `RegistrationMessage` | XXpsk3 后执行 request、prepared、commit、committed 四阶段注册。 |
-| `Messages` | 上报、命令、应答等业务数据。 |
+| `DiagnosticMessage` | Example 和链路诊断请求/响应，不承载正式 Job 业务。 |
 | `SecureError` | 已加密的 Token、授权或业务错误。 |
 | `SessionControl` | Ping/Pong 和同步 rekey。 |
 | `KeyRotationMessage` | Agent/Server 长期静态密钥轮换。 |
+| `JobCommand` / `JobCommandResult` | Server Job 控制及 Agent 执行结果。 |
+| `TaskReport` | Agent 强类型采集结果上报。 |
+| `AgentJobPolicySync` | Agent 本地 Job 策略的 Query、Snapshot 和 ACK。 |
 
 ## 身份与标识方法
 
@@ -372,6 +375,17 @@ ServerSessionAcceptor
 
 ## Agent Client 方法
 
+### 共享输入校验
+
+| 方法 | 作用 |
+| --- | --- |
+| `validate_registration_token_id(token_id)` | 在数据库查询前限制握手外层公开 Token ID 的长度和字符集。 |
+| `parse_registration_credential(credential)` | 一次解析 `token_id.64位十六进制PSK`，返回公开 ID 和固定 32 字节 PSK；错误不回显凭据。 |
+| `validate_agent_display_name(display_name)` | 校验 Server 签发 Token 时可选的 1-64 字节 Agent 展示名称。 |
+
+这些方法只定义协议相关输入不变量，不读取配置或数据库。Token ID 和凭据由 Agent、Server
+共同使用；展示名称只由 Server 管理入口使用，Agent 不上报该字段。
+
 ### `AgentProtocolClient`
 
 | 方法 | 作用 | 重要行为 |
@@ -379,13 +393,14 @@ ServerSessionAcceptor
 | `new(endpoint)` | 创建 Client 配置。 | `http://` 使用 h2c；`https://` 使用系统根证书验证 TLS。 |
 | `set_handshake_timeout(duration)` | 修改连接和每一步握手超时。 | 默认 5 秒，只限制建连/握手，不限制长期业务流。 |
 | `set_grpc_prefix(prefix)` | 设置 Axum/Nginx 下的统一 gRPC 前缀。 | 示例使用 `/api/v1/grpc`。 |
-| `prepare_registration(identity, psk, token, agent_name)` | 执行 XXpsk3 并等待 Server 保存 pending 注册。 | `token` 使用 `token_id.psk`；返回后应先持久化结果，再调用 `commit()`。 |
-| `register_agent(identity, psk, token, agent_name)` | 依次执行 prepare 和 commit 的便捷方法。 | 自动从 `token_id.psk` 提取 Token ID；适合测试。生产持久化应使用分步方法。 |
+| `prepare_registration(identity, psk, token)` | 执行 XXpsk3 并等待 Server 保存 pending 注册。 | `token` 使用 `token_id.psk`；返回后应先持久化结果，再调用 `send_registration_commit_and_receive_committed()`。 |
+| `register_agent(identity, psk, token)` | 依次执行 prepare 和 commit 的便捷方法。 | 自动从 `token_id.psk` 提取 Token ID；适合测试。生产持久化应使用分步方法。 |
 | `connect(identity, server_key)` | 使用固定 Server 公钥执行 IK。 | 成功后返回可持续使用的 `TonicNoiseSession`。 |
 | `connect_with_candidates(identity, candidates)` | 依次尝试多把 Server 公钥。 | Server 换钥期间通常传 `PinnedServerKeys::connection_candidates()`。 |
 
 `prepare_registration` 返回 `AgentPendingRegistration`，其中的 `agent_identity`、
-`server_public_key`、`agent_id` 和 `registration_id` 都必须先持久化。随后调用 `commit()`，
+`server_public_key`、`agent_id` 和 `registration_id` 都必须先持久化。随后调用
+`send_registration_commit_and_receive_committed()`，
 成功后得到 `AgentRegistration`：
 
 | 字段 | 含义 | 是否需要持久化 |
@@ -409,7 +424,7 @@ ServerSessionAcceptor
 prepare_registration()
     -> Server 返回 pending
     -> 原子保存 agent_identity、server_public_key、agent_id、registration_id
-    -> commit()
+    -> send_registration_commit_and_receive_committed()
     -> 原子保存 committed 状态
     -> 直接使用返回的 registration.session
 ```
@@ -418,7 +433,7 @@ prepare_registration()
 
 ```rust,ignore
 let pending = client
-    .prepare_registration(identity, &psk, token, agent_name)
+    .prepare_registration(identity, &psk, token)
     .await?;
 
 // 这里保存四项长期材料；保存失败时不要发送 commit。
@@ -430,7 +445,9 @@ store.save_pending_registration(
 )?;
 
 // Server 激活 Agent 并消费 Token；成功后当前 XX session 已经可以传业务。
-let registered = pending.commit().await?;
+let registered = pending
+    .send_registration_commit_and_receive_committed()
+    .await?;
 store.mark_registration_committed(registered.registration_id)?;
 run_business_loop(registered.session).await?;
 ```
@@ -484,7 +501,9 @@ let pending = client
 save_pending_registration(&pending)?;
 
 // 保存成功后再发送 RegistrationCommit，并等待 Server 的 RegistrationCommitted。
-let mut registration = pending.commit().await?;
+let mut registration = pending
+    .send_registration_commit_and_receive_committed()
+    .await?;
 mark_registration_committed(registration.registration_id)?;
 
 // 持久化成功后直接复用 registration.session 发送业务消息；不需要立即重连 IK。
@@ -501,7 +520,8 @@ mark_registration_committed(registration.registration_id)?;
 3. `prepare_registration` 执行 XXpsk3 三消息握手。
 4. 双方确认持有相同 PSK，Client 得到已认证的 Server 公钥。
 5. Client 在 Noise 密文内发送 `RegistrationRequest`。
-6. Server 保存 pending 事务并返回 `RegistrationPrepared`。
+6. Server 从 Token 记录取得可选展示名称，保存 pending 事务并返回 `RegistrationPrepared`；
+   未配置名称时使用新生成的 `agent_id`。
 7. Client 持久化身份、Server 公钥、`agent_id` 和 `registration_id`。
 8. Client 发送 `RegistrationCommit`；Server 激活 Agent、消费 Token 并返回 `RegistrationCommitted`。
 9. Client 标记本地注册完成，当前 XX Session 直接进入业务循环。
@@ -514,9 +534,11 @@ mark_registration_committed(registration.registration_id)?;
 ### 后续 IK 连接
 
 ```rust,no_run
-// Messages 是加密业务 envelope；NoiseIdentity 和 Server 公钥来自持久化状态。
+// DiagnosticMessage 只用于链路诊断；NoiseIdentity 和 Server 公钥来自持久化状态。
 use smalux_protocol::{
-    agent::v1::{Messages, MessagesRequest, SecureMessage, messages, secure_message},
+    agent::v1::{
+        DiagnosticMessage, DiagnosticRequest, SecureMessage, diagnostic_message, secure_message,
+    },
     noise::{NoiseIdentity, NoisePublicKey},
     tonic_transport::AgentProtocolClient,
 };
@@ -533,10 +555,10 @@ let mut session = client.connect(&identity, server_key).await?;
 // 所有业务消息都必须交给 session.send，由它维护严格递增的 Noise nonce。
 session
     .send(SecureMessage {
-        // SecureMessage 的 oneof 指明这是一条普通业务 Messages。
-        body: Some(secure_message::Body::Messages(Messages {
-            // Messages oneof 再区分 Request 与 Response。
-            body: Some(messages::Body::Request(MessagesRequest {
+        // SecureMessage 的 oneof 指明这是一条链路诊断消息。
+        body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+            // DiagnosticMessage oneof 再区分 Request 与 Response。
+            body: Some(diagnostic_message::Body::Request(DiagnosticRequest {
                 // sequence 用于业务确认和幂等，不是 Noise 密码学 nonce。
                 sequence: 1,
                 // 示例省略 payload；实际可放 bytes、string 或 typed EchoRequest。
@@ -605,19 +627,23 @@ let incoming = ServerSessionAcceptor::default()
 let (agent_id, session) = match incoming {
     IncomingSession::Registration(mut registration) => {
         let agent_key = registration.peer_public_key();
-        let request = registration.receive_request().await?;
+        let request = registration.receive_registration_request().await?;
         // 数据库方法必须对 token + agent_key 的重复请求返回同一事务。
         let prepared = registry.prepare(request, agent_key)?;
-        registration.prepare(prepared.id, prepared.agent_id.clone()).await?;
-        registration.wait_for_commit(prepared.id, commit_timeout).await?;
+        registration
+            .send_registration_prepared(prepared.id, prepared.agent_id.clone())
+            .await?;
+        registration
+            .receive_registration_commit(prepared.id, commit_timeout)
+            .await?;
         // 先提交数据库并消费 Token，再发送最终成功响应。
         registry.commit(prepared.id, agent_key)?;
-        let session = registration.complete(prepared.id).await?;
+        let session = registration.send_registration_committed(prepared.id).await?;
         (prepared.agent_id, session)
     }
     IncomingSession::Authentication(authentication) => {
         let Some(agent_id) = registry.authorize(authentication.peer_public_key()) else {
-            authentication.reject(not_authorized_error).await?;
+            authentication.send_rejection(not_authorized_error).await?;
             return Ok(());
         };
         (agent_id, authentication.authorize())
@@ -689,7 +715,7 @@ rekey 等待 Ack 时提前到达的业务消息会被缓存，并在换钥完成
 `SessionEventReceiver`；调用方可自行 spawn `driver.run()`。`SessionDriver::spawn` 是对应的便捷入口，
 返回 `RunningSession { handle, events, task }`。
 
-`SessionHandle` 提供 `send`、`send_messages`、`send_task_report`、`send_job_command`、
+`SessionHandle` 提供 `send`、`send_diagnostic`、`send_task_report`、`send_job_command`、
 `send_job_command_result`、`ping`、`request_rekey`、`require_rekey`、`heartbeat_stats`、四个静态密钥
 轮换发送方法和幂等 `shutdown`。所有请求经过有界队列，真正的 Prost 编码、Noise 加密、rekey 和 nonce 推进只发生
 在 Driver task 中。事件队列同样有界，消费过慢会形成反压而不是静默丢包。
@@ -892,7 +918,7 @@ Server 换钥推荐流程：
 | `RemoteSecure(code, message)` | 已建立 Noise 后收到的加密业务错误。 | 按 `SecureErrorCode` 处理，例如重新注册或停止授权。 |
 
 Server 只有在握手尚未完成、不能发送 `SecureError` 时才调用 `protocol_error()`。握手成功后应通过
-`ServerPendingSession::reject()` 或 `TonicNoiseSession::send()` 返回加密错误。
+各阶段对象的 `send_rejection()` 或 `TonicNoiseSession::send()` 返回加密错误。
 
 ## CDN 与反向代理
 

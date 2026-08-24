@@ -7,7 +7,7 @@ use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::ProcessTaskConfig;
 use smalux_protocol::agent::v1::{
     CollectionMode, ProcessDetails, ProcessEntry, ProcessRanking, ProcessSelection,
-    ProcessSnapshot, ProcessState, ProcessStateCount, SampleMetadata, TaskResult, task_result,
+    ProcessSnapshot, ProcessState, ProcessStateCount, TaskResult, task_result,
 };
 
 use crate::{
@@ -18,11 +18,11 @@ use crate::{
     },
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// 使用独立 sysinfo 状态采集进程数量和有限列表的调度任务。
 pub struct ProcessTask {
-    state: CollectState<ProcessCollector>,
+    state: BlockingCollectorState<ProcessCollector>,
     config: ProcessTaskConfig,
     mode: CollectionMode,
     selection: ProcessSelection,
@@ -64,7 +64,7 @@ impl ProcessTask {
             .transpose()?;
         ProcessCollector::validate(mode, &selection, ranking)?;
         Ok(Self {
-            state: CollectState::new(ProcessCollector::new()),
+            state: BlockingCollectorState::new(ProcessCollector::new()),
             config,
             mode,
             selection,
@@ -100,15 +100,9 @@ impl ReportingTask for ProcessTask {
                     .map_err(|error| anyhow!(error))
             })
             .await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Process(into_proto_snapshot(
-                output.snapshot,
-            ))),
-        })
+        Ok(output.into_task_result(|snapshot| {
+            task_result::Result::Process(into_proto_snapshot(snapshot))
+        }))
     }
 
     fn kind(&self) -> &'static str {

@@ -45,7 +45,7 @@ pub struct TaskContext {
 /// Task 主体错误。
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
-    /// 临时错误，可按 [`ExecutionRetryPolicy`](super::ExecutionRetryPolicy) 重试。
+    /// 临时错误，可按当前 Job 配置的执行重试策略重试。
     #[error("transient task error: {0:#}")]
     Transient(#[source] anyhow::Error),
     /// 永久错误，立即停用 Job，不执行重试。
@@ -102,7 +102,7 @@ pub trait ActionTask: Send + Sync + 'static {
     /// 返回用于快照和诊断的稳定 Task 类型名称。
     ///
     /// 默认使用完整 Rust 类型名；需要跨版本稳定名称时可自行覆盖。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         std::any::type_name::<Self>()
     }
 
@@ -125,7 +125,7 @@ pub(crate) trait ValueTask: Send + Sync + 'static {
     async fn run(&self, context: TaskContext) -> Result<Self::Output, TaskError>;
 
     /// 返回用于快照和诊断的稳定 Task 类型名称。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         std::any::type_name::<Self>()
     }
 
@@ -142,7 +142,7 @@ pub trait ReportingTask: Send + Sync + 'static {
     async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError>;
 
     /// 返回用于诊断和 TaskFactory 映射的稳定类型名称。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         std::any::type_name::<Self>()
     }
 
@@ -155,7 +155,7 @@ pub trait ReportingTask: Send + Sync + 'static {
 /// 把标准 Task 结果交给持久化、Channel 或连接层的异步出口。
 ///
 /// Sink 只负责交付已经完成的结果，不应重新执行原 Task。临时交付错误只影响本次报告，
-/// 永久交付错误则会由 Scheduler 按 [`TaskRunResult::CallbackPermanent`] 停用 Job。
+/// 永久交付错误则会由 Scheduler 归类为 Callback 永久失败并停用 Job。
 pub trait TaskReportSink: Send + Sync + 'static {
     /// 消费一次带 Job revision 和执行身份的完整报告。
     fn report(&self, report: TaskReport) -> CallbackFuture;
@@ -236,7 +236,7 @@ pub(crate) enum TaskRunResult {
 #[async_trait]
 pub(crate) trait ScheduledTask: Send + Sync + 'static {
     /// 返回类型擦除前的 Task 名称。
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> &str;
     /// 执行 Task 及其输出适配器，并返回统一内部结果。
     async fn execute(&self, context: TaskContext) -> TaskRunResult;
 }
@@ -251,6 +251,11 @@ pub(crate) struct TaskBinding {
 }
 
 impl TaskBinding {
+    /// 返回类型擦除前的稳定 Task 标识，供策略校验和诊断复用。
+    pub fn kind(&self) -> &str {
+        self.inner.kind()
+    }
+
     /// 把不产生业务值的 [`ActionTask`] 注册为统一 Task。
     #[allow(dead_code)]
     pub fn action<T>(task: Arc<T>) -> Self
@@ -371,7 +376,7 @@ where
     T: ReportingTask,
     S: TaskReportSink + ?Sized,
 {
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         self.task.kind()
     }
 
@@ -432,7 +437,7 @@ where
     T: ActionTask,
 {
     /// 转发 ActionTask 的诊断名称。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         self.task.kind()
     }
 
@@ -466,7 +471,7 @@ where
     T: ValueTask,
 {
     /// 转发 ValueTask 的诊断名称。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         self.task.kind()
     }
 
@@ -509,7 +514,7 @@ where
     C: AsyncCallback<T::Output>,
 {
     /// 转发 ValueTask 的诊断名称。
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         self.task.kind()
     }
 
@@ -540,7 +545,7 @@ where
 }
 
 /// 记录统一 Task 入口，避免每个采集器重复实现相同的生命周期日志。
-fn log_task_started(kind: &'static str, context: &TaskContext) {
+fn log_task_started(kind: &str, context: &TaskContext) {
     tracing::trace!(
         task_kind = kind,
         job_id = %context.job_id,
@@ -552,7 +557,7 @@ fn log_task_started(kind: &'static str, context: &TaskContext) {
 }
 
 /// 记录统一 Task 结果；业务输出本身不写入日志，只记录交付状态。
-fn log_task_finished(kind: &'static str, context: &TaskContext, outcome: &TaskRunResult) {
+fn log_task_finished(kind: &str, context: &TaskContext, outcome: &TaskRunResult) {
     match outcome {
         TaskRunResult::Completed | TaskRunResult::OutputDelivered => {
             tracing::trace!(

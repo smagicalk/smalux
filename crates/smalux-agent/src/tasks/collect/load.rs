@@ -1,18 +1,18 @@
 //! 系统平均负载周期采集任务。
 
 use async_trait::async_trait;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::load,
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// 采集平台平均负载的调度任务。
 pub struct LoadTask {
-    state: CollectState<()>,
+    state: BlockingCollectorState<()>,
 }
 
 impl LoadTask {
@@ -22,7 +22,7 @@ impl LoadTask {
     /// 创建无状态系统负载采集 Task。
     pub fn new() -> Self {
         Self {
-            state: CollectState::new(()),
+            state: BlockingCollectorState::new(()),
         }
     }
 }
@@ -37,13 +37,7 @@ impl Default for LoadTask {
 impl ReportingTask for LoadTask {
     async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let output = self.state.collect(context, |_| load::collect()).await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Load(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::Load))
     }
 
     fn kind(&self) -> &'static str {

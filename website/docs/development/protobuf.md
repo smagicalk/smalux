@@ -10,7 +10,10 @@ description: Proto 文件组织、代码生成和向后兼容规则。
 ```text
 proto/smalux/agent/v1/
 ├── transport.proto        # gRPC service 与外层 Frame
-├── messages.proto         # 安全业务 envelope、注册和控制消息
+├── diagnostic.proto       # Example 和链路诊断请求/响应
+├── key_rotation.proto     # 长期 Noise 静态身份轮换
+├── registration.proto     # XXpsk3 注册状态机
+├── session_control.proto  # 心跳和 Session 对称密钥 rekey
 ├── errors.proto           # 稳定错误枚举
 ├── job/
 │   ├── definition.proto

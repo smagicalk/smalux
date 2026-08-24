@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package smalux.plus.echo.v1;
+
+// Echo 的运行模式，仅用于演示枚举下拉参数。
+enum EchoMode {
+  ECHO_MODE_UNSPECIFIED = 0;
+  ECHO_MODE_NORMAL = 1;
+  ECHO_MODE_DIAGNOSTIC = 2;
+}
+
+// 一次 Echo Task 的参数。
+message EchoTaskConfig {
+  // 成功时原样返回的文本。
+  string message = 1;
+  // 返回结果前等待的毫秒数。
+  uint64 delay_millis = 2;
+  // 是否主动返回一个示例错误。
+  bool fail = 3;
+  // 固定枚举选项示例。
+  EchoMode mode = 4;
+  // 可选择预设值、也可手动填写的目标名称示例。
+  string target = 5;
+}
+
+// Echo Task 成功执行后的插件私有结果。
+message EchoTaskResult {
+  string message = 1;
+  uint64 completed_at_unix_millis = 2;
+  EchoMode mode = 3;
+  string target = 4;
+}

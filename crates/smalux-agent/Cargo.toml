@@ -54,6 +54,8 @@ uuid = { version = "1.23.4", features = ["v4", "serde"] }
 smalux-core = { path = "../smalux-core" }
 # Agent/Server 共用的 Job、Task 配置和强类型结果模型。
 smalux-protocol = { path = "../smalux-protocol" }
+# Plus Worker 的 Manifest 与 IPC 契约；Agent 不链接第三方插件业务代码。
+smalux-plus-core = { path = "../smalux-plus/smalux-plus-core" }
 # 读取和构造生成消息中的 Timestamp、Duration。
 prost-types = "0.14.4"
 # Tokio 原生异步 ICMPv4/ICMPv6，实现多节点 Ping 且支持 Linux 非特权 DGRAM socket。
@@ -65,6 +67,10 @@ prost = "0.14.4"
 tonic = { version = "0.14.6", features = ["transport", "tls-native-roots"] }
 # Tonic 0.14 的 Prost 消息 Codec。
 tonic-prost = "0.14.6"
+
+[target.'cfg(windows)'.dependencies]
+# 为本地管理命名管道设置当前所有者 ACL，避免 Windows 默认 Everyone 读取权限。
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 
 
 

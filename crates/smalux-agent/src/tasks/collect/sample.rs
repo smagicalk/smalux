@@ -1,6 +1,7 @@
 //! 采集任务统一输出模型。
 
 use serde::Serialize;
+use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 带实际采样时间与间隔的强类型采集结果。
@@ -22,6 +23,23 @@ impl<T> MetricSample<T> {
             snapshot,
         }
     }
+
+    /// 把强类型快照及其采样元数据统一封装成协议层 `TaskResult`。
+    ///
+    /// 调用方只需声明快照对应的 protobuf oneof 变体，避免每个 Task
+    /// 重复拷贝 `SampleMetadata` 字段。
+    pub(crate) fn into_task_result(
+        self,
+        into_result: impl FnOnce(T) -> task_result::Result,
+    ) -> TaskResult {
+        TaskResult {
+            sample: Some(SampleMetadata {
+                sampled_at_ms: self.sampled_at_ms,
+                sample_interval_ms: self.sample_interval_ms,
+            }),
+            result: Some(into_result(self.snapshot)),
+        }
+    }
 }
 
 pub(crate) fn unix_timestamp_ms() -> u64 {
@@ -39,6 +57,8 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use smalux_protocol::agent::v1::task_result;
+
     use super::MetricSample;
 
     #[test]
@@ -48,5 +68,16 @@ mod tests {
         assert_eq!(collected.sampled_at_ms, 123);
         assert_eq!(collected.sample_interval_ms, Some(50));
         assert_eq!(collected.snapshot, "cpu");
+    }
+
+    #[test]
+    fn metric_sample_builds_task_result_without_losing_metadata() {
+        let result = MetricSample::new(123, Some(50), Default::default())
+            .into_task_result(task_result::Result::Cpu);
+
+        let sample = result.sample.expect("sample metadata");
+        assert_eq!(sample.sampled_at_ms, 123);
+        assert_eq!(sample.sample_interval_ms, Some(50));
+        assert!(matches!(result.result, Some(task_result::Result::Cpu(_))));
     }
 }

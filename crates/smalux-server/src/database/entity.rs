@@ -7,5 +7,6 @@
 
 pub mod agent;
 pub mod agent_registration;
+pub mod plugin_schema;
 pub mod registration_token;
 pub mod server_keyring;

@@ -40,7 +40,7 @@ TaskReportSink
 Collector 不负责调度，也不决定结果发往哪里。Task 把配置和一次执行封装为稳定单元；Scheduler
 只管理执行时序；Sink 决定输出。这种拆分让同一个 Task 可以用于周期 Job、Cron Job、手动执行或测试。
 
-一次远程任务的职责分配是：Server 负责生成配置与版本，Protocol 负责可靠传递，JobController 负责
+一次远程任务的职责分配是：Server 负责生成配置与版本，Protocol 负责可靠传递，RemoteJobController 负责
 校验和安装，Scheduler 负责运行，Task 负责产生结果，Sink/连接层负责上报。每层只确认自己已经完成的
 动作；例如 gRPC 发送成功不等于 Server 已持久化 TaskReport。
 
@@ -72,7 +72,7 @@ Protocol crate 不管理 Token 数据库、Agent 授权表、TLS 证书、HTTP R
 Smalux 当前适合继续开发和验证以下场景：
 
 - 主机 CPU、内存、磁盘、网络、进程和 Socket 观测；
-- ICMP、TCP Connect 和 HTTP 多节点探测；
+- ICMP、TCP Connect、UDP Request 和 HTTP 多节点探测；
 - Server 下发固定类型 Job，Agent 持续执行；
 - TLS/h2c 外层加 Noise 内层加密；
 - Axum REST、WebSocket 和 gRPC 共用端口的集成验证。
@@ -88,34 +88,38 @@ Smalux 当前适合继续开发和验证以下场景：
 Server 进程启动
   |
   +--> bootstrap::run_server
-  |      +--> ServerDatabase::connect
-  |      |      +--> DatabaseConfig::validate / resolve_connection_url
-  |      |      +--> SeaORM connect
-  |      |      +--> Migrator::up
-  |      +--> AppState::build
-  |      |      +--> ServerKeyRingManager::load_or_create
-  |      |      +--> start_sync_task_with_shutdown
-  |      |      +--> AgentRegistrar::start_cleanup_task
-  |      +--> route::build_app_router
-  |             +--> controller::frontend::get_route
-  |             +--> controller::agent::get_route
-  |                    +--> AgentServer::new
-  |                    +--> AgentTransportServer<AgentServer>
-  |                    +--> Routes::into_axum_router
-  +--> axum::serve
+  |      +--> build_runtime
+  |      |      +--> ServerDatabase::connect
+  |      |      |      +--> DatabaseConfig::validate / resolve_connection_url
+  |      |      |      +--> SeaORM connect
+  |      |      |      +--> Migrator::up
+  |      |      +--> AppState::build
+  |      |      |      +--> ServerKeyRingManager::load_or_create
+  |      |      |      +--> start_sync_task_with_shutdown
+  |      |      |      +--> AgentRegistry::start_cleanup_task
+  |      |      +--> route::build_app_router
+  |      |             +--> controller::frontend::router
+  |      |             +--> controller::agent::router
+  |      |                    +--> AgentTransportService::new
+  |      |                    +--> AgentTransportServer<AgentTransportService>
+  |      |                    +--> Routes::into_axum_router
+  |      +--> TcpListener::bind
+  |      +--> serve_runtime
+  |             +--> axum::serve
+  |             +--> Ctrl+C / graceful shutdown
 
 Agent gRPC OpenSession
   |
-  +--> AgentServer::open_session
+  +--> AgentTransportService::open_session
          +--> try_acquire_session
          +--> ServerSessionAcceptor::accept_incoming_with_psk_resolver
          |      +--> XXpsk3 / IK Noise handshake
-         |      +--> AgentRegistrar::resolve_registration_psk (XXpsk3)
+         |      +--> AgentRegistry::resolve_registration_psk (XXpsk3)
          |      +--> IncomingSession::Registration / Authentication
-         +--> AgentServer::handle_established_session
+         +--> AgentTransportService::run_session_worker
                 +--> registration prepare/commit, or Agent authorization
                 +--> TonicNoiseSession::receive
-                +--> MessagesRequest echo / future Job dispatch
+                +--> DiagnosticRequest echo
 ```
 
 ### 模块、接口和实现
@@ -125,19 +129,19 @@ Agent gRPC OpenSession
 | `bootstrap` | 只在数据库、状态和路由都成功后监听端口 | `smalux-server/src/bootstrap.rs` | 不处理业务消息 |
 | `AppState` | 持有进程级共享状态和取消令牌 | `smalux-server/src/state.rs` | 不解析 Proto |
 | Agent Controller | 把 Agent 状态装配成 Axum Router | `controller/agent.rs` | 不实现注册策略 |
-| Tonic Adapter | 接收 `OpenSession`、限流、启动 worker | `service/agent/server_service.rs` | 不直接操作注册表规则 |
-| Session Policy | 处理握手完成后的注册、授权和业务循环 | `server_service/session.rs` | 不建立 Axum 路由 |
-| `AgentRegistrar` | Token、注册事务、Agent 授权和吊销 | `service/agent/agent_registrar.rs` | 不发送 gRPC 帧 |
+| Tonic Adapter | 接收 `OpenSession`、限流、启动 worker | `service/agent/transport.rs` | 不直接操作注册表规则 |
+| Session Policy | 处理握手完成后的注册、授权和业务循环 | `transport/session.rs` | 不建立 Axum 路由 |
+| `AgentRegistry` | Token、注册事务、Agent 授权和吊销 | `service/agent/agent_registry.rs` | 不发送 gRPC 帧 |
 | Database Adapter | 事务、CAS、状态持久化和迁移 | `database/` | 不决定协议错误文本 |
-| `JobController` | 命令幂等、目录 revision 和远程所有权 | `smalux-agent/src/job_control.rs` | 不直接发送网络消息 |
-| `compiler` | Proto 校验、Task 工厂和强类型转换 | `job_control/compiler.rs` | 不修改 Scheduler |
+| `RemoteJobController` | 命令幂等、目录 revision 和远程所有权 | `smalux-agent/src/remote_jobs.rs` | 不直接发送网络消息 |
+| `compiler` | Proto 校验、Task 工厂和强类型转换 | `remote_jobs/compiler.rs` | 不修改 Scheduler |
 | Scheduler | 时间、并发、队列、重试和 generation | `smalux-agent/src/scheduler/` | 不理解 CPU 或 gRPC |
 | Task/Collector | 一次采集和结果构造 | `smalux-agent/src/tasks/collect/` | 不决定长期调度或输出位置 |
 | Protocol Session | Noise 帧、心跳、rekey 和事件分类 | `smalux-protocol/src/tonic_transport/` | 不保存 Token 数据库 |
 
 这里的模块是带接口的实现单元；接口不只有函数签名，还包括顺序、错误、持久化和取消规则。
-例如 `AgentRegistrar::authorize_agent` 返回的“已吊销”和“未知身份”都不会让会话进入业务流，
-而 `JobController::apply` 必须在结果缓存和远程目录更新后才向调用方返回。
+例如 `AgentRegistry::authorize_agent` 返回的“已吊销”和“未知身份”都不会让会话进入业务流，
+而 `RemoteJobController::apply_command` 必须在结果缓存和远程目录更新后才向调用方返回。
 
 ### 为什么这些模块是深模块
 
@@ -146,7 +150,7 @@ Agent gRPC OpenSession
 1. 删除这个模块后，复杂度是消失，还是会分散到所有调用方？
 2. 调用方需要理解多少实现细节，才能安全调用它？
 
-`JobController`、`ServerSessionAcceptor` 和 `ServerDatabase` 都隐藏了较多实现细节，调用方只需要
+`RemoteJobController`、`ServerSessionAcceptor` 和 `ServerDatabase` 都隐藏了较多实现细节，调用方只需要
 掌握较小的接口，因此具有较高 leverage。`controller/agent.rs` 过去只是转发函数，删除测试显示它
 不会承载独立规则，所以现在直接负责 Router 装配。相反，Protocol 的 `TonicNoiseSession` 虽然文件较大，
 但 `send`、`receive`、心跳和 rekey 共享 nonce 状态，继续拆分会破坏 locality，因此只把无状态的策略和
@@ -162,14 +166,17 @@ run() -> config::ServerConfig::from_env()
       -> bootstrap::run_server(config)
 
 // bootstrap::run_server
-ServerDatabase::connect(config.database)
+build_runtime(config)
+    -> ServerDatabase::connect(config.database)
     -> DatabaseConfig::validate()
     -> Database::connect()
     -> ServerDatabase::migrate()
     -> AppState::build(runtime_config, database)
     -> route::build_app_router(app_state)
-    -> tokio::net::TcpListener::bind()
+TcpListener::bind()
+serve_runtime(runtime, listener)
     -> axum::serve(listener, router)
+    -> Ctrl+C / graceful shutdown
 ```
 
 `AppState::build` 还会启动两个可取消后台任务：Server Noise 密钥环的跨实例同步，以及 Agent
@@ -177,7 +184,7 @@ ServerDatabase::connect(config.database)
 不会因为普通 `AppState` clone 提前停止。
 
 路由装配时，Agent 路由会先调用 `ServerKeyRingManager::active_key_count` 做启动检查，再构造
-`AgentServer` 和 `AgentTransportServer`。因此“Router 构造成功”表示当前至少有一个可用 Server
+`AgentTransportService` 和 `AgentTransportServer`。因此“Router 构造成功”表示当前至少有一个可用 Server
 Noise 身份；数据库、密钥环或迁移失败时不会启动半可用监听器。
 
 ## 一次业务请求的完整路径
@@ -186,11 +193,11 @@ Noise 身份；数据库、密钥环或迁移失败时不会启动半可用监�
 AgentProtocolClient::connect / register_agent
   -> AgentTransportRpcClient::open_session
   -> ProtocolFrame(NoiseHandshake)
-  -> AgentServer::open_session
+  -> AgentTransportService::open_session
   -> ServerSessionAcceptor
   -> TonicNoiseSession
   -> SessionDriver 或手动 receive_event
-  -> JobController::apply / TaskReportSink
+  -> RemoteJobController::apply_command / TaskReportSink
   -> SecureMessage(ciphertext)
   -> ProtocolFrame
   -> Server Session Policy

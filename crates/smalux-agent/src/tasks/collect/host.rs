@@ -1,18 +1,18 @@
 //! 主机身份周期采集任务。
 
 use async_trait::async_trait;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::host,
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// 采集变化频率较低的主机身份信息。
 pub struct HostTask {
-    state: CollectState<()>,
+    state: BlockingCollectorState<()>,
 }
 
 impl HostTask {
@@ -22,7 +22,7 @@ impl HostTask {
     /// 创建无状态主机信息采集 Task。
     pub fn new() -> Self {
         Self {
-            state: CollectState::new(()),
+            state: BlockingCollectorState::new(()),
         }
     }
 }
@@ -37,13 +37,7 @@ impl Default for HostTask {
 impl ReportingTask for HostTask {
     async fn run(&self, context: TaskContext) -> Result<TaskResult, TaskError> {
         let output = self.state.collect(context, |_| host::collect()).await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Host(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::Host))
     }
 
     fn kind(&self) -> &'static str {

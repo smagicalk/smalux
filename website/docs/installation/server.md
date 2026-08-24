@@ -21,6 +21,42 @@ description: 当前 Server 骨架、数据库依赖和部署前必须补齐的�
 cargo build -p smalux-server --release
 ```
 
+## 下载 Release 产物
+
+Release workflow 只允许手动触发，并创建 Draft Release。Agent 与 Server 使用相同版本号，
+但每个程序分别归档。触发时输入的 Tag 必须带 `v` 前缀，并与 Agent、Server 两个
+`Cargo.toml` 的版本完全一致：
+
+```text
+Cargo version: 0.1.0
+Release tag:   v0.1.0
+```
+
+Server 产物命名为：
+
+```text
+smalux-server-v0.1.0-x86_64-pc-windows-msvc.zip
+smalux-server-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+smalux-server-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+smalux-server-v0.1.0-x86_64-apple-darwin.tar.gz
+smalux-server-v0.1.0-aarch64-apple-darwin.tar.gz
+```
+
+GNU Linux 产物用于 Ubuntu、Debian、Rocky Linux 等 glibc 系统；musl 产物用于 Alpine Linux。
+macOS 产物分别用于 Intel 和 Apple Silicon。每个归档包含 Server 可执行文件、本 crate 的
+README 和仓库 LICENSE。工作流还会用 Alpine 容器对 musl Agent/Server 执行 `--version` 启动
+冒烟检查。
+
+下载后先校验所有归档：
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Windows PowerShell 可使用 `Get-FileHash -Algorithm SHA256 <file>` 对照 `SHA256SUMS`。
+当前 Release 不包含代码签名、systemd/Windows Service 文件或自动升级器；Draft Release 必须
+人工检查后再公开，生产环境仍需自行配置服务管理、数据库备份和升级回滚。
+
 Server manifest 已准备 SQLite、PostgreSQL 和 MySQL 的 SeaORM 驱动，并保留 `frontend-embed` feature：
 
 ```powershell

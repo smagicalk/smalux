@@ -70,7 +70,7 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
 当前实现中，Agent 的底层系统采集器位于 `tasks/collect/collectors/`，固定采集任务位于
 `tasks/collect/`，触发、队列、并发、重试和生命周期位于 `scheduler/`。所有采集任务都
 实现 `ReportingTask`，直接返回 Proto `TaskResult`；`TaskReportSink` 决定结果写入本地、
-Channel 或连接层。`job_control` 负责把 `JobDefinition` 校验并装配为调度任务，同时处理
+Channel 或连接层。`remote_jobs` 负责把 `JobDefinition` 校验并装配为调度任务，同时处理
 `JobCommand` 的幂等、catalog revision 和远程 Job 所有权。原有 JSON Job 解析层已经移除。
 
 ---

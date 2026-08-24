@@ -25,6 +25,63 @@ cargo rustdoc -p smalux-protocol --lib -- -D warnings
 cargo build -p smalux-server --release
 ```
 
+## Agent 运行
+
+```powershell
+cargo run -p smalux-agent -- run `
+  --server-endpoint http://127.0.0.1:12345 `
+  --token <TOKEN> `
+  --offline-job-timeout 30m
+```
+
+`--offline-job-timeout` 对应 `SMALUX_OFFLINE_JOB_TIMEOUT`，默认 `30m`。短暂断线期间远程 Job
+继续执行；持续断线到期后 Agent 清空远程 Job，重连时由 Server 重新下发权威目录。
+
+## Server 运行与管理
+
+无子命令和显式 `run` 都会启动 Server：
+
+```powershell
+cargo run -p smalux-server
+cargo run -p smalux-server -- run --listen-address 127.0.0.1 --listen-port 12345
+```
+
+配置按 `CLI > 环境变量 > 默认值` 解析。数据库密码只接受
+`SMALUX_DATABASE_PASSWORD` 或 `--database-password-file`，不提供会泄露到进程列表的
+明文密码参数。
+
+除 `run` 和 `config check` 外，管理命令都通过本地 IPC 访问正在运行的 Server。Windows
+默认使用 `\\.\pipe\smalux-server`，Unix 默认使用
+`<data_dir>/server/control.sock`；可用全局 `--control-endpoint` 覆盖。
+
+```powershell
+# 校验配置、查看状态
+cargo run -p smalux-server -- config check --database-url sqlite::memory:
+cargo run -p smalux-server -- status --output json
+cargo run -p smalux-server -- config show
+
+# Token 默认 30m；支持 30m、24h、7d 或显式 --no-expiry
+cargo run -p smalux-server -- registration-token create --agent-name node-a --expires-in 24h
+cargo run -p smalux-server -- registration-token create --credential-file token.txt
+cargo run -p smalux-server -- registration-token list --status active
+cargo run -p smalux-server -- registration-token revoke <TOKEN_ID> --yes
+
+# Agent 身份和当前 Session
+cargo run -p smalux-server -- agent list --online
+cargo run -p smalux-server -- agent rename <AGENT_ID> --name edge-node
+cargo run -p smalux-server -- agent revoke <AGENT_ID> --yes
+cargo run -p smalux-server -- session list --state authenticated
+cargo run -p smalux-server -- session disconnect <SESSION_ID> --yes
+
+# 密钥环只读诊断和优雅关闭
+cargo run -p smalux-server -- keyring status
+cargo run -p smalux-server -- shutdown --yes
+```
+
+Token 完整凭据只在创建时返回一次；`list/show` 不返回 PSK。指定 `--credential-file` 后凭据
+只写入新文件，不再打印。吊销 Agent 会立即断开其当前 Session，而单独断开 Session 不会
+吊销 Agent。危险操作在非交互环境必须提供 `--yes`。
+
 ## Protocol Example
 
 Server：
@@ -32,7 +89,7 @@ Server：
 ```powershell
 cargo run -p smalux-protocol --example noise_shared_port_server
 # 在 Server 控制台输入：
-# server> token generate
+# server> token generate [display-name]
 ```
 
 Client：
@@ -94,6 +151,6 @@ git diff --check
 git diff --stat
 ```
 
-正式 `smalux-agent` 当前入口尚未装配运行循环，正式 `smalux-server` 当前固定监听
-`127.0.0.1:8080` 且 Router 为空。验证完整 Protocol 流程应运行上面的两个独立 Example，不能把正式
-二进制启动成功理解为 Agent/Server 业务已经接通。
+正式 `smalux-agent` 已装配 Client、Scheduler、动态 Job 策略和本地 IPC；正式 `smalux-server` 已装配
+Axum、gRPC/Noise、注册中心和策略协商循环。Example 仍适合独立学习协议，但默认 Server Job Provider
+不返回目录，监控结果也尚未持久化，不能把二进制连接成功理解为完整监控闭环。

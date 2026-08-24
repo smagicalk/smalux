@@ -1,25 +1,28 @@
-//! 多节点 ICMP Echo、TCP Connect 与 HTTP 调度任务。
+//! 多节点 ICMP Echo、TCP Connect、UDP Request 与 HTTP 调度任务。
 
 mod http;
 mod icmp_echo;
 mod model;
 mod tcp_connect;
+mod udp_request;
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 pub use smalux_protocol::agent::v1::ProbeTaskConfig;
 use smalux_protocol::agent::v1::{
-    ProbeAttemptSnapshot, ProbeNodeSnapshot, ProbeProtocol, ProbeSnapshot, SampleMetadata,
-    TaskResult, task_result,
+    ProbeAttemptSnapshot, ProbeNodeSnapshot, ProbeProtocol, ProbeSnapshot, TaskResult, task_result,
 };
 use tokio::sync::Mutex;
 
 use crate::scheduler::{ReportingTask, TaskContext, TaskError};
 
-use super::sample::{duration_ms, unix_timestamp_ms};
+use super::sample::{MetricSample, duration_ms, unix_timestamp_ms};
 use http::HttpClients;
 use icmp_echo::IcmpClients;
 
@@ -32,10 +35,51 @@ use model::{
     ProbeTaskConfig as CompiledProbeTaskConfig, compile_config,
 };
 
+/// 一个 Probe Task 跨多轮执行复用的网络资源。
+///
+/// ICMP socket 在 Task 构造时创建；HTTP Client 延迟到首次 HTTP 探测时创建，并在
+/// 后续执行中继续复用连接池、DNS 解析器和 TLS 配置。未配置对应协议时不会分配资源。
+struct ProbeRuntime {
+    icmp_clients: Option<Arc<IcmpClients>>,
+    http_clients: Option<OnceLock<Result<Arc<HttpClients>, String>>>,
+}
+
+impl ProbeRuntime {
+    fn new(config: &CompiledProbeTaskConfig) -> Self {
+        let uses_icmp = config
+            .nodes
+            .iter()
+            .any(|node| matches!(node.target, ProbeTarget::IcmpEcho));
+        let uses_http = config
+            .nodes
+            .iter()
+            .any(|node| matches!(node.target, ProbeTarget::Http { .. }));
+        Self {
+            icmp_clients: uses_icmp.then(|| Arc::new(IcmpClients::new())),
+            http_clients: uses_http.then(OnceLock::new),
+        }
+    }
+
+    fn http_clients(&self) -> Result<Option<Arc<HttpClients>>, String> {
+        let Some(clients) = &self.http_clients else {
+            return Ok(None);
+        };
+        clients
+            .get_or_init(|| {
+                HttpClients::new()
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map(Some)
+    }
+}
+
 /// 并发执行多个网络节点探测的调度任务。
 pub struct ProbeTask {
     config: ProbeTaskConfig,
     compiled: CompiledProbeTaskConfig,
+    runtime: ProbeRuntime,
     last_sampled_at: Mutex<Option<Instant>>,
 }
 
@@ -46,9 +90,11 @@ impl ProbeTask {
     /// 校验配置并创建 Probe Task。
     pub fn try_with_config(config: ProbeTaskConfig) -> Result<Self, ProbeConfigError> {
         let compiled = compile_config(&config)?;
+        let runtime = ProbeRuntime::new(&compiled);
         Ok(Self {
             config,
             compiled,
+            runtime,
             last_sampled_at: Mutex::new(None),
         })
     }
@@ -86,29 +132,16 @@ impl ReportingTask for ProbeTask {
                     .map(|previous| duration_ms(sampled_at.duration_since(previous)))
             }
         };
-        let icmp_clients = self
-            .compiled
-            .nodes
-            .iter()
-            .any(|node| matches!(node.target, ProbeTarget::IcmpEcho))
-            .then(|| Arc::new(IcmpClients::new()));
-        let http_clients = self
-            .compiled
-            .nodes
-            .iter()
-            .any(|node| matches!(node.target, ProbeTarget::Http { .. }))
-            .then(HttpClients::new)
-            .transpose()
-            .map_err(|error| {
-                tracing::warn!(
-                    job_id = %context.job_id,
-                    run_id = %context.run_id,
-                    error = %error,
-                    "network probe HTTP client initialization failed"
-                );
-                TaskError::Permanent(anyhow!("failed to build HTTP probe client: {error}"))
-            })?
-            .map(Arc::new);
+        let icmp_clients = self.runtime.icmp_clients.clone();
+        let http_clients = self.runtime.http_clients().map_err(|error| {
+            tracing::warn!(
+                job_id = %context.job_id,
+                run_id = %context.run_id,
+                error = %error,
+                "network probe HTTP client initialization failed"
+            );
+            TaskError::Permanent(anyhow!("failed to build HTTP probe client: {error}"))
+        })?;
         let identifier_seed =
             u16::from_le_bytes([context.run_id.as_bytes()[0], context.run_id.as_bytes()[1]]);
         let work = stream::iter(self.compiled.nodes.iter().cloned().enumerate().map(
@@ -129,6 +162,9 @@ impl ReportingTask for ProbeTask {
                         }
                         ProbeTarget::TcpConnect { .. } => {
                             tcp_connect::probe(node, cancellation).await
+                        }
+                        ProbeTarget::UdpRequest { .. } => {
+                            udp_request::probe(node, cancellation).await
                         }
                         ProbeTarget::Http { .. } => {
                             http::probe(
@@ -207,13 +243,11 @@ impl ReportingTask for ProbeTask {
             healthy_nodes = snapshot.healthy_nodes,
             "network probe task completed"
         );
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms,
-                sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Probe(into_proto_snapshot(snapshot))),
-        })
+        Ok(
+            MetricSample::new(sampled_at_ms, sample_interval_ms, snapshot).into_task_result(
+                |snapshot| task_result::Result::Probe(into_proto_snapshot(snapshot)),
+            ),
+        )
     }
 
     fn kind(&self) -> &'static str {
@@ -236,6 +270,7 @@ fn into_proto_node(node: CollectedNode) -> ProbeNodeSnapshot {
         protocol: match node.protocol {
             CollectedProtocol::IcmpEcho => ProbeProtocol::IcmpEcho as i32,
             CollectedProtocol::TcpConnect => ProbeProtocol::TcpConnect as i32,
+            CollectedProtocol::UdpRequest => ProbeProtocol::UdpRequest as i32,
             CollectedProtocol::Http => ProbeProtocol::Http as i32,
         },
         port: node.port.map(u32::from),
@@ -265,9 +300,11 @@ fn into_proto_attempt(attempt: CollectedAttempt) -> ProbeAttemptSnapshot {
 impl ProbeTask {
     fn from_compiled_for_test(compiled: CompiledProbeTaskConfig) -> Result<Self, ProbeConfigError> {
         compiled.validate()?;
+        let runtime = ProbeRuntime::new(&compiled);
         Ok(Self {
             config: ProbeTaskConfig::default(),
             compiled,
+            runtime,
             last_sampled_at: Mutex::new(None),
         })
     }
@@ -282,7 +319,7 @@ mod tests {
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, UdpSocket},
         task::JoinHandle,
     };
 
@@ -356,6 +393,45 @@ mod tests {
             timeout: Duration::from_secs(1),
             interval: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn task_reports_udp_request_response_snapshot() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request = [0_u8; 64];
+            let (received, peer) = socket.recv_from(&mut request).await.unwrap();
+            assert_eq!(&request[..received], b"health");
+            socket.send_to(b"ok", peer).await.unwrap();
+        });
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
+            concurrency: NonZeroUsize::new(1).unwrap(),
+            nodes: vec![ProbeNodeConfig {
+                name: "udp".to_owned(),
+                host: address.ip().to_string(),
+                target: ProbeTarget::UdpRequest {
+                    port: NonZeroU16::new(address.port()).unwrap(),
+                    request_payload: b"health".to_vec(),
+                    expected_response_prefix: Some(b"ok".to_vec()),
+                },
+                attempts: NonZeroU16::new(1).unwrap(),
+                timeout: Duration::from_secs(1),
+                interval: Duration::ZERO,
+            }],
+        })
+        .unwrap();
+
+        let output = task.run(context()).await.unwrap();
+
+        let Some(task_result::Result::Probe(snapshot)) = output.result else {
+            panic!("probe task must return TaskResult.probe");
+        };
+        assert_eq!(snapshot.healthy_nodes, 1);
+        assert_eq!(snapshot.nodes[0].protocol, ProbeProtocol::UdpRequest as i32);
+        assert_eq!(snapshot.nodes[0].port, Some(u32::from(address.port())));
+        assert_eq!(snapshot.nodes[0].succeeded, 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -460,5 +536,23 @@ mod tests {
         let error = task.run(context).await.unwrap_err();
 
         assert!(matches!(error, TaskError::Transient(_)));
+    }
+
+    #[test]
+    fn task_reuses_initialized_http_clients() {
+        let task = ProbeTask::from_compiled_for_test(model::ProbeTaskConfig {
+            concurrency: NonZeroUsize::new(1).unwrap(),
+            nodes: vec![http_node(
+                "http",
+                reqwest::Url::parse("http://127.0.0.1/health").unwrap(),
+            )],
+        })
+        .unwrap();
+
+        let first = task.runtime.http_clients().unwrap().unwrap();
+        let second = task.runtime.http_clients().unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(task.runtime.icmp_clients.is_none());
     }
 }

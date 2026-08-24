@@ -56,8 +56,8 @@ impl ServerDatabase {
 
         let current = restore_required_identity(
             "current",
-            model.current_private_key,
-            model.current_public_key,
+            &model.current_private_key,
+            &model.current_public_key,
         )?;
         let next =
             restore_optional_identity("next", model.next_private_key, model.next_public_key)?;
@@ -102,9 +102,9 @@ impl ServerDatabase {
     ) -> Result<ServerKeyRingRecord, DatabaseError> {
         ServerKeyRing::from_snapshot(snapshot.clone())?;
         let now = unix_timestamp_micros()?;
-        let (next_private_key, next_public_key) = export_optional_identity(&snapshot.next);
+        let (next_private_key, next_public_key) = export_optional_identity(snapshot.next.as_ref());
         let (previous_private_key, previous_public_key) =
-            export_optional_identity(&snapshot.previous);
+            export_optional_identity(snapshot.previous.as_ref());
 
         let insert = server_keyring::Entity::insert(server_keyring::ActiveModel {
             keyring_id: sea_orm::ActiveValue::Set(SERVER_KEYRING_SINGLETON_ID.to_owned()),
@@ -160,9 +160,9 @@ impl ServerDatabase {
             .checked_add(1)
             .ok_or(DatabaseError::ServerKeyringRevisionOverflow)?;
         let now = unix_timestamp_micros()?;
-        let (next_private_key, next_public_key) = export_optional_identity(&snapshot.next);
+        let (next_private_key, next_public_key) = export_optional_identity(snapshot.next.as_ref());
         let (previous_private_key, previous_public_key) =
-            export_optional_identity(&snapshot.previous);
+            export_optional_identity(snapshot.previous.as_ref());
         let rotation_id = snapshot.rotation_id.map(|value| value.as_bytes().to_vec());
 
         let update = server_keyring::Entity::update_many()
@@ -218,10 +218,10 @@ impl ServerDatabase {
 /// 恢复必须存在的身份；current 缺少任一部分都视为数据库损坏。
 fn restore_required_identity(
     name: &str,
-    private_key: Vec<u8>,
-    public_key: Vec<u8>,
+    private_key: &[u8],
+    public_key: &[u8],
 ) -> Result<NoiseIdentity, DatabaseError> {
-    NoiseIdentity::from_parts(&private_key, &public_key).map_err(|error| {
+    NoiseIdentity::from_parts(private_key, public_key).map_err(|error| {
         DatabaseError::InvalidServerKeyring(format!("{name} identity is invalid: {error}"))
     })
 }
@@ -251,17 +251,14 @@ fn restore_optional_identity(
 
 /// 将一个可选身份拆成数据库的两个可空二进制字段。
 fn export_optional_identity(
-    identity: &Option<NoiseIdentity>,
+    identity: Option<&NoiseIdentity>,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    identity
-        .as_ref()
-        .map(|identity| {
-            (
-                Some(identity.export_private_key().as_bytes().to_vec()),
-                Some(identity.public_key().as_bytes().to_vec()),
-            )
-        })
-        .unwrap_or((None, None))
+    identity.map_or((None, None), |identity| {
+        (
+            Some(identity.export_private_key().as_bytes().to_vec()),
+            Some(identity.public_key().as_bytes().to_vec()),
+        )
+    })
 }
 
 /// 统一生成数据库记录时间，避免不同数据库使用不同的默认时间函数。

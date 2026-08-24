@@ -21,7 +21,7 @@ pub use driver::{
 };
 pub use server::{
     IncomingSession, ServerAuthentication, ServerPendingSession, ServerRegistration,
-    ServerSessionAcceptor, validate_registration_token_id,
+    ServerSessionAcceptor,
 };
 pub use session::{
     HeartbeatPolicy, HeartbeatSample, HeartbeatStats, MaintenanceResult, MaintenanceStatus,
@@ -37,6 +37,95 @@ use crate::noise::NoiseError;
 ///
 /// 该上限只约束日志表示，不改变协议字段或业务存储格式。
 const MAX_EXTERNAL_LOG_LABEL_BYTES: usize = 128;
+
+/// 注册 Token ID 在握手外层允许的最大字节数。
+const MAX_REGISTRATION_TOKEN_ID_BYTES: usize = 128;
+
+/// 标准注册 PSK 的固定字节数。
+const REGISTRATION_PSK_BYTES: usize = 32;
+
+/// Server 为 Agent 指定的展示名称最大字节数。
+const MAX_AGENT_DISPLAY_NAME_BYTES: usize = 64;
+
+/// 校验握手首帧中用于选择 PSK 的公开 Token ID。
+///
+/// 该字段虽然不是秘密，但在 Noise 建立前完全来自网络，必须在进入异步 resolver
+/// 和数据库查询前限制长度与字符集。实际签发器使用 32 位十六进制 ID；协议层保留
+/// 128 字节上限，兼容未来使用 UUID 或带版本前缀的 ID。
+pub fn validate_registration_token_id(token_id: &str) -> Result<(), TransportError> {
+    if token_id.is_empty()
+        || token_id.len() > MAX_REGISTRATION_TOKEN_ID_BYTES
+        || !token_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        tracing::warn!(
+            token_id_len = token_id.len(),
+            "rejected invalid registration Token ID"
+        );
+        return Err(TransportError::Protocol(
+            "registration Token ID is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 解析标准 `token_id.64位十六进制PSK` 注册凭据。
+///
+/// 返回值只包含公开 Token ID 和解码后的固定长度 PSK；错误文本不会回显原始凭据，
+/// 因而 Agent 配置层与 Server 注册层可以共享同一条 wire invariant，而不会复制安全逻辑。
+pub fn parse_registration_credential(
+    credential: &str,
+) -> Result<(&str, [u8; REGISTRATION_PSK_BYTES]), TransportError> {
+    let (token_id, encoded_psk) = credential.split_once('.').ok_or_else(|| {
+        TransportError::Protocol("registration token must use the token_id.psk format".to_owned())
+    })?;
+    validate_registration_token_id(token_id)?;
+    if encoded_psk.len() != REGISTRATION_PSK_BYTES * 2 {
+        return Err(TransportError::Protocol(
+            "registration PSK must contain 64 hexadecimal characters".to_owned(),
+        ));
+    }
+
+    let mut psk = [0_u8; REGISTRATION_PSK_BYTES];
+    for (index, pair) in encoded_psk.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or_else(invalid_registration_psk)?;
+        let low = hex_nibble(pair[1]).ok_or_else(invalid_registration_psk)?;
+        psk[index] = (high << 4) | low;
+    }
+    Ok((token_id, psk))
+}
+
+/// 校验 Server 签发注册 Token 时绑定的 Agent 展示名称。
+///
+/// 展示名称不是身份键，也不由 Agent 上报；Server 可在签发 Token 时提供该值。
+/// 名称会进入日志、标签和管理界面，因此仍在公共协议库中集中约束格式。
+pub fn validate_agent_display_name(display_name: &str) -> Result<(), TransportError> {
+    if display_name.is_empty()
+        || display_name.len() > MAX_AGENT_DISPLAY_NAME_BYTES
+        || !display_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(TransportError::Protocol(
+            "Agent display name must be 1-64 ASCII letters, digits, '-', '_' or '.'".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn invalid_registration_psk() -> TransportError {
+    TransportError::Protocol("registration PSK contains a non-hexadecimal character".to_owned())
+}
 
 /// 返回适合写入日志的注册 Token ID。
 ///
@@ -174,7 +263,10 @@ impl From<http::uri::InvalidUri> for TransportError {
 
 #[cfg(test)]
 mod tests {
-    use super::registration_token_id_log_label;
+    use super::{
+        parse_registration_credential, registration_token_id_log_label,
+        validate_agent_display_name, validate_registration_token_id,
+    };
 
     #[test]
     fn registration_token_log_label_preserves_short_safe_ids() {
@@ -195,5 +287,46 @@ mod tests {
             registration_token_id_log_label(&"a".repeat(129)),
             "<invalid-token-id:129-bytes>"
         );
+    }
+
+    #[test]
+    fn registration_credential_parser_returns_public_id_and_exact_psk() {
+        let credential = format!("agent-token.{}", "aB".repeat(32));
+
+        let (token_id, psk) = parse_registration_credential(&credential).unwrap();
+
+        assert_eq!(token_id, "agent-token");
+        assert_eq!(psk, [0xab; 32]);
+    }
+
+    #[test]
+    fn registration_credential_parser_rejects_invalid_shapes_without_echoing_secrets() {
+        for credential in [
+            "missing-separator",
+            "agent.00",
+            "agent.not-hex",
+            "bad id.00",
+        ] {
+            let error = parse_registration_credential(credential).unwrap_err();
+            assert!(!error.to_string().contains(credential));
+        }
+    }
+
+    #[test]
+    fn registration_token_id_validation_rejects_untrusted_values() {
+        assert!(validate_registration_token_id("0123456789abcdef").is_ok());
+        assert!(validate_registration_token_id("token-id.v1").is_ok());
+        assert!(validate_registration_token_id("").is_err());
+        assert!(validate_registration_token_id(&"a".repeat(129)).is_err());
+        assert!(validate_registration_token_id("token id").is_err());
+        assert!(validate_registration_token_id("token\n-id").is_err());
+    }
+
+    #[test]
+    fn agent_display_name_validation_matches_the_server_contract() {
+        assert!(validate_agent_display_name("agent-1.test").is_ok());
+        for value in ["", "has space", "中文", &"a".repeat(65)] {
+            assert!(validate_agent_display_name(value).is_err());
+        }
     }
 }

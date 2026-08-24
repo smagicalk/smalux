@@ -5,8 +5,9 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::agent::v1::{
-    JobCommand, JobCommandResult, KeyRotationMessage, Messages, RegistrationMessage, SecureMessage,
-    TaskReport, secure_message,
+    AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, DiagnosticMessage, JobCommand,
+    JobCommandResult, KeyRotationMessage, RegistrationMessage, SecureMessage, TaskReport,
+    secure_message,
 };
 
 use super::super::TransportError;
@@ -88,7 +89,7 @@ pub struct RekeyPolicy {
 pub struct MaintenanceStatus {
     /// 当前连接已经超过最大无入站时长，继续使用前应关闭并重连。
     pub heartbeat_expired: bool,
-    /// 当前端近期没有发送数据，可以发送加密 Ping。
+    /// 对端近期没有发送入站数据，可以发送加密 Ping 验证反向链路。
     pub ping_due: bool,
     /// initiator 已达到自动 rekey 的时间或帧数阈值。
     pub rekey_due: bool,
@@ -108,8 +109,8 @@ pub struct MaintenanceResult {
 pub enum SessionEvent {
     /// 首次注册状态消息。
     Registration(RegistrationMessage),
-    /// 通用请求或响应消息。
-    Messages(Messages),
+    /// 示例和链路诊断请求或响应消息。
+    Diagnostic(DiagnosticMessage),
     /// 长期静态身份密钥轮换消息。
     KeyRotation(KeyRotationMessage),
     /// Server 下发的 Job 控制命令。
@@ -118,6 +119,12 @@ pub enum SessionEvent {
     JobCommandResult(Box<JobCommandResult>),
     /// Agent 上报的强类型 Task 执行结果。
     TaskReport(Box<TaskReport>),
+    /// Agent 本地远程 Job 策略的查询、快照或确认。
+    AgentJobPolicy(AgentJobPolicySync),
+    /// Agent 可执行 Task 与 Probe 协议的查询或完整快照。
+    AgentCapability(AgentCapabilitySync),
+    /// Plus 插件清单、运行时快照或应用确认。
+    AgentPlugin(AgentPluginSync),
 }
 
 impl TryFrom<SecureMessage> for SessionEvent {
@@ -127,13 +134,16 @@ impl TryFrom<SecureMessage> for SessionEvent {
     fn try_from(message: SecureMessage) -> Result<Self, Self::Error> {
         match message.body {
             Some(secure_message::Body::RegistrationMessage(value)) => Ok(Self::Registration(value)),
-            Some(secure_message::Body::Messages(value)) => Ok(Self::Messages(value)),
+            Some(secure_message::Body::Diagnostic(value)) => Ok(Self::Diagnostic(value)),
             Some(secure_message::Body::KeyRotation(value)) => Ok(Self::KeyRotation(value)),
             Some(secure_message::Body::JobCommand(value)) => Ok(Self::JobCommand(value)),
             Some(secure_message::Body::JobCommandResult(value)) => {
                 Ok(Self::JobCommandResult(value))
             }
             Some(secure_message::Body::TaskReport(value)) => Ok(Self::TaskReport(value)),
+            Some(secure_message::Body::AgentJobPolicy(value)) => Ok(Self::AgentJobPolicy(value)),
+            Some(secure_message::Body::AgentCapability(value)) => Ok(Self::AgentCapability(value)),
+            Some(secure_message::Body::AgentPlugin(value)) => Ok(Self::AgentPlugin(value)),
             Some(secure_message::Body::Error(error)) => {
                 let code = crate::agent::v1::SecureErrorCode::try_from(error.code)
                     .unwrap_or(crate::agent::v1::SecureErrorCode::Unspecified);
@@ -164,5 +174,28 @@ impl Default for RekeyPolicy {
             max_frames: 1 << 20,
             automatic: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::v1::{
+        AgentCapabilityQuery, AgentCapabilitySync, SecureMessage, agent_capability_sync,
+        secure_message,
+    };
+
+    use super::SessionEvent;
+
+    #[test]
+    fn capability_envelope_is_exposed_as_a_typed_session_event() {
+        let message = AgentCapabilitySync {
+            body: Some(agent_capability_sync::Body::Query(AgentCapabilityQuery {})),
+        };
+        let event = SessionEvent::try_from(SecureMessage {
+            body: Some(secure_message::Body::AgentCapability(message)),
+        })
+        .unwrap();
+
+        assert!(matches!(event, SessionEvent::AgentCapability(_)));
     }
 }

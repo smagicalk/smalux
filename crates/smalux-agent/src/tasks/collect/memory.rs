@@ -1,18 +1,18 @@
 //! 内存周期采集任务。
 
 use async_trait::async_trait;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::system::SystemCollector,
 };
 
-use super::blocking::CollectState;
+use super::blocking::BlockingCollectorState;
 
 /// 独立刷新内存与交换空间的调度任务。
 pub struct MemoryTask {
-    state: CollectState<SystemCollector>,
+    state: BlockingCollectorState<SystemCollector>,
 }
 
 impl MemoryTask {
@@ -22,7 +22,7 @@ impl MemoryTask {
     /// 创建拥有独立 sysinfo 刷新状态的内存采集 Task。
     pub fn new() -> Self {
         Self {
-            state: CollectState::new(SystemCollector::new()),
+            state: BlockingCollectorState::new(SystemCollector::new()),
         }
     }
 }
@@ -40,13 +40,7 @@ impl ReportingTask for MemoryTask {
             .state
             .collect(context, SystemCollector::collect_memory)
             .await?;
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::Memory(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::Memory))
     }
 
     fn kind(&self) -> &'static str {

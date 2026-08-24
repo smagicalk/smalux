@@ -2,18 +2,18 @@
 
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::NetworkIoTaskConfig;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::io::NetworkIoCollector,
 };
 
-use super::{blocking::CollectState, selection::filter_network};
+use super::{blocking::BlockingCollectorState, selection::filter_network};
 
 /// 独立维护网络流量增量基线的调度任务。
 pub struct NetworkIoTask {
-    state: CollectState<NetworkIoCollector>,
+    state: BlockingCollectorState<NetworkIoCollector>,
     config: NetworkIoTaskConfig,
 }
 
@@ -29,7 +29,7 @@ impl NetworkIoTask {
     /// 使用显式网卡筛选配置创建 Task。
     pub fn with_config(config: NetworkIoTaskConfig) -> Self {
         Self {
-            state: CollectState::new(NetworkIoCollector::new()),
+            state: BlockingCollectorState::new(NetworkIoCollector::new()),
             config,
         }
     }
@@ -56,13 +56,7 @@ impl ReportingTask for NetworkIoTask {
         if let Some(selection) = self.config.interfaces.as_ref() {
             filter_network(&mut output.snapshot, selection);
         }
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::NetworkIo(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::NetworkIo))
     }
 
     fn kind(&self) -> &'static str {

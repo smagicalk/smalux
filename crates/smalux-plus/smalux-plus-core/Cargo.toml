@@ -1,0 +1,23 @@
+[package]
+name = "smalux-plus-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+# Plus 公共错误、Manifest 和 Worker IPC 的序列化类型。
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# Worker 协议使用稳定的 Protobuf wire format，不依赖 build.rs 生成代码。
+prost = "0.14.4"
+# 动态参数 Schema 使用官方 Protobuf 描述符集合。
+prost-types = "0.14.4"
+# 对已规范化的 Schema Bundle 计算内容哈希。
+sha2 = "0.10.9"
+# Worker SDK 的异步任务和 stdin/stdout 运行时。
+async-trait = "0.1.89"
+tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+thiserror = "2.0.18"

@@ -1,0 +1,297 @@
+name: Build and publish release
+
+on:
+  # Release 只允许手动触发，避免普通 push 意外生成公开版本。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag，例如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smalux-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Validate tag and crate versions
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            echo "Expected format: v<major>.<minor>.<patch>[-prerelease]" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          agent_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "smalux-agent") | .version')"
+          server_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "smalux-server") | .version')"
+
+          if [[ "$agent_version" != "$version" || "$server_version" != "$version" ]]; then
+            echo "Release tag version: $version" >&2
+            echo "smalux-agent version: $agent_version" >&2
+            echo "smalux-server version: $server_version" >&2
+            echo "Cargo package versions must match the tag without the leading v." >&2
+            exit 1
+          fi
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Workspace tests and clippy
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo registry and git dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: quality-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: quality-${{ runner.os }}-
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run workspace Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: [validate, quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_format: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_format: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_format: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_format: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive_format: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Cache Cargo registry, git dependencies and target output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.target }}
+          key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-${{ matrix.target }}-
+
+      - name: Build Agent and Server
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p smalux-agent -p smalux-server
+
+      - name: Smoke-test binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary_suffix=""
+          if [[ "$TARGET" == *windows* ]]; then
+            binary_suffix=".exe"
+          fi
+          "./target/$TARGET/release/smalux-agent${binary_suffix}" --version
+          "./target/$TARGET/release/smalux-server${binary_suffix}" --version
+
+      - name: Smoke-test musl binaries in Alpine
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            alpine:3.22 \
+            /workspace/target/x86_64-unknown-linux-musl/release/smalux-agent --version
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            alpine:3.22 \
+            /workspace/target/x86_64-unknown-linux-musl/release/smalux-server --version
+
+      - name: Package Agent and Server separately on Unix
+        if: matrix.os != 'windows-2025'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+        run: |
+          set -euo pipefail
+          rm -rf dist package
+          mkdir -p dist package
+
+          binary_suffix=""
+          if [[ "$TARGET" == *windows* ]]; then
+            binary_suffix=".exe"
+          fi
+
+          for package_name in smalux-agent smalux-server; do
+            archive_base="${package_name}-${RELEASE_TAG}-${TARGET}"
+            package_dir="package/$archive_base"
+            mkdir -p "$package_dir"
+            cp "target/$TARGET/release/${package_name}${binary_suffix}" "$package_dir/${package_name}${binary_suffix}"
+            cp "crates/$package_name/README.md" "$package_dir/README.md"
+            cp LICENSE "$package_dir/LICENSE"
+
+            tar -czf "dist/$archive_base.tar.gz" -C package "$archive_base"
+          done
+
+      - name: Package Agent and Server separately on Windows
+        if: matrix.os == 'windows-2025'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $PWD "dist"
+          $packageRoot = Join-Path $PWD "package"
+          Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dist, $packageRoot | Out-Null
+
+          foreach ($packageName in @("smalux-agent", "smalux-server")) {
+            $archiveBase = "$packageName-$env:RELEASE_TAG-$env:TARGET"
+            $packageDir = Join-Path $packageRoot $archiveBase
+            New-Item -ItemType Directory -Path $packageDir | Out-Null
+            Copy-Item "target/$env:TARGET/release/$packageName.exe" (Join-Path $packageDir "$packageName.exe")
+            Copy-Item "crates/$packageName/README.md" (Join-Path $packageDir "README.md")
+            Copy-Item "LICENSE" (Join-Path $packageDir "LICENSE")
+            Compress-Archive -Path $packageDir -DestinationPath (Join-Path $dist "$archiveBase.zip")
+          }
+
+      - name: Upload platform archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create draft GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.zip *.tar.gz | sort -k2 > SHA256SUMS
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          existing_state="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [[ "$existing_state" == "false" ]]; then
+            echo "Release $RELEASE_TAG is already public; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          if [[ "$existing_state" == "true" ]]; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --title "Smalux $RELEASE_TAG" --draft
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --draft \
+              --title "Smalux $RELEASE_TAG" \
+              --generate-notes \
+              --target "$RELEASE_SHA"
+          fi

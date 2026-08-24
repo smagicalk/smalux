@@ -13,11 +13,15 @@ use crate::{
         noise_handshake::HandshakeType, protocol_frame, registration_message, secure_message,
     },
     noise::{
-        HandshakeMode, KeyId, NoisePublicKey, ServerIkHandshake, ServerKeyRing, ServerXxHandshake,
+        EstablishedNoise, HandshakeMode, KeyId, NoisePublicKey, ServerIkHandshake, ServerKeyRing,
+        ServerXxHandshake,
     },
 };
 
-use super::{TonicNoiseSession, TransportError, registration_token_id_log_label};
+use super::{
+    TonicNoiseSession, TransportError, registration_token_id_log_label,
+    validate_registration_token_id,
+};
 
 /// 完成 Noise 握手后得到的强类型 Server 入口。
 ///
@@ -53,7 +57,9 @@ impl ServerRegistration {
     }
 
     /// 读取首次注册请求；其他业务或控制类型会作为协议错误返回。
-    pub async fn receive_request(&mut self) -> Result<RegistrationRequest, TransportError> {
+    pub async fn receive_registration_request(
+        &mut self,
+    ) -> Result<RegistrationRequest, TransportError> {
         debug!("waiting for encrypted Agent RegistrationRequest");
         let message = self
             .session
@@ -64,10 +70,7 @@ impl ServerRegistration {
             Some(secure_message::Body::RegistrationMessage(RegistrationMessage {
                 body: Some(registration_message::Body::Request(request)),
             })) => {
-                info!(
-                    agent_name_len = request.agent_name.len(),
-                    "received encrypted Agent registration request"
-                );
+                info!("received encrypted Agent registration request");
                 Ok(request)
             }
             _ => {
@@ -80,7 +83,7 @@ impl ServerRegistration {
     }
 
     /// Server 持久化 pending 注册后，向 Agent 返回稳定业务 ID 和幂等事务 ID。
-    pub async fn prepare(
+    pub async fn send_registration_prepared(
         &mut self,
         registration_id: [u8; 16],
         agent_id: impl Into<String>,
@@ -98,7 +101,7 @@ impl ServerRegistration {
     }
 
     /// 等待 Agent 确认本地身份材料已经持久化，并校验事务 ID。
-    pub async fn wait_for_commit(
+    pub async fn receive_registration_commit(
         &mut self,
         expected_registration_id: [u8; 16],
         limit: Duration,
@@ -125,7 +128,7 @@ impl ServerRegistration {
     }
 
     /// Server 激活 Agent 并消费 Token 后发送最终确认，返回可继续复用的 XX 会话。
-    pub async fn complete(
+    pub async fn send_registration_committed(
         mut self,
         registration_id: [u8; 16],
     ) -> Result<TonicNoiseSession, TransportError> {
@@ -141,16 +144,12 @@ impl ServerRegistration {
     }
 
     /// 发送加密拒绝原因并结束本地注册阶段。
-    pub async fn reject(mut self, error: SecureError) -> Result<(), TransportError> {
+    pub async fn send_rejection(mut self, error: SecureError) -> Result<(), TransportError> {
         warn!(
             code = error.code,
             "rejecting Agent registration in encrypted session"
         );
-        self.session
-            .send(SecureMessage {
-                body: Some(secure_message::Body::Error(error)),
-            })
-            .await
+        send_session_rejection(&mut self.session, error).await
     }
 }
 
@@ -173,13 +172,9 @@ impl ServerAuthentication {
     }
 
     /// 数据库授权失败时发送加密错误并结束本地授权阶段。
-    pub async fn reject(mut self, error: SecureError) -> Result<(), TransportError> {
+    pub async fn send_rejection(mut self, error: SecureError) -> Result<(), TransportError> {
         warn!(code = error.code, "rejecting authenticated Agent session");
-        self.session
-            .send(SecureMessage {
-                body: Some(secure_message::Body::Error(error)),
-            })
-            .await
+        send_session_rejection(&mut self.session, error).await
     }
 }
 
@@ -212,14 +207,46 @@ impl ServerPendingSession {
     }
 
     /// 通过已建立的 Noise 会话发送加密拒绝原因，然后结束本地待授权状态。
-    pub async fn reject(mut self, error: SecureError) -> Result<(), TransportError> {
+    pub async fn send_rejection(mut self, error: SecureError) -> Result<(), TransportError> {
         warn!(code = error.code, "rejecting pending Agent session");
-        self.session
-            .send(SecureMessage {
-                body: Some(secure_message::Body::Error(error)),
-            })
-            .await
+        send_session_rejection(&mut self.session, error).await
     }
+
+    /// 把握手阶段的通用结果收窄为业务层可处理的注册或认证入口。
+    ///
+    /// 两种公开 accept 方法最终都经过这里，因此 `XXpsk3` 必须携带 Token ID、`IK`
+    /// 不得进入注册分支等阶段不变量只维护一份。
+    fn into_incoming(self) -> Result<IncomingSession, TransportError> {
+        match self.mode {
+            HandshakeMode::RegistrationXxPsk3 => {
+                Ok(IncomingSession::Registration(ServerRegistration {
+                    registration_token_id: self.registration_token_id.ok_or_else(|| {
+                        TransportError::Protocol("registration Token ID is missing".to_owned())
+                    })?,
+                    peer_public_key: self.peer_public_key,
+                    session: self.session,
+                }))
+            }
+            HandshakeMode::AuthenticatedIk => {
+                Ok(IncomingSession::Authentication(ServerAuthentication {
+                    peer_public_key: self.peer_public_key,
+                    session: self.session,
+                }))
+            }
+        }
+    }
+}
+
+/// 通过已建立的 Noise 会话发送统一格式的加密拒绝消息。
+async fn send_session_rejection(
+    session: &mut TonicNoiseSession,
+    error: SecureError,
+) -> Result<(), TransportError> {
+    session
+        .send(SecureMessage {
+            body: Some(secure_message::Body::Error(error)),
+        })
+        .await
 }
 
 /// 接受 `OpenSession` 双向流并完成 Noise responder 握手。
@@ -286,38 +313,17 @@ impl ServerSessionAcceptor {
         info!(handshake = ?kind, token_id = %token_id_label, payload_len = first.payload.len(), "received Agent Noise handshake start");
         let established = match kind {
             HandshakeType::XxPsk3 => {
-                validate_registration_token_id(&first.registration_token_id)?;
-                let registration_psk = timeout(
+                accept_xxpsk3(
+                    first,
+                    &mut inbound,
+                    &sender,
+                    keyring,
                     self.handshake_timeout,
-                    resolve_psk(first.registration_token_id.clone()),
+                    resolve_psk,
                 )
-                .await
-                .map_err(|_| TransportError::Timeout("resolving registration PSK"))??;
-                debug!(token_id = %token_id_label, "resolved registration PSK without logging secret bytes");
-                // 首次注册尚无 pinned key，固定使用 keyring 的当前首选身份响应。
-                let identity =
-                    keyring.active_keys().into_iter().next().ok_or_else(|| {
-                        TransportError::Protocol("Server keyring is empty".into())
-                    })?;
-                let (waiting, second) =
-                    ServerXxHandshake::receive_message1(identity, &registration_psk, first)?;
-                send_handshake(&sender, second).await?;
-                let third = next_handshake(&mut inbound, self.handshake_timeout).await?;
-                debug!("received Agent XXpsk3 message 3; validating registration handshake");
-                waiting.receive_message3(third)?
+                .await?
             }
-            HandshakeType::Ik => {
-                // IK Client 明确指定 responder key ID，轮换期据此选择 current/next/previous。
-                let key_id = KeyId::from_bytes(&first.responder_key_id)?;
-                debug!(server_key_id = ?key_id, "selecting Server key for Agent IK handshake");
-                let identity = keyring
-                    .find_active(key_id)
-                    .ok_or(TransportError::UnknownKeyId)?;
-                let (established, second) = ServerIkHandshake::receive_message1(identity, first)?;
-                send_handshake(&sender, second).await?;
-                info!(peer_key_id = ?established.remote_static_key.key_id(), "Agent IK handshake completed");
-                established
-            }
+            HandshakeType::Ik => accept_ik(first, &sender, keyring).await?,
             HandshakeType::Unspecified => {
                 warn!("Agent handshake did not specify a supported mode");
                 return Err(TransportError::Protocol(
@@ -346,23 +352,7 @@ impl ServerSessionAcceptor {
         let pending = self
             .accept_session(inbound, sender, keyring, registration_psk)
             .await?;
-        match pending.mode {
-            HandshakeMode::RegistrationXxPsk3 => {
-                Ok(IncomingSession::Registration(ServerRegistration {
-                    registration_token_id: pending.registration_token_id.ok_or_else(|| {
-                        TransportError::Protocol("registration Token ID is missing".to_owned())
-                    })?,
-                    peer_public_key: pending.peer_public_key,
-                    session: pending.session,
-                }))
-            }
-            HandshakeMode::AuthenticatedIk => {
-                Ok(IncomingSession::Authentication(ServerAuthentication {
-                    peer_public_key: pending.peer_public_key,
-                    session: pending.session,
-                }))
-            }
-        }
+        pending.into_incoming()
     }
 
     /// 使用异步多 Token resolver 完成握手并分类注册或 IK 会话。
@@ -380,47 +370,63 @@ impl ServerSessionAcceptor {
         let pending = self
             .accept_session_with_psk_resolver(inbound, sender, keyring, resolve_psk)
             .await?;
-        match pending.mode {
-            HandshakeMode::RegistrationXxPsk3 => {
-                Ok(IncomingSession::Registration(ServerRegistration {
-                    registration_token_id: pending.registration_token_id.ok_or_else(|| {
-                        TransportError::Protocol("registration Token ID is missing".to_owned())
-                    })?,
-                    peer_public_key: pending.peer_public_key,
-                    session: pending.session,
-                }))
-            }
-            HandshakeMode::AuthenticatedIk => {
-                Ok(IncomingSession::Authentication(ServerAuthentication {
-                    peer_public_key: pending.peer_public_key,
-                    session: pending.session,
-                }))
-            }
-        }
+        pending.into_incoming()
     }
 }
 
-/// 校验握手首帧中用于选择 PSK 的公开 Token ID。
-///
-/// 该字段虽然不是秘密，但在 Noise 建立前完全来自网络，必须在进入异步 resolver
-/// 和数据库查询前限制长度与字符集。实际签发器使用 32 位十六进制 ID；协议层保留
-/// 128 字节上限，兼容未来使用 UUID 或带版本前缀的 ID。
-pub fn validate_registration_token_id(token_id: &str) -> Result<(), TransportError> {
-    if token_id.is_empty()
-        || token_id.len() > 128
-        || !token_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        warn!(
-            token_id_len = token_id.len(),
-            "rejected invalid registration Token ID"
-        );
-        return Err(TransportError::Protocol(
-            "registration Token ID is invalid".to_owned(),
-        ));
-    }
-    Ok(())
+/// 完成首次注册的 responder XXpsk3 分支。
+async fn accept_xxpsk3<F, Fut>(
+    first: NoiseHandshake,
+    inbound: &mut Streaming<ProtocolFrame>,
+    sender: &mpsc::Sender<Result<ProtocolFrame, Status>>,
+    keyring: &ServerKeyRing,
+    handshake_timeout: Duration,
+    resolve_psk: F,
+) -> Result<EstablishedNoise, TransportError>
+where
+    F: FnOnce(String) -> Fut + Send,
+    Fut: Future<Output = Result<[u8; 32], TransportError>> + Send,
+{
+    validate_registration_token_id(&first.registration_token_id)?;
+    let token_id_label = registration_token_id_log_label(&first.registration_token_id);
+    let registration_psk = timeout(
+        handshake_timeout,
+        resolve_psk(first.registration_token_id.clone()),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout("resolving registration PSK"))??;
+    debug!(token_id = %token_id_label, "resolved registration PSK without logging secret bytes");
+
+    // 首次注册尚无 pinned key，固定使用 keyring 的当前首选身份响应。
+    let identity = keyring
+        .active_keys()
+        .into_iter()
+        .next()
+        .ok_or_else(|| TransportError::Protocol("Server keyring is empty".into()))?;
+    let (waiting, second) =
+        ServerXxHandshake::receive_message1(identity, &registration_psk, first)?;
+    send_handshake(sender, second).await?;
+    let third = next_handshake(inbound, handshake_timeout).await?;
+    debug!("received Agent XXpsk3 message 3; validating registration handshake");
+    Ok(waiting.receive_message3(third)?)
+}
+
+/// 完成已注册 Agent 的 responder IK 分支。
+async fn accept_ik(
+    first: NoiseHandshake,
+    sender: &mpsc::Sender<Result<ProtocolFrame, Status>>,
+    keyring: &ServerKeyRing,
+) -> Result<EstablishedNoise, TransportError> {
+    // IK Client 明确指定 responder key ID，轮换期据此选择 current/next/previous。
+    let key_id = KeyId::from_bytes(&first.responder_key_id)?;
+    debug!(server_key_id = ?key_id, "selecting Server key for Agent IK handshake");
+    let identity = keyring
+        .find_active(key_id)
+        .ok_or(TransportError::UnknownKeyId)?;
+    let (established, second) = ServerIkHandshake::receive_message1(identity, first)?;
+    send_handshake(sender, second).await?;
+    info!(peer_key_id = ?established.remote_static_key.key_id(), "Agent IK handshake completed");
+    Ok(established)
 }
 
 /// 构造一条加密注册状态消息。
@@ -480,19 +486,4 @@ async fn send_handshake(
         }))
         .await
         .map_err(|_| TransportError::Closed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_registration_token_id;
-
-    #[test]
-    fn registration_token_id_validation_rejects_untrusted_values() {
-        assert!(validate_registration_token_id("0123456789abcdef").is_ok());
-        assert!(validate_registration_token_id("token-id.v1").is_ok());
-        assert!(validate_registration_token_id("").is_err());
-        assert!(validate_registration_token_id(&"a".repeat(129)).is_err());
-        assert!(validate_registration_token_id("token id").is_err());
-        assert!(validate_registration_token_id("token\n-id").is_err());
-    }
 }

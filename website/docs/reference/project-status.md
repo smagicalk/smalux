@@ -18,9 +18,9 @@ description: 区分当前已实现、示例实现和待完成的能力。
 - Agent Scheduler：触发、队列、并发、重试、取消和生命周期；
 - 固定采集 Task：主机、CPU、内存、负载、磁盘、网络、IP；
 - 进程和 Socket 的 SUMMARY/BASIC/DETAILED 模式；
-- ICMP、TCP Connect、HTTP 多节点探测；
+- ICMP、TCP Connect、UDP Request、HTTP 多节点探测；
 - Proto JobDefinition、JobCommand、TaskDefinition、TaskReport；
-- JobController 命令幂等、目录 revision 和远程所有权；
+- RemoteJobController 命令幂等、目录 revision 和远程所有权；
 - Noise XXpsk3、IK、加密 Session、心跳和同步 rekey；
 - Agent/Server 静态密钥轮换状态与 snapshot；
 - Tonic Client/Server 适配和 SessionDriver；
@@ -28,6 +28,13 @@ description: 区分当前已实现、示例实现和待完成的能力。
 - `smalux-server` library 的 Axum 启动链、`/api/v1/health` 和 `/api/v1/grpc` 路由装配；
 - Server Noise PSK resolver 的异步接口与握手级超时。
 - Server 数据库注册中心：一次性 Token 查询、幂等 prepare、原子 commit、Agent 授权与吊销查询。
+- Agent 正式入口：状态恢复、XXpsk3/IK 自动选择、首次连接及断线退避重连、Scheduler 与 RemoteJobController 装配；
+- Agent Server 公钥轮换：校验公告、先持久化新旧公钥候选，再通过当前加密会话确认。
+- Agent 能力同步：连接后主动上报版本、稳定 Task kind 和 Probe 协议，Server 可查询并校验快照；
+- Agent 运行配置：CLI/环境变量覆盖 Scheduler 容量、TaskReport 内存队列和关闭 drain 超时；
+- Agent 优雅关闭：Ctrl+C 与 Unix SIGTERM 停止 Scheduler、限时补发内存队列并关闭会话；
+- Agent 离线窗口：默认断线 30 分钟后清空远程 Job，重连后由 Server 重新同步权威目录；
+- Agent 身份文件权限：Unix `0600` 与 Windows 保护 ACL，读取时检查不安全权限。
 
 ## Example 中实现
 
@@ -40,17 +47,19 @@ description: 区分当前已实现、示例实现和待完成的能力。
 
 Example 用于说明调用流程，不具备生产数据库、审计、限流和密钥安全存储。
 
-正式入口的当前状态也需要单独说明：`smalux-agent` 的 `main` 尚未组装 Scheduler、连接和上报循环；
-`smalux-server` 已能启动 Axum listener，并装配健康检查、Agent gRPC/Noise 入口和数据库注册中心；
-但管理端尚未提供 Token 签发/吊销 API，Agent 正式入口也尚未组装自动连接与重连。因此“注册与授权
-链路已实现”仍不等于“正式二进制已经可部署”。
+正式入口的当前状态也需要单独说明：`smalux-agent` 已组装 Client、Scheduler、RemoteJobController、
+自动心跳和重连循环，并可作为 library 嵌入其他进程；`smalux-server` 已能启动 Axum listener，
+装配健康检查、Agent gRPC/Noise 入口和数据库注册中心。Server 已在认证后查询并确认 Agent 本地 Job
+策略，通过可替换 Provider 预留权威 Job 目录来源，并能接收 JobCommandResult 与 TaskReport；默认
+Provider 仍不下发 Job，接收结果也尚未落库。因此“认证连接已实现”仍不
+等于“端到端监控系统已经可部署”。
 
 ## 仍需完成
 
-- Agent 与 Server 正式连接生命周期和自动重连；
 - TaskReport 本地持久化、跨 Session ACK、去重和重放；
+- Server 端 Job Provider 的真实数据源，以及 JobCommandResult 与 TaskReport 持久化；
 - Server Job/指标数据库模型与迁移，以及 Agent/Token 管理 API；
-- 能力协商和协议版本策略；
+- Server 基于能力快照过滤 Job，以及跨版本能力兼容策略；
 - 管理 REST API、Web 管理端和用户授权；
 - 安装包、系统服务、容器镜像、升级和回滚；
 - `smalux-plus-rustic` 实际业务实现；

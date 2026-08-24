@@ -5,8 +5,14 @@ syntax = "proto3";
 package smalux.agent.v1;
 
 import "smalux/agent/v1/errors.proto";
+import "smalux/agent/v1/capability.proto";
 import "smalux/agent/v1/job/command.proto";
-import "smalux/agent/v1/messages.proto";
+import "smalux/agent/v1/job/policy.proto";
+import "smalux/agent/v1/diagnostic.proto";
+import "smalux/agent/v1/key_rotation.proto";
+import "smalux/agent/v1/plugin.proto";
+import "smalux/agent/v1/registration.proto";
+import "smalux/agent/v1/session_control.proto";
 import "smalux/agent/v1/task/common.proto";
 
 // Agent 与 Server 的版本化 gRPC 入口。
@@ -30,7 +36,7 @@ message HealthResponse {
   // 供人阅读的简短状态，例如 "ok"。
   string message = 1;
 
-  // 机器可读状态码；示例实现使用 0 表示服务可达。
+  // 机器可读状态码；正式 Server 当前使用 200 表示服务可达。
   uint32 code = 2;
 }
 
@@ -92,7 +98,7 @@ message SecureMessage {
     RegistrationMessage registration_message = 1;
 
     // 已授权会话中的通用请求和响应消息。
-    Messages messages = 2;
+    DiagnosticMessage diagnostic = 2;
 
     // Noise 已建立后返回的加密业务错误。
     SecureError error = 3;
@@ -111,5 +117,14 @@ message SecureMessage {
 
     // Agent 中 ReportingTask 的强类型执行结果。
     TaskReport task_report = 8;
+
+    // Agent 本地远程 Job 策略的查询、完整快照和确认。
+    AgentJobPolicySync agent_job_policy = 9;
+
+    // Agent 可执行 Task 与 Probe 协议的查询或完整快照。
+    AgentCapabilitySync agent_capability = 10;
+
+    // Plus 插件清单、会话内运行时快照与应用确认。
+    AgentPluginSync agent_plugin = 11;
   }
 }

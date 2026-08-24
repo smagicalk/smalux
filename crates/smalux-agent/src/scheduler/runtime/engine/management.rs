@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// 已完成全部校验、可以原子应用到 Job 的更新计划。
+struct JobUpdatePlan {
+    next_version: u64,
+    next_run_at: Option<DateTime<Utc>>,
+    reschedule: RescheduleMode,
+    trigger_changed: bool,
+    task_changed: bool,
+}
+
 impl SchedulerActor {
     /// 校验 Job 数量、Trigger 和策略，生成唯一 JobId 并安排首次运行。
     pub(super) fn add_job(
@@ -38,7 +47,7 @@ impl SchedulerActor {
         };
         let (coalescing, capacity) = effective_queue_policies(&trigger, &options);
         let next_run = first_run_at(&trigger, now)?;
-        let task_kind = task.inner.kind();
+        let task_kind = task.inner.kind().to_owned();
         self.jobs.insert(
             id,
             JobEntry {
@@ -100,102 +109,16 @@ impl SchedulerActor {
         expected_version: u64,
         mut patch: JobPatch,
     ) -> Result<JobSnapshot, SchedulerError> {
-        let mut job = self
-            .jobs
-            .remove(&job_id)
-            .ok_or(SchedulerError::JobNotFound(job_id))?;
-        if job.version != expected_version {
-            let actual = job.version;
-            self.jobs.insert(job_id, job);
-            return Err(SchedulerError::VersionConflict {
-                job_id,
-                expected: expected_version,
-                actual,
-            });
-        }
-
-        // 所有候选值先完成校验，确保失败的 Patch 不会污染现有 Job。
-        let candidate_trigger = patch.trigger.as_ref().unwrap_or(&job.trigger);
-        let candidate_cancellation_mode = patch
-            .task
-            .as_ref()
-            .map(TaskBinding::cancellation_mode)
-            .unwrap_or(job.cancellation_mode);
-        let mut candidate_options = job_options_from_entry(&job);
-        candidate_options.concurrency = match &patch.concurrency {
-            PatchValue::Keep => candidate_options.concurrency,
-            PatchValue::Set(value) => Some(*value),
-            PatchValue::Inherit => None,
-        };
-        candidate_options.max_pending = match &patch.max_pending {
-            PatchValue::Keep => candidate_options.max_pending,
-            PatchValue::Set(value) => Some(*value),
-            PatchValue::Inherit => None,
-        };
-        if let Some(value) = patch.priority {
-            candidate_options.priority = value;
-        }
-        if let Some(value) = patch.coalescing {
-            candidate_options.coalescing = Some(value);
-        }
-        if let Some(value) = patch.capacity {
-            candidate_options.capacity = Some(value);
-        }
-        if let Some(value) = &patch.retry {
-            candidate_options.retry = value.clone();
-        }
-        if let Some(value) = &patch.failure {
-            candidate_options.failure = value.clone();
-        }
-        if let Err(error) = validate_trigger(candidate_trigger, &candidate_options, &self.config) {
-            self.jobs.insert(job_id, job);
-            return Err(error);
-        }
-        if let Err(error) =
-            validate_task_cancellation_mode(candidate_trigger, candidate_cancellation_mode)
-        {
-            self.jobs.insert(job_id, job);
-            return Err(error);
-        }
-        let next_version = match job.version.checked_add(1) {
-            Some(version) => version,
-            None => {
-                self.jobs.insert(job_id, job);
-                return Err(SchedulerError::VersionOverflow(job_id));
-            }
-        };
-
-        let trigger_changed = patch.trigger.is_some();
-        let task_changed = patch.task.is_some();
-        let mode = if trigger_changed && patch.reschedule == RescheduleMode::Preserve {
-            RescheduleMode::Recalculate
-        } else {
-            patch.reschedule
-        };
-        let now = Utc::now();
-        let next = match mode {
-            RescheduleMode::Preserve => match job.next_run_at {
-                Some(next) => Some(next),
-                None if matches!(job.state, JobState::Enabled) => {
-                    match first_run_at(candidate_trigger, now) {
-                        Ok(next) => Some(next),
-                        Err(error) => {
-                            self.jobs.insert(job_id, job);
-                            return Err(error);
-                        }
-                    }
-                }
-                None => None,
-            },
-            RescheduleMode::Recalculate => match first_run_at(candidate_trigger, now) {
-                Ok(next) => Some(next),
-                Err(error) => {
-                    self.jobs.insert(job_id, job);
-                    return Err(error);
-                }
-            },
-            RescheduleMode::RunNow => Some(now),
-        };
+        // 在移出权威 Job 之前完成所有可能失败的计算；失败时无需回滚或重新插入。
+        let plan = self.plan_job_update(job_id, expected_version, &patch)?;
+        let mut job = self.jobs.remove(&job_id).expect("validated Job must exist");
+        let JobUpdatePlan {
+            next_version,
+            next_run_at,
+            reschedule,
+            trigger_changed,
+            task_changed,
+        } = plan;
         if let Some(trigger) = patch.trigger.take() {
             job.trigger = trigger;
         }
@@ -243,7 +166,7 @@ impl SchedulerActor {
             }
         }
 
-        let timer_kind = if mode == RescheduleMode::RunNow {
+        let timer_kind = if reschedule == RescheduleMode::RunNow {
             TimerKind::RunNow
         } else {
             TimerKind::Normal
@@ -251,7 +174,7 @@ impl SchedulerActor {
         let version = job.version;
         let should_schedule = matches!(job.state, JobState::Enabled);
         self.jobs.insert(job_id, job);
-        if should_schedule && let Some(next) = next {
+        if should_schedule && let Some(next) = next_run_at {
             self.schedule_normal(job_id, next, timer_kind);
         }
         if trigger_changed || task_changed {
@@ -265,6 +188,68 @@ impl SchedulerActor {
             "agent scheduler job updated"
         );
         Ok(self.snapshot(self.jobs.get(&job_id).unwrap()))
+    }
+
+    /// 从当前 Job 和 Patch 生成不可失败的提交计划，不修改任何 Actor 状态。
+    fn plan_job_update(
+        &self,
+        job_id: JobId,
+        expected_version: u64,
+        patch: &JobPatch,
+    ) -> Result<JobUpdatePlan, SchedulerError> {
+        let job = self
+            .jobs
+            .get(&job_id)
+            .ok_or(SchedulerError::JobNotFound(job_id))?;
+        if job.version != expected_version {
+            return Err(SchedulerError::VersionConflict {
+                job_id,
+                expected: expected_version,
+                actual: job.version,
+            });
+        }
+
+        let candidate_trigger = patch.trigger.as_ref().unwrap_or(&job.trigger);
+        let candidate_cancellation_mode = patch
+            .task
+            .as_ref()
+            .map(TaskBinding::cancellation_mode)
+            .unwrap_or(job.cancellation_mode);
+        let candidate_options = patched_job_options(job, patch);
+        validate_trigger(candidate_trigger, &candidate_options, &self.config)?;
+        validate_task_cancellation_mode(candidate_trigger, candidate_cancellation_mode)?;
+
+        let next_version = job
+            .version
+            .checked_add(1)
+            .ok_or(SchedulerError::VersionOverflow(job_id))?;
+        let trigger_changed = patch.trigger.is_some();
+        let task_changed = patch.task.is_some();
+        let reschedule = if trigger_changed && patch.reschedule == RescheduleMode::Preserve {
+            RescheduleMode::Recalculate
+        } else {
+            patch.reschedule
+        };
+        let now = Utc::now();
+        let next_run_at = match reschedule {
+            RescheduleMode::Preserve => match job.next_run_at {
+                Some(next) => Some(next),
+                None if matches!(job.state, JobState::Enabled) => {
+                    Some(first_run_at(candidate_trigger, now)?)
+                }
+                None => None,
+            },
+            RescheduleMode::Recalculate => Some(first_run_at(candidate_trigger, now)?),
+            RescheduleMode::RunNow => Some(now),
+        };
+
+        Ok(JobUpdatePlan {
+            next_version,
+            next_run_at,
+            reschedule,
+            trigger_changed,
+            task_changed,
+        })
     }
 
     /// 启用 Disabled/Completed Job；对 Enabled Job 保持幂等。
@@ -501,6 +486,37 @@ fn job_options_from_entry(job: &JobEntry) -> JobOptions {
         retry: job.retry.clone(),
         failure: job.failure.clone(),
     }
+}
+
+/// 将 Patch 覆盖到当前选项副本，仅供更新计划校验使用。
+fn patched_job_options(job: &JobEntry, patch: &JobPatch) -> JobOptions {
+    let mut options = job_options_from_entry(job);
+    options.concurrency = match &patch.concurrency {
+        PatchValue::Keep => options.concurrency,
+        PatchValue::Set(value) => Some(*value),
+        PatchValue::Inherit => None,
+    };
+    options.max_pending = match &patch.max_pending {
+        PatchValue::Keep => options.max_pending,
+        PatchValue::Set(value) => Some(*value),
+        PatchValue::Inherit => None,
+    };
+    if let Some(value) = patch.priority {
+        options.priority = value;
+    }
+    if let Some(value) = patch.coalescing {
+        options.coalescing = Some(value);
+    }
+    if let Some(value) = patch.capacity {
+        options.capacity = Some(value);
+    }
+    if let Some(value) = &patch.retry {
+        options.retry = value.clone();
+    }
+    if let Some(value) = &patch.failure {
+        options.failure = value.clone();
+    }
+    options
 }
 
 /// 阻塞工作一旦开始就不能由 Tokio 中止，禁止把“超时已结束”的错误状态暴露给 Scheduler。

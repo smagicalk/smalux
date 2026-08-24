@@ -26,6 +26,8 @@ tower_governor = { version = "0.8.0", default-features = false, features = ["axu
 tower-sessions = { version = "0.15.0", features = ["signed", "private"] }
 # Server 命令行参数与环境变量解析。
 clap = { version = "4.6.1", features = ["derive", "env", "unicode", "wrap_help"] }
+# CLI 使用人类可读时长，例如 30m、24h 和 7d。
+humantime = "2.4.0"
 # API DTO、配置和数据库模型的序列化基础能力。
 serde = { version = "1.0.228", features = ["derive"] }
 # HTTP API、配置 patch 和数据库 JSON 字段的编解码。
@@ -54,6 +56,8 @@ headers = "0.4.1"
 validator = { version = "0.20.0", features = ["derive"] }
 # 生成和序列化连接、命令、任务等服务端 ID。
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
+# 使用操作系统密码学随机源生成注册 Token ID 和 XXpsk3 PSK。
+getrandom = "0.3.4"
 # 时间处理与序列化，用于数据库字段、过期时间和 API 输出。
 time = { version = "0.3.53", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
 # URL 构造与编码，用于数据库连接地址和外部链接。
@@ -68,6 +72,8 @@ mime_guess = { version = "2.0.5", optional = true }
 smalux-core = { path = "../smalux-core" }
 # 项目协议库
 smalux-protocol = { path = "../smalux-protocol"}
+# Server 只解析 Plus Schema 契约，不安装或执行 Plus Worker。
+smalux-plus-core = { path = "../smalux-plus/smalux-plus-core" }
 # Echo 示例需要直接调用 Prost 的 Message 编解码 trait。
 prost = "0.14.4"
 tonic = "0.14.6"
@@ -77,3 +83,11 @@ snow = "0.10.0"
 [dev-dependencies]
 # 测试二进制启动时提前安装全局 tracing subscriber。
 ctor = "1.0.8"
+# 使用正式 Agent Client 验证 Token 注册、状态落盘和 IK 重连链路。
+smalux-agent = { path = "../smalux-agent" }
+# 构造真实 FileDescriptorSet，验证 Plus Schema 数据库和缓存闭环。
+prost-types = "0.14.4"
+
+[target.'cfg(windows)'.dependencies]
+# 为本地管理命名管道设置仅本机所有者/管理员可访问的 ACL。
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }

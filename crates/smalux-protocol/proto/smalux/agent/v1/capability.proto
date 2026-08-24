@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+import "smalux/agent/v1/task/probe.proto";
+
+// 当前已认证会话中的 Agent 能力同步消息。
+//
+// Agent 连接后主动发送完整快照；Server 也可以发送 Query 要求立即重发。
+// 能力快照描述当前二进制实际可执行的内容，不是 Job 下发或执行结果确认。
+message AgentCapabilitySync {
+  // 查询和快照互斥；空 body 属于无效业务消息。
+  oneof body {
+    // Server 请求 Agent 立即发送当前完整能力快照。
+    AgentCapabilityQuery query = 1;
+    // Agent 主动上报或响应 Query 的完整能力快照。
+    AgentCapabilitySnapshot snapshot = 2;
+  }
+}
+
+// 能力查询当前不携带过滤条件，Agent 始终返回完整快照。
+message AgentCapabilityQuery {}
+
+// 当前 Agent 二进制能够执行的稳定能力集合。
+message AgentCapabilitySnapshot {
+  // 能力内容格式版本；同一版本中的列表含义必须保持兼容。
+  uint64 revision = 1;
+  // Agent crate 的构建版本，用于诊断不同节点的能力差异。
+  string agent_version = 2;
+  // 可用于 Job TaskDefinition 的稳定 Task kind；发送前排序并去重。
+  repeated string task_kinds = 3;
+  // Probe Task 当前实际支持的探测协议；发送前按枚举值排序并去重。
+  repeated ProbeProtocol probe_protocols = 4;
+}

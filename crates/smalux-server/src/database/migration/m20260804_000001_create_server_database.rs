@@ -43,6 +43,11 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(string_len(RegistrationTokens::TokenId, 128).primary_key())
                     .col(binary_len(RegistrationTokens::Psk, 32))
+                    .col(
+                        ColumnDef::new(RegistrationTokens::DisplayName)
+                            .string_len(256)
+                            .null(),
+                    )
                     .col(string_len(RegistrationTokens::Status, 32))
                     .col(big_integer(RegistrationTokens::CreatedAt))
                     .col(big_integer(RegistrationTokens::UpdatedAt))
@@ -145,6 +150,32 @@ impl MigrationTrait for Migration {
                     .col(big_integer(ServerKeyrings::UpdatedAt))
                     .to_owned(),
             )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(PluginSchemaBundles::Table)
+                    .if_not_exists()
+                    .col(binary_len(PluginSchemaBundles::SchemaHash, 32).primary_key())
+                    .col(string_len(PluginSchemaBundles::PluginId, 256))
+                    .col(string_len(PluginSchemaBundles::PluginVersion, 64))
+                    .col(integer(PluginSchemaBundles::FormatVersion))
+                    .col(binary(PluginSchemaBundles::SchemaPayload))
+                    .col(big_integer(PluginSchemaBundles::CreatedAt))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_plugin_schema_bundles_plugin_version")
+                    .table(PluginSchemaBundles::Table)
+                    .col(PluginSchemaBundles::PluginId)
+                    .col(PluginSchemaBundles::PluginVersion)
+                    .unique()
+                    .to_owned(),
+            )
             .await
     }
 
@@ -154,6 +185,14 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(ServerKeyrings::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(PluginSchemaBundles::Table)
                     .if_exists()
                     .to_owned(),
             )
@@ -197,6 +236,7 @@ enum RegistrationTokens {
     Table,
     TokenId,
     Psk,
+    DisplayName,
     Status,
     CreatedAt,
     UpdatedAt,
@@ -234,4 +274,15 @@ enum ServerKeyrings {
     Revision,
     CreatedAt,
     UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum PluginSchemaBundles {
+    Table,
+    SchemaHash,
+    PluginId,
+    PluginVersion,
+    FormatVersion,
+    SchemaPayload,
+    CreatedAt,
 }

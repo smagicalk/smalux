@@ -35,18 +35,18 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_MIN_CONNECTIONS: u32 = 1;
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 
-/// 数据库层自己的稳定错误边界，避免启动代码依赖 SeaORM 的内部错误结构。
+/// 数据库配置解析与校验错误。
+///
+/// 这里只描述连接建立前的配置问题；SeaORM、迁移、密钥环和 Agent 注册
+/// 等已连接后错误属于 `crate::database::DatabaseError`。
 #[derive(Debug, Error)]
-pub enum DatabaseError {
+pub enum DatabaseConfigError {
     /// 解析应用数据目录失败。
     #[error("failed to resolve application data directory: {0}")]
     Directory(#[from] smalux_core::config::DirectoryError),
     /// 创建默认 SQLite 目录失败。
     #[error("failed to prepare default SQLite directory: {0}")]
     Io(#[from] std::io::Error),
-    /// SeaORM 或底层 SQLx 驱动返回的连接/迁移错误。
-    #[error("database operation failed: {0}")]
-    SeaOrm(#[from] sea_orm::DbErr),
     /// URL 库无法构造默认 SQLite 地址；这是程序配置错误。
     #[error("failed to build default SQLite URL: {0}")]
     InvalidDefaultUrl(String),
@@ -61,46 +61,36 @@ pub enum DatabaseError {
     UnsupportedBackend(String),
     /// 后端 options 中出现当前 adapter 不认识的参数。
     #[error("unsupported {backend} database option: {key}")]
-    UnsupportedOption { backend: &'static str, key: String },
+    UnsupportedOption {
+        /// 当前 URL 选择的数据库后端标签。
+        backend: &'static str,
+        /// 不受该后端支持的 option 名称。
+        key: String,
+    },
     /// 后端 option 的 JSON 类型不正确。
     #[error("invalid {backend} database option '{key}': {reason}")]
     InvalidOption {
+        /// 当前 URL 选择的数据库后端标签。
         backend: &'static str,
+        /// 校验失败的 option 名称。
         key: String,
+        /// 不包含连接凭据的失败原因。
         reason: String,
     },
     /// URL 查询参数与 options map 中的同名参数冲突。
     #[error("database option '{key}' conflicts with an existing URL query parameter")]
-    OptionConflict { key: String },
+    OptionConflict {
+        /// 同时出现在 URL 和 options map 的参数名。
+        key: String,
+    },
     /// 环境变量中的数值或布尔值无法解析。
     #[error("invalid database environment variable {name}: {value}")]
-    InvalidEnvironment { name: &'static str, value: String },
-    /// 数据库中保存的 Server 密钥环结构不完整或不一致。
-    #[error("invalid persisted Server keyring: {0}")]
-    InvalidServerKeyring(String),
-    /// Server 密钥环记录不存在，通常表示迁移后数据库尚未完成初始化。
-    #[error("persisted Server keyring record is missing")]
-    MissingServerKeyring,
-    /// Server 密钥环写入时发现其他进程已经提交了更新。
-    #[error("Server keyring revision conflict: expected {expected}, actual {actual:?}")]
-    ServerKeyringRevisionConflict {
-        /// 调用方读取到的 revision。
-        expected: i64,
-        /// 数据库当前 revision；数据库记录被删除时为 None。
-        actual: Option<i64>,
+    InvalidEnvironment {
+        /// 无法解析的环境变量名称。
+        name: &'static str,
+        /// 原始非敏感配置值；密码变量不会走此错误分支。
+        value: String,
     },
-    /// revision 达到 i64 上限，无法再安全递增。
-    #[error("Server keyring revision overflow")]
-    ServerKeyringRevisionOverflow,
-    /// 读取系统时间失败，无法安全比较注册 Token 或注册事务的过期时间。
-    #[error("failed to read database clock: {0}")]
-    Clock(#[from] std::time::SystemTimeError),
-    /// 注册相关记录违反持久化不变量，例如数据库中的 PSK 长度错误。
-    #[error("invalid persisted Agent registration data: {0}")]
-    InvalidAgentRegistration(String),
-    /// 恢复或校验 Noise 身份时失败。
-    #[error("Noise keyring operation failed: {0}")]
-    Noise(#[from] smalux_protocol::noise::NoiseError),
 }
 
 /// SeaORM 支持的运行时数据库后端。
@@ -116,12 +106,12 @@ pub enum DatabaseBackend {
 
 impl DatabaseBackend {
     /// 将 URL scheme 转换为数据库后端。
-    fn from_url(url: &Url) -> Result<Self, DatabaseError> {
+    fn from_url(url: &Url) -> Result<Self, DatabaseConfigError> {
         match url.scheme().to_ascii_lowercase().as_str() {
             "sqlite" => Ok(Self::Sqlite),
             "postgres" | "postgresql" => Ok(Self::Postgres),
             "mysql" => Ok(Self::MySql),
-            scheme => Err(DatabaseError::UnsupportedBackend(scheme.to_owned())),
+            scheme => Err(DatabaseConfigError::UnsupportedBackend(scheme.to_owned())),
         }
     }
 
@@ -185,6 +175,7 @@ pub struct DatabaseConfig {
     /// 密码只允许从配置读取，序列化时跳过；Debug 实现也不会输出它。
     #[serde(skip_serializing)]
     password: Option<String>,
+    /// 跨 SQLite、PostgreSQL 和 MySQL 共用的连接池参数。
     pub pool: DatabasePoolConfig,
     /// 后端专属配置的值只允许使用标量 JSON 类型。
     pub options: BTreeMap<String, Value>,
@@ -227,7 +218,7 @@ impl DatabaseConfig {
     }
 
     /// 从环境变量读取完整数据库配置；未设置 URL 时使用应用数据目录下的 SQLite 文件。
-    pub fn from_env() -> Result<Self, DatabaseError> {
+    pub fn from_env() -> Result<Self, DatabaseConfigError> {
         let url = env::var(DATABASE_URL_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -258,6 +249,22 @@ impl DatabaseConfig {
         self
     }
 
+    pub(crate) fn set_url(&mut self, url: String) {
+        self.url = url;
+    }
+
+    pub(crate) fn set_username(&mut self, username: String) {
+        self.username = Some(username);
+    }
+
+    pub(crate) fn set_password(&mut self, password: String) {
+        self.password = Some(password);
+    }
+
+    pub(crate) fn set_option(&mut self, key: String, value: Value) {
+        self.options.insert(key, value);
+    }
+
     /// 返回原始数据库 URL，供连接层使用。
     pub fn url(&self) -> &str {
         &self.url
@@ -269,9 +276,9 @@ impl DatabaseConfig {
     }
 
     /// 根据 URL 返回数据库后端；非法 URL 返回稳定的配置错误。
-    pub fn backend(&self) -> Result<DatabaseBackend, DatabaseError> {
-        let url =
-            Url::parse(&self.url).map_err(|error| DatabaseError::InvalidUrl(error.to_string()))?;
+    pub fn backend(&self) -> Result<DatabaseBackend, DatabaseConfigError> {
+        let url = Url::parse(&self.url)
+            .map_err(|error| DatabaseConfigError::InvalidUrl(error.to_string()))?;
         DatabaseBackend::from_url(&url)
     }
 
@@ -283,26 +290,26 @@ impl DatabaseConfig {
     }
 
     /// 校验配置但不建立网络连接。
-    pub fn validate(&self) -> Result<(), DatabaseError> {
+    pub fn validate(&self) -> Result<(), DatabaseConfigError> {
         let (_, backend) = self.resolve_connection_url()?;
         self.validate_options(backend)?;
         if self.pool.max_connections == 0 {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "max_connections must be greater than zero".to_owned(),
             ));
         }
         if self.pool.min_connections == 0 {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "min_connections must be greater than zero".to_owned(),
             ));
         }
         if self.pool.min_connections > self.pool.max_connections {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "min_connections must not exceed max_connections".to_owned(),
             ));
         }
         if self.pool.connect_timeout_seconds == 0 {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "connect_timeout_seconds must be greater than zero".to_owned(),
             ));
         }
@@ -312,7 +319,7 @@ impl DatabaseConfig {
             ("max_lifetime_seconds", self.pool.max_lifetime_seconds),
         ] {
             if value == Some(0) {
-                return Err(DatabaseError::InvalidConfig(format!(
+                return Err(DatabaseConfigError::InvalidConfig(format!(
                     "{name} must be greater than zero when configured"
                 )));
             }
@@ -321,42 +328,42 @@ impl DatabaseConfig {
     }
 
     /// 将配置解析成 SeaORM 使用的连接 URL，并返回已确定的后端类型。
-    pub(super) fn resolve_connection_url(
+    pub(crate) fn resolve_connection_url(
         &self,
-    ) -> Result<(String, DatabaseBackend), DatabaseError> {
-        let mut url =
-            Url::parse(&self.url).map_err(|error| DatabaseError::InvalidUrl(error.to_string()))?;
+    ) -> Result<(String, DatabaseBackend), DatabaseConfigError> {
+        let mut url = Url::parse(&self.url)
+            .map_err(|error| DatabaseConfigError::InvalidUrl(error.to_string()))?;
         let backend = DatabaseBackend::from_url(&url)?;
 
         let has_url_username = !url.username().is_empty();
         let has_url_password = url.password().is_some();
         if has_url_username || has_url_password {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "database URL must not contain username or password; use separate fields"
                     .to_owned(),
             ));
         }
         if self.password.is_some() && self.username.is_none() {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "database password requires a database username".to_owned(),
             ));
         }
         if backend == DatabaseBackend::Sqlite
             && (self.username.is_some() || self.password.is_some())
         {
-            return Err(DatabaseError::InvalidConfig(
+            return Err(DatabaseConfigError::InvalidConfig(
                 "SQLite does not accept username or password fields".to_owned(),
             ));
         }
 
         if let Some(username) = &self.username {
             url.set_username(username).map_err(|_| {
-                DatabaseError::InvalidConfig("database username cannot be encoded".to_owned())
+                DatabaseConfigError::InvalidConfig("database username cannot be encoded".to_owned())
             })?;
         }
         if let Some(password) = &self.password {
             url.set_password(Some(password)).map_err(|_| {
-                DatabaseError::InvalidConfig("database password cannot be encoded".to_owned())
+                DatabaseConfigError::InvalidConfig("database password cannot be encoded".to_owned())
             })?;
         }
 
@@ -369,7 +376,7 @@ impl DatabaseConfig {
         &self,
         url: &mut Url,
         backend: DatabaseBackend,
-    ) -> Result<(), DatabaseError> {
+    ) -> Result<(), DatabaseConfigError> {
         for (key, value) in &self.options {
             let is_url_option = match backend {
                 DatabaseBackend::Sqlite => matches!(key.as_str(), "mode" | "cache" | "immutable"),
@@ -383,7 +390,7 @@ impl DatabaseConfig {
                 .query_pairs()
                 .any(|(existing, _)| existing == key.as_str())
             {
-                return Err(DatabaseError::OptionConflict { key: key.clone() });
+                return Err(DatabaseConfigError::OptionConflict { key: key.clone() });
             }
             let encoded = option_scalar_as_string(backend, key, value)?;
             url.query_pairs_mut().append_pair(key, &encoded);
@@ -392,11 +399,11 @@ impl DatabaseConfig {
     }
 
     /// 将通用连接池字段和 SeaORM 已知的后端 setter 应用到 ConnectOptions。
-    pub(super) fn apply_connect_options(
+    pub(crate) fn apply_connect_options(
         &self,
         options: &mut ConnectOptions,
         backend: DatabaseBackend,
-    ) -> Result<(), DatabaseError> {
+    ) -> Result<(), DatabaseConfigError> {
         options
             .max_connections(self.pool.max_connections)
             .min_connections(self.pool.min_connections)
@@ -428,7 +435,7 @@ impl DatabaseConfig {
                 if let Some(value) = self.options.get("statement_timeout_seconds") {
                     let seconds = option_u64(backend, "statement_timeout_seconds", value)?;
                     if seconds == 0 {
-                        return Err(DatabaseError::InvalidOption {
+                        return Err(DatabaseConfigError::InvalidOption {
                             backend: backend.label(),
                             key: "statement_timeout_seconds".to_owned(),
                             reason: "must be greater than zero".to_owned(),
@@ -444,7 +451,7 @@ impl DatabaseConfig {
     }
 
     /// 校验当前后端允许的 options key。
-    fn validate_options(&self, backend: DatabaseBackend) -> Result<(), DatabaseError> {
+    fn validate_options(&self, backend: DatabaseBackend) -> Result<(), DatabaseConfigError> {
         for key in self.options.keys() {
             let supported = match backend {
                 DatabaseBackend::Sqlite => {
@@ -457,7 +464,7 @@ impl DatabaseConfig {
                 DatabaseBackend::MySql => matches!(key.as_str(), "charset" | "ssl-mode"),
             };
             if !supported {
-                return Err(DatabaseError::UnsupportedOption {
+                return Err(DatabaseConfigError::UnsupportedOption {
                     backend: backend.label(),
                     key: key.clone(),
                 });
@@ -479,7 +486,7 @@ impl DatabaseConfig {
                 (DatabaseBackend::Postgres, "statement_timeout_seconds") => {
                     let seconds = option_u64(backend, key, value)?;
                     if seconds == 0 {
-                        return Err(DatabaseError::InvalidOption {
+                        return Err(DatabaseConfigError::InvalidOption {
                             backend: backend.label(),
                             key: key.clone(),
                             reason: "must be greater than zero".to_owned(),
@@ -495,7 +502,7 @@ impl DatabaseConfig {
 
 impl DatabasePoolConfig {
     /// 使用环境变量覆盖默认连接池参数。
-    fn from_env() -> Result<Self, DatabaseError> {
+    fn from_env() -> Result<Self, DatabaseConfigError> {
         let defaults = Self::default();
         Ok(Self {
             max_connections: env_u32(DATABASE_MAX_CONNECTIONS_ENV, defaults.max_connections)?,
@@ -521,16 +528,18 @@ fn option_scalar_as_string(
     backend: DatabaseBackend,
     key: &str,
     value: &Value,
-) -> Result<String, DatabaseError> {
+) -> Result<String, DatabaseConfigError> {
     match value {
         Value::String(value) => Ok(value.clone()),
         Value::Bool(value) => Ok(value.to_string()),
         Value::Number(value) => Ok(value.to_string()),
-        Value::Null | Value::Array(_) | Value::Object(_) => Err(DatabaseError::InvalidOption {
-            backend: backend.label(),
-            key: key.to_owned(),
-            reason: "expected a string, boolean, or number".to_owned(),
-        }),
+        Value::Null | Value::Array(_) | Value::Object(_) => {
+            Err(DatabaseConfigError::InvalidOption {
+                backend: backend.label(),
+                key: key.to_owned(),
+                reason: "expected a string, boolean, or number".to_owned(),
+            })
+        }
     }
 }
 
@@ -538,68 +547,74 @@ fn option_string(
     backend: DatabaseBackend,
     key: &str,
     value: &Value,
-) -> Result<String, DatabaseError> {
+) -> Result<String, DatabaseConfigError> {
     value
         .as_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| DatabaseError::InvalidOption {
+        .ok_or_else(|| DatabaseConfigError::InvalidOption {
             backend: backend.label(),
             key: key.to_owned(),
             reason: "expected a string".to_owned(),
         })
 }
 
-fn option_u64(backend: DatabaseBackend, key: &str, value: &Value) -> Result<u64, DatabaseError> {
-    value.as_u64().ok_or_else(|| DatabaseError::InvalidOption {
-        backend: backend.label(),
-        key: key.to_owned(),
-        reason: "expected an unsigned integer".to_owned(),
-    })
+fn option_u64(
+    backend: DatabaseBackend,
+    key: &str,
+    value: &Value,
+) -> Result<u64, DatabaseConfigError> {
+    value
+        .as_u64()
+        .ok_or_else(|| DatabaseConfigError::InvalidOption {
+            backend: backend.label(),
+            key: key.to_owned(),
+            reason: "expected an unsigned integer".to_owned(),
+        })
 }
 
 fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
-fn env_u32(name: &'static str, default: u32) -> Result<u32, DatabaseError> {
+fn env_u32(name: &'static str, default: u32) -> Result<u32, DatabaseConfigError> {
     let Some(value) = optional_env(name) else {
         return Ok(default);
     };
     value
         .parse()
-        .map_err(|_| DatabaseError::InvalidEnvironment { name, value })
+        .map_err(|_| DatabaseConfigError::InvalidEnvironment { name, value })
 }
 
-fn env_u64(name: &'static str, default: u64) -> Result<u64, DatabaseError> {
+fn env_u64(name: &'static str, default: u64) -> Result<u64, DatabaseConfigError> {
     let Some(value) = optional_env(name) else {
         return Ok(default);
     };
     value
         .parse()
-        .map_err(|_| DatabaseError::InvalidEnvironment { name, value })
+        .map_err(|_| DatabaseConfigError::InvalidEnvironment { name, value })
 }
 
-fn env_optional_u64(name: &'static str) -> Result<Option<u64>, DatabaseError> {
+fn env_optional_u64(name: &'static str) -> Result<Option<u64>, DatabaseConfigError> {
     let Some(value) = optional_env(name) else {
         return Ok(None);
     };
     value
         .parse()
         .map(Some)
-        .map_err(|_| DatabaseError::InvalidEnvironment { name, value })
+        .map_err(|_| DatabaseConfigError::InvalidEnvironment { name, value })
 }
 
-fn env_bool(name: &'static str, default: bool) -> Result<bool, DatabaseError> {
+fn env_bool(name: &'static str, default: bool) -> Result<bool, DatabaseConfigError> {
     let Some(value) = optional_env(name) else {
         return Ok(default);
     };
     value
         .parse()
-        .map_err(|_| DatabaseError::InvalidEnvironment { name, value })
+        .map_err(|_| DatabaseConfigError::InvalidEnvironment { name, value })
 }
 
 /// 返回默认数据库 URL，并确保公共应用目录存在。
-pub fn default_database_url() -> Result<String, DatabaseError> {
+pub fn default_database_url() -> Result<String, DatabaseConfigError> {
     let directories = smalux_core::config::AppDirectories::discover()?;
     directories.ensure_all()?;
     let path = directories.data_dir().join("server.db");
@@ -607,10 +622,10 @@ pub fn default_database_url() -> Result<String, DatabaseError> {
 }
 
 /// 将跨平台文件路径转换为 SQLx 可以识别的 SQLite URL。
-fn sqlite_url_for_path(path: &Path) -> Result<String, DatabaseError> {
+fn sqlite_url_for_path(path: &Path) -> Result<String, DatabaseConfigError> {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let mut url = Url::parse("sqlite:///")
-        .map_err(|error| DatabaseError::InvalidDefaultUrl(error.to_string()))?;
+        .map_err(|error| DatabaseConfigError::InvalidDefaultUrl(error.to_string()))?;
     // Url 负责对空格、井号等文件名字符做百分号编码。
     url.set_path(&normalized);
     url.set_query(Some("mode=rwc"));
@@ -812,6 +827,7 @@ mod tests {
         registration_token::ActiveModel {
             token_id: Set("token-1".to_owned()),
             psk: Set(vec![3; 32]),
+            display_name: Set(Some("Agent One".to_owned())),
             status: Set("active".to_owned()),
             created_at: Set(1),
             updated_at: Set(1),
@@ -824,6 +840,7 @@ mod tests {
         registration_token::ActiveModel {
             token_id: Set("token-2".to_owned()),
             psk: Set(vec![4; 32]),
+            display_name: Set(Some("Agent One".to_owned())),
             status: Set("active".to_owned()),
             created_at: Set(1),
             updated_at: Set(1),

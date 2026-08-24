@@ -5,6 +5,7 @@ package smalux.agent.v1;
 import "google/protobuf/timestamp.proto";
 
 // Scheduler 生命周期事件。按 kind 解释其余可选元数据字段。
+// 当前 v1 仅预留 schema，尚未加入 SecureMessage 或正式 Agent/Server 传输流程。
 message JobEvent {
   // Agent 进程内单调递增序号，用于发现事件缺口；重启后可重新开始。
   uint64 sequence = 1;

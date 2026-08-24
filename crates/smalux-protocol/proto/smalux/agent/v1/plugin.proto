@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 当前已认证会话中的 Plus 插件同步消息。
+//
+// Agent 先发送本机发现到的插件清单；Server 再下发当前会话有效的运行时快照；
+// Agent 成功启动或更新 Worker 后发送 acknowledgement。配置和 secret 都只存在于该
+// Noise 加密会话内，进程重启后由 Server 重新同步。
+message AgentPluginSync {
+  oneof body {
+    // Server 请求 Agent 立即重新发送本机插件清单。
+    AgentPluginQuery query = 1;
+    // Agent 本机已发现且通过 Manifest 校验的完整插件清单。
+    AgentPluginInventory inventory = 2;
+    // Server 针对这条会话下发的完整运行时配置，不是安装或下载命令。
+    PluginRuntimeSnapshot snapshot = 3;
+    // Agent 已接受或拒绝某个运行时快照的结构化确认。
+    AgentPluginAck acknowledgement = 4;
+    // Server 请求 Agent 上传缺失的参数 Schema。
+    PluginSchemaQuery schema_query = 5;
+    // Agent 返回一个已经按 hash 校验的完整 Schema。
+    PluginSchemaResponse schema_response = 6;
+    // Agent 的 Plus Worker 连续崩溃后，请求 Server 暂停该 Agent 的插件 Job 下发。
+    PluginPauseNotice pause_notice = 7;
+    // Server 确认已经记录该 Agent 的插件暂停状态。
+    PluginPauseAck pause_acknowledgement = 8;
+  }
+}
+
+// 插件清单查询当前不带过滤条件，始终要求完整快照。
+message AgentPluginQuery {}
+
+// Server 只请求数据库中不存在的 Schema，避免每次连接重复传输大描述符。
+message PluginSchemaQuery {
+  repeated bytes schema_hashes = 1;
+}
+
+// Agent 对一个 Schema hash 的完整响应。
+message PluginSchemaResponse {
+  bytes schema_hash = 1;
+  bytes schema_bundle = 2;
+}
+
+// Agent 发现到的 Plus 插件完整集合。
+message AgentPluginInventory {
+  // Agent 本地清单格式版本；同一版本内列表语义保持兼容。
+  uint64 revision = 1;
+  // 清单按 plugin_id、version 排序，且同一组合不能重复。
+  repeated PluginInventoryEntry plugins = 2;
+}
+
+// 单个已安装插件版本的公开能力。
+message PluginInventoryEntry {
+  // 稳定插件身份，例如 smalux.plus.echo。
+  string plugin_id = 1;
+  // 语义版本字符串，仅用于 Server 选择兼容运行时快照。
+  string version = 2;
+  // 此版本 Worker 声明能执行的稳定 Task kind，发送前排序去重。
+  repeated string task_kinds = 3;
+  // smalux-plus-core::PluginSchemaBundle 的 SHA-256。
+  bytes schema_hash = 4;
+  // Schema Bundle 格式版本。
+  uint32 schema_format_version = 5;
+}
+
+// Server 下发给当前 Agent 会话的完整插件运行时配置集合。
+message PluginRuntimeSnapshot {
+  // Server 分配的单调版本；Agent 只接受不低于当前已应用的版本。
+  uint64 revision = 1;
+  // 未列出的已安装插件不接收远程 Job，但不删除其本地文件。
+  repeated PluginRuntimeConfig plugins = 2;
+}
+
+// 一个插件版本在当前会话内的运行时参数。
+message PluginRuntimeConfig {
+  // 必须和 Agent inventory 中的插件身份匹配。
+  string plugin_id = 1;
+  // 必须和 Agent inventory 中的版本匹配，避免 Server 对错误二进制下发 Job。
+  string version = 2;
+  // 插件自定义运行时配置的格式版本。
+  uint32 schema_version = 3;
+  // 不包含任务私有参数的共享运行时配置，按插件自己的 Protobuf 定义编码。
+  bytes config = 4;
+  // Server 请求的该插件 Worker 最大并发；Agent 仍会受本地硬上限约束。
+  uint32 requested_concurrency = 5;
+}
+
+// Agent 对运行时快照的接受结果。
+message AgentPluginAck {
+  // 被确认的 PluginRuntimeSnapshot revision。
+  uint64 revision = 1;
+  // true 表示全部配置对应的 Worker 已可接受新 Job。
+  bool accepted = 2;
+  // false 时给出可读失败原因；Server 不得把该字符串作为稳定业务分支。
+  optional string error = 3;
+}
+
+// Agent 在本地 Worker 达到崩溃阈值后发送的暂停通知。
+message PluginPauseNotice {
+  // 插件稳定身份。
+  string plugin_id = 1;
+  // 发生故障的插件版本。
+  string plugin_version = 2;
+  // 触发故障的运行时配置 revision。
+  uint64 runtime_revision = 3;
+  // 当前失败窗口中的连续失败次数。
+  uint32 failure_count = 4;
+  // 失败窗口开始时间，Unix 毫秒。
+  uint64 failure_window_started_at_ms = 5;
+  // 进入暂停状态的时间，Unix 毫秒。
+  uint64 paused_at_ms = 6;
+  // 子进程退出原因，不作为稳定业务枚举使用。
+  string last_exit_reason = 7;
+  // 最后一次启动或协议错误，不包含 Secret。
+  string last_error = 8;
+}
+
+// Server 对插件暂停通知的确认。
+message PluginPauseAck {
+  // 被确认的插件身份。
+  string plugin_id = 1;
+  // 被确认的插件版本。
+  string plugin_version = 2;
+  // 被确认的运行时配置 revision。
+  uint64 runtime_revision = 3;
+  // Server 是否接受并记录暂停状态。
+  bool accepted = 4;
+  // 拒绝时的人类可读原因。
+  optional string error = 5;
+}
+
+// Job 中引用 Plus 插件 Task 的一次执行配置。
+message PluginTaskConfig {
+  // Manifest 中声明的插件身份。
+  string plugin_id = 1;
+  // 插件版本；Server 必须只引用 Agent 已上报且运行时已确认的版本。
+  string plugin_version = 2;
+  // Worker 注册的稳定 Task kind。
+  string task_kind = 3;
+  // task_config 的插件私有格式版本。
+  uint32 schema_version = 4;
+  // 单次 Job 的插件私有参数；不存放共享 Secret。
+  bytes task_config = 5;
+}
+
+// 插件 Worker 返回的通用结果载体。
+//
+// 插件私有 payload 仍由 plugin_id、task_kind 和 schema_version 解释；Agent 只负责把它
+// 可靠地关联到标准 TaskReport，不尝试反序列化或修改业务内容。
+message PluginTaskResult {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  string task_kind = 3;
+  uint32 schema_version = 4;
+  string summary = 5;
+  repeated PluginMetric metrics = 6;
+  bytes payload = 7;
+}
+
+// 插件任务返回的一项数值指标。
+message PluginMetric {
+  string name = 1;
+  double value = 2;
+}

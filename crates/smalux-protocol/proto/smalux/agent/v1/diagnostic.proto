@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 示例和链路诊断使用的请求/响应封装，不承载正式 Job 业务。
+message DiagnosticMessage {
+  // 请求和响应互斥；正式 Job、策略和上报拥有独立强类型分支。
+  oneof body {
+    DiagnosticRequest request = 1;
+    DiagnosticResponse response = 2;
+  }
+}
+
+// 带序号的诊断请求；sequence 不是 Noise nonce。
+message DiagnosticRequest {
+  // 用于关联响应和发现错序，不参与密码学 nonce 计算。
+  uint64 sequence = 1;
+  // 保留三种示例载荷，便于验证二进制、UTF-8 和嵌套 Protobuf 编码。
+  oneof payload {
+    bytes bytes_payload = 2;
+    string string_payload = 3;
+    EchoRequest echo_request = 4;
+  }
+}
+
+// 对诊断请求的关联响应。
+message DiagnosticResponse {
+  // 必须复制对应请求的 sequence。
+  uint64 acknowledged_sequence = 1;
+  oneof payload {
+    bytes bytes_payload = 2;
+    string string_payload = 3;
+    EchoResponse echo_response = 4;
+  }
+}
+
+message EchoRequest {
+  // Server 原样返回的示例文本。
+  string payload = 1;
+}
+
+message EchoResponse {
+  // 从对应 EchoRequest 复制的文本。
+  string payload = 1;
+}

@@ -10,7 +10,7 @@ pub use smalux_protocol::agent::v1::{
 
 mod public;
 
-pub(crate) use public::collect_public_families;
+pub(crate) use public::collect_public_families_with_client;
 pub use public::{collect_public, fetch_public_ips};
 
 pub(crate) fn public_ip_not_requested() -> PublicIpState {

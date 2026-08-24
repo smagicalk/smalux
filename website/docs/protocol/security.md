@@ -89,7 +89,7 @@ RPC 和 Noise 状态，失败 Session 不能复用。
 
 | 方法语义 | 必须原子保存的内容 |
 | --- | --- |
-| 保存注册 pending | 注册公钥、展示名称、预分配 Agent ID、Token ID 和 transaction ID；此时不创建 Agent 授权记录。 |
+| 保存注册 pending | 注册公钥、Server Token 绑定的展示名称、预分配 Agent ID、Token ID 和 transaction ID；此时不创建 Agent 授权记录。 |
 | 提交注册 | pending 状态转换为 committed，并记录注册 ID。 |
 | 保存 Agent 轮换 | current、pending、previous identity 和 rotation ID snapshot。 |
 | 保存 Server 轮换 | current、next、previous identity 和确认进度。 |

@@ -110,4 +110,6 @@ enum JobCommandErrorCode {
   JOB_COMMAND_ERROR_CODE_CAPACITY_EXCEEDED = 6;
   // Scheduler 关闭、故障或发生无法细分的内部错误。
   JOB_COMMAND_ERROR_CODE_SCHEDULER_UNAVAILABLE = 7;
+  // Agent 本地安全策略拒绝该远程 Job；Server 不应把相同定义作为配置错误反复重试。
+  JOB_COMMAND_ERROR_CODE_LOCAL_POLICY_DENIED = 8;
 }

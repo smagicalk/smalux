@@ -18,7 +18,7 @@ pub(super) async fn probe(
 ) -> Result<ProbeNodeSnapshot, ()> {
     let port = match node.target {
         ProbeTarget::TcpConnect { port } => port.get(),
-        ProbeTarget::IcmpEcho | ProbeTarget::Http { .. } => {
+        ProbeTarget::IcmpEcho | ProbeTarget::UdpRequest { .. } | ProbeTarget::Http { .. } => {
             unreachable!("TCP executor received a non-TCP node")
         }
     };

@@ -4661,6 +4661,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smalux-core",
+ "smalux-plus-core",
  "smalux-protocol",
  "surge-ping",
  "sysinfo",
@@ -4672,6 +4673,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4691,6 +4693,35 @@ dependencies = [
  "tracing-appender",
  "tracing-rolling-file",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "smalux-plus-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "smalux-plus-echo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "smalux-plus-core",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -4729,10 +4760,13 @@ dependencies = [
  "clap",
  "ctor",
  "form_urlencoded",
+ "getrandom 0.3.4",
  "headers",
  "http",
+ "humantime",
  "mime_guess",
  "prost",
+ "prost-types",
  "rust-embed",
  "sea-orm",
  "sea-orm-migration",
@@ -4740,7 +4774,9 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "smalux-agent",
  "smalux-core",
+ "smalux-plus-core",
  "smalux-protocol",
  "snow",
  "thiserror 2.0.20",
@@ -4756,6 +4792,7 @@ dependencies = [
  "url",
  "uuid",
  "validator",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

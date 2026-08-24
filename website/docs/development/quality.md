@@ -58,7 +58,7 @@ Agent 的关键测试至少应覆盖：
 | Collector | 单元测试或平台条件测试 | 原始读取、权限和不可用状态。 |
 | Task | 使用固定输入/假 Collector | 配置、筛选、首次采样和结果转换。 |
 | Scheduler | Tokio 时间暂停测试 | 时序、misfire、重试、取消和容量。 |
-| JobController | 内存 Scheduler/Factory | revision、幂等、ReplaceAll 原子性。 |
+| RemoteJobController | 内存 Scheduler/Factory | revision、幂等、ReplaceAll 原子性。 |
 | Noise | 内存帧往返 | 握手阶段、nonce、rekey 和错误帧。 |
 | Tonic | 本机临时 listener | HTTP/2 流、超时、半关闭与 Driver。 |
 | Example | 进程级 smoke test | REST/gRPC 共端口和持久化恢复。 |

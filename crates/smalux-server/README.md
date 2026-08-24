@@ -17,19 +17,23 @@
 - `/api/v1/grpc` 下的 `AgentTransport` gRPC unary 和长期双向流；
 - 基于 Noise XXpsk3 的首次注册、pending/commit/committed 状态和 IK 后续授权；
 - 数据库持久化的 Server keyring、Agent、注册 Token 和注册事务；
+- Agent Job 策略的会话内 Query、Snapshot、ACK 和 Job Provider 扩展边界；
 - Agent 会话数、注册会话数、gRPC 消息大小限制；
+- 通过本地 Named Pipe/Unix Socket 提供的 Server CLI 管理面；
+- 注册 Token 签发、查询、吊销，以及 Agent、实时 Session 和 keyring 状态管理；
 - `Ctrl+C` 取消通知和优雅关闭；
 - `tracing` 控制台日志与按日期/大小滚动的文本日志。
 
 仍未完成的应用能力包括：
 
-- 正式 Token 签发、查询和吊销 CLI/管理 API；
+- 面向 Web 页面的管理 HTTP API、用户登录和操作审计；
 - Job 管理 API、TaskReport 持久化和结果查询；
 - Web 管理端和租户/用户授权；
 - Server 进程自身的 TLS listener（生产环境建议由 Nginx/Cloudflare 终止 TLS）；
 - 多实例之间的注册表、Token 和业务数据一致性策略。
 
-Protocol Example 中的 `token generate` 只用于演示，不能直接当作生产 Token 管理模块。
+正式 Server CLI 已替代 Protocol Example 的 `token generate`。Example 仍只用于学习协议，不能
+作为生产管理入口。
 
 ## 目录结构
 
@@ -37,16 +41,24 @@ Protocol Example 中的 `token generate` 只用于演示，不能直接当作生
 crates/smalux-server/
 ├── src/main.rs                 # 进程入口：初始化 tracing，调用 run_from_env
 ├── src/lib.rs                  # 可复用的 Server 启动入口
-├── src/bootstrap.rs            # 数据库、状态、路由、监听和优雅关闭
+├── src/bootstrap.rs            # Runtime 装配、监听和优雅关闭
+├── src/cli.rs                  # Clap 参数、子命令和配置覆盖
+├── src/commands.rs             # CLI 到本地 IPC 请求的转换与输出
+├── src/management/              # CLI/未来页面共用的本地管理边界
+│   ├── mod.rs                   # 兼容性重导出和 IPC 装配
+│   ├── protocol.rs              # 请求、响应、配置和安全状态 DTO
+│   ├── service.rs               # AdminService 和管理业务分发
+│   └── ipc.rs                   # Named Pipe/Unix Socket 有界 JSON 帧
 ├── src/config.rs               # ServerConfig 和 RuntimeConfig
 ├── src/route.rs                # 顶层 Axum Router、request ID 中间件
-├── src/state.rs                # Common/Frontend/Agent/AppState 装配
+├── src/state.rs                # AppState、Agent 子状态和关闭令牌装配
 ├── src/controller/
 │   ├── frontend.rs             # 普通 HTTP 健康检查
-│   └── agent/routes.rs         # Tonic AgentTransport 路由
+│   └── agent.rs                # Tonic AgentTransport 路由
 ├── src/service/agent/
-│   ├── server_service.rs       # HealthCheck/OpenSession 和 Session 业务循环
-│   ├── agent_registrar.rs      # Token、注册事务、Agent 激活与授权
+│   ├── transport.rs            # HealthCheck/OpenSession 和 worker 生命周期
+│   ├── transport/session/      # 注册、授权和加密业务循环
+│   ├── agent_registry.rs       # Token、注册事务、Agent 激活与授权
 │   ├── keyring_manager.rs      # 数据库 keyring 恢复、CAS 轮换和后台同步
 │   └── state.rs                # Agent gRPC 共享状态和容量限制
 └── src/database/
@@ -63,6 +75,8 @@ crates/smalux-server/
 
 ```powershell
 cargo run -p smalux-server
+# 等价的显式写法
+cargo run -p smalux-server -- run
 ```
 
 默认监听：
@@ -75,13 +89,83 @@ http://127.0.0.1:12345
 
 ```text
 初始化 tracing
-  -> 读取 ServerConfig（当前为环境变量 + 默认值）
+  -> 按 CLI > 环境变量 > 默认值读取 ServerConfig
   -> 连接数据库并执行 SeaORM migration
   -> 恢复或创建 Server Noise keyring
-  -> 创建 AgentRegistrar、后台清理/同步任务和 AppState
+  -> 创建 AgentRegistry、后台清理/同步任务和 AppState
+  -> 启动仅本机可访问的管理 IPC
   -> 装配普通 HTTP 与 Agent gRPC 路由
   -> 监听 TCP
 ```
+
+### 启动参数
+
+```powershell
+cargo run -p smalux-server -- run `
+  --listen-address 127.0.0.1 `
+  --listen-port 12345 `
+  --max-agent-sessions 256 `
+  --max-registration-sessions 32 `
+  --max-grpc-message-bytes 1048576 `
+  --shutdown-grace 15s
+```
+
+数据库可通过 `--database-url`、`--database-username`、`--database-password-file`、连接池
+参数和可重复的 `--database-option KEY=VALUE` 覆盖。CLI 不提供明文
+`--database-password`，避免密码进入命令历史或进程列表。
+
+只解析并校验配置、不启动 Server：
+
+```powershell
+cargo run -p smalux-server -- config check --database-url sqlite::memory:
+```
+
+## 本地管理 CLI
+
+管理子命令不会直接连接数据库，而是通过正在运行的 Server 调用 `AdminService`：
+
+```text
+CLI -> 本地 IPC -> AdminService -> Database / AgentRegistry / SessionRegistry / Keyring
+未来页面 -> 管理 HTTP API -> 同一个 AdminService
+```
+
+Windows 默认端点为 `\\.\pipe\smalux-server`，拒绝远程 Pipe Client，并通过 ACL 只允许
+System、管理员和对象所有者访问。Unix 默认端点为 `<data_dir>/server/control.sock`，权限为
+`0600`。可通过全局 `--control-endpoint` 或 `SMALUX_SERVER_CONTROL_ENDPOINT` 覆盖。
+
+常用命令：
+
+```powershell
+# 运行状态、最终生效配置和只读 keyring 状态
+cargo run -p smalux-server -- status
+cargo run -p smalux-server -- status --watch --interval 2s
+cargo run -p smalux-server -- config show --output json
+cargo run -p smalux-server -- keyring status
+
+# 注册 Token 默认 30 分钟有效；期限支持 30m、24h、7d
+cargo run -p smalux-server -- registration-token create --agent-name node-a --expires-in 24h
+cargo run -p smalux-server -- registration-token create --credential-file token.txt
+cargo run -p smalux-server -- registration-token list --status active
+cargo run -p smalux-server -- registration-token show <TOKEN_ID>
+cargo run -p smalux-server -- registration-token revoke <TOKEN_ID> --yes
+
+# Agent 和实时 Session
+cargo run -p smalux-server -- agent list --online
+cargo run -p smalux-server -- agent rename <AGENT_ID> --name edge-node
+cargo run -p smalux-server -- agent revoke <AGENT_ID> --yes
+cargo run -p smalux-server -- session list --agent-id <AGENT_ID>
+cargo run -p smalux-server -- session disconnect <SESSION_ID> --yes
+
+# 使用现有优雅关闭流程停止 Server
+cargo run -p smalux-server -- shutdown --yes
+```
+
+完整 `token_id.psk` 只在创建响应中出现一次。使用 `--credential-file` 时，CLI 会在请求前
+以“文件必须不存在”的方式预留目标文件，成功后不再把凭据打印到控制台。Token 的
+`list/show` DTO 不含 PSK。`agent revoke` 会先持久化吊销状态，再取消该 Agent 的活动
+Session；`session disconnect` 只断开当前连接，Agent 仍可重新认证。
+
+危险命令在交互终端要求输入 `yes`；脚本或其他非交互环境必须显式提供 `--yes`。
 
 检查普通 HTTP 路由：
 
@@ -178,8 +262,8 @@ token_id.psk
 Agent 发送 XXpsk3 message 1 + token_id
   -> Server 根据 token_id 从数据库解析 PSK
   -> XXpsk3 完成，双方得到加密 Session
-  -> Agent 发送加密 RegistrationRequest(token_id.psk, agent_name)
-  -> Server prepare：保存注册事务，但不创建 active Agent
+  -> Agent 发送加密 RegistrationRequest(token_id.psk)
+  -> Server prepare：读取 Token 绑定的展示名称并保存注册事务，但不创建 active Agent
   -> Agent 保存身份、公钥、预分配 Agent ID、registration_id
   -> Agent 发送加密 RegistrationCommit
   -> Server 原子创建 active Agent、标记事务 committed、消费 Token
@@ -192,6 +276,23 @@ Agent 公钥查询 `agents.status`，只有 `active` Agent 可以进入业务循
 
 pending 注册默认保留 10 分钟，后台任务每 60 秒清理过期且尚未 commit 的事务。同一 Token、
 同一 Agent 公钥的重试保持注册事务幂等；同一 Token 绑定不同公钥会被拒绝。
+展示名称在 Server 签发 Token 时可选；未指定时，prepare 使用新生成的 `agent_id` 作为默认值。
+Agent 不在注册请求中上报名称，因此不能自行覆盖 Server 的管理信息。
+
+## Agent Job 策略
+
+远程 Job 黑名单由 Agent 本地持久化并通过 Noise 密文同步。Server 在每次注册或 IK 授权
+成功后发送 `AgentJobPolicyQuery`，接受 Agent 主动或应答发送的完整快照并返回 revision ACK。
+Server 只在当前会话保存最新快照，不为它创建数据库表；断线后的新会话会重新查询。
+
+业务循环获得快照前不会主动下发 Job。每次接受新 revision 后调用
+`AgentJobCatalogProvider`，传入 `agent_id` 和当前策略；Provider 可以返回权威
+`ReplaceAllJobs`。当前默认 Provider 只记录日志并返回 `None`，因此本阶段完成策略闭环，
+但不提供正式 Job 数据来源。后续接入数据库或管理服务时只需替换 Provider。
+
+策略 ACK 仅表示 Server 接收了该会话的快照，不表示 Provider 已经重新下发 Job。完整线序、
+revision 规则和 Agent 本地停用语义见
+[`PROTOCOL_FLOW.md`](../smalux-protocol/PROTOCOL_FLOW.md#11-agent-job-策略同步)。
 
 ## 资源限制和关闭
 

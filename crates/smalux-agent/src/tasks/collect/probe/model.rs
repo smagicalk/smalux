@@ -19,6 +19,8 @@ pub const MAX_PROBE_ATTEMPTS: u16 = 20;
 pub const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 同一节点两次尝试之间允许配置的最大间隔。
 pub const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// UDP 单次请求或期望响应前缀允许的最大字节数。
+pub const MAX_UDP_PAYLOAD_BYTES: usize = 4 * 1024;
 
 /// 节点使用的网络探测方式。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,15 @@ pub enum ProbeTarget {
     TcpConnect {
         /// 目标 TCP 端口；零端口无法构造。
         port: NonZeroU16,
+    },
+    /// 发送 UDP 数据报，并等待同一目标返回满足前缀条件的数据报。
+    UdpRequest {
+        /// 目标 UDP 端口；零端口无法构造。
+        port: NonZeroU16,
+        /// 每次尝试发送的原始请求载荷。
+        request_payload: Vec<u8>,
+        /// 成功响应必须具有的前缀；`None` 表示接受任意响应数据报。
+        expected_response_prefix: Option<Vec<u8>>,
     },
     /// 发送 HTTP GET 请求并按状态码范围判断成功。
     Http {
@@ -67,6 +78,8 @@ pub enum ProbeProtocol {
     IcmpEcho,
     /// TCP 三次握手连接探测。
     TcpConnect,
+    /// UDP 请求与响应数据报探测。
+    UdpRequest,
     /// HTTP GET 响应探测。
     Http,
 }
@@ -78,11 +91,11 @@ pub struct ProbeNodeConfig {
     pub name: String,
     /// IP 地址或可由系统 DNS 解析的主机名。
     pub host: String,
-    /// ICMP 或 TCP 探测方式。
+    /// ICMP、TCP、UDP 或 HTTP 探测方式。
     pub target: ProbeTarget,
     /// 一次 Task 运行中对该节点执行的尝试次数。
     pub attempts: NonZeroU16,
-    /// 每次 ICMP 回包或 TCP 连接的等待上限。
+    /// 每次协议交互的总等待上限。
     pub timeout: Duration,
     /// 同一节点相邻尝试之间的等待时间；零表示立即进行下一次。
     pub interval: Duration,
@@ -151,6 +164,36 @@ impl ProbeTaskConfig {
                     });
                 }
             }
+            if let ProbeTarget::UdpRequest {
+                request_payload,
+                expected_response_prefix,
+                ..
+            } = &node.target
+            {
+                if request_payload.is_empty() {
+                    return Err(ProbeConfigError::EmptyUdpRequestPayload {
+                        name: node.name.clone(),
+                    });
+                }
+                if request_payload.len() > MAX_UDP_PAYLOAD_BYTES {
+                    return Err(ProbeConfigError::UdpPayloadTooLarge {
+                        name: node.name.clone(),
+                        field: "request_payload",
+                        actual: request_payload.len(),
+                        maximum: MAX_UDP_PAYLOAD_BYTES,
+                    });
+                }
+                if let Some(prefix) = expected_response_prefix
+                    && prefix.len() > MAX_UDP_PAYLOAD_BYTES
+                {
+                    return Err(ProbeConfigError::UdpPayloadTooLarge {
+                        name: node.name.clone(),
+                        field: "expected_response_prefix",
+                        actual: prefix.len(),
+                        maximum: MAX_UDP_PAYLOAD_BYTES,
+                    });
+                }
+            }
             if node.attempts.get() > MAX_PROBE_ATTEMPTS {
                 return Err(ProbeConfigError::AttemptsTooHigh {
                     name: node.name.clone(),
@@ -189,7 +232,7 @@ pub enum ProbeConfigError {
         /// 允许的最大尝试次数。
         maximum: u16,
     },
-    /// 节点没有配置 ICMP、TCP 或 HTTP target。
+    /// 节点没有配置 ICMP、TCP、UDP 或 HTTP target。
     #[error("probe node '{name}' target is required")]
     MissingTarget {
         /// 配置错误的节点名称。
@@ -200,6 +243,30 @@ pub enum ProbeConfigError {
     InvalidTcpPort {
         /// 配置错误的节点名称。
         name: String,
+    },
+    /// UDP 端口不是 1 到 65535。
+    #[error("probe node '{name}' UDP port must be within 1..=65535")]
+    InvalidUdpPort {
+        /// 配置错误的节点名称。
+        name: String,
+    },
+    /// UDP 请求载荷为空，无法验证目标是否会响应实际请求。
+    #[error("probe node '{name}' UDP request payload cannot be empty")]
+    EmptyUdpRequestPayload {
+        /// 配置错误的节点名称。
+        name: String,
+    },
+    /// UDP 请求载荷或响应前缀超过内存和网络安全边界。
+    #[error("probe node '{name}' UDP {field} size {actual} exceeds limit {maximum}")]
+    UdpPayloadTooLarge {
+        /// 配置错误的节点名称。
+        name: String,
+        /// 超过限制的字段名。
+        field: &'static str,
+        /// 实际字节数。
+        actual: usize,
+        /// 允许的最大字节数。
+        maximum: usize,
     },
     /// 未配置任何探测节点。
     #[error("at least one probe node is required")]
@@ -319,6 +386,22 @@ pub(super) fn compile_config(
                         })?;
                     ProbeTarget::TcpConnect { port }
                 }
+                Some(probe_node_config::Target::UdpRequest(target)) => {
+                    let port = u16::try_from(target.port)
+                        .ok()
+                        .and_then(NonZeroU16::new)
+                        .ok_or_else(|| ProbeConfigError::InvalidUdpPort {
+                            name: node.name.clone(),
+                        })?;
+                    ProbeTarget::UdpRequest {
+                        port,
+                        request_payload: target.request_payload.clone(),
+                        expected_response_prefix: target
+                            .expected_response_prefix
+                            .clone()
+                            .filter(|prefix| !prefix.is_empty()),
+                    }
+                }
                 Some(probe_node_config::Target::Http(target)) => ProbeTarget::Http {
                     url: reqwest::Url::parse(&target.url).map_err(|_| {
                         ProbeConfigError::InvalidHttpUrl {
@@ -360,7 +443,7 @@ fn proto_duration(value: Option<&prost_types::Duration>) -> Option<Duration> {
     Some(Duration::new(value.seconds as u64, value.nanos as u32))
 }
 
-/// 一次 ICMP Echo、TCP Connect 或 HTTP 尝试的结果。
+/// 一次 ICMP Echo、TCP Connect、UDP Request 或 HTTP 尝试的结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeAttemptSnapshot {
     /// 从 1 开始的尝试序号。
@@ -369,7 +452,7 @@ pub struct ProbeAttemptSnapshot {
     pub success: bool,
     /// 成功时的往返或连接耗时。
     pub latency_ms: Option<f64>,
-    /// HTTP 响应状态码；ICMP、TCP 或未收到响应头时为 `None`。
+    /// HTTP 响应状态码；ICMP、TCP、UDP 或未收到响应头时为 `None`。
     pub status_code: Option<u16>,
     /// 失败时的稳定错误摘要。
     pub error: Option<String>,
@@ -384,7 +467,7 @@ pub struct ProbeNodeSnapshot {
     pub host: String,
     /// 节点使用的探测协议。
     pub protocol: ProbeProtocol,
-    /// TCP Connect 的目标端口；ICMP Echo 为 `None`。
+    /// TCP Connect 或 UDP Request 的目标端口；其他协议为 `None`。
     pub port: Option<u16>,
     /// HTTP 探测 URL 的脱敏形式；凭据、查询参数和片段会被移除。
     pub url: Option<String>,
@@ -396,7 +479,7 @@ pub struct ProbeNodeSnapshot {
     pub succeeded: u16,
     /// 未满足该协议成功条件的尝试比例，范围为 0 到 100。
     ///
-    /// 对 ICMP 这通常等同于丢包率；对 TCP/HTTP 则表示连接或健康检查失败率。
+    /// 对 ICMP/UDP 这通常等同于丢包率；对 TCP/HTTP 则表示连接或健康检查失败率。
     pub failure_percent: f64,
     /// 成功样本的最小耗时。
     pub min_latency_ms: Option<f64>,
@@ -439,6 +522,9 @@ impl ProbeNodeSnapshot {
         let (protocol, port, url) = match &node.target {
             ProbeTarget::IcmpEcho => (ProbeProtocol::IcmpEcho, None, None),
             ProbeTarget::TcpConnect { port } => (ProbeProtocol::TcpConnect, Some(port.get()), None),
+            ProbeTarget::UdpRequest { port, .. } => {
+                (ProbeProtocol::UdpRequest, Some(port.get()), None)
+            }
             ProbeTarget::Http { url, .. } => {
                 (ProbeProtocol::Http, None, Some(sanitized_http_url(url)))
             }
@@ -495,6 +581,43 @@ pub(super) fn latency_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proto_config_compiles_udp_request_target() {
+        let config = ProtoProbeTaskConfig {
+            concurrency: 1,
+            nodes: vec![smalux_protocol::agent::v1::ProbeNodeConfig {
+                name: "dns".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                attempts: 1,
+                timeout: Some(prost_types::Duration {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                interval: None,
+                target: Some(probe_node_config::Target::UdpRequest(
+                    smalux_protocol::agent::v1::UdpRequestTarget {
+                        port: 53,
+                        request_payload: b"request".to_vec(),
+                        expected_response_prefix: Some(b"response".to_vec()),
+                    },
+                )),
+            }],
+        };
+
+        let compiled = compile_config(&config).unwrap();
+
+        assert!(matches!(
+            &compiled.nodes[0].target,
+            ProbeTarget::UdpRequest {
+                port,
+                request_payload,
+                expected_response_prefix: Some(expected),
+            } if port.get() == 53
+                && request_payload == b"request"
+                && expected == b"response"
+        ));
+    }
 
     fn node(name: &str) -> ProbeNodeConfig {
         ProbeNodeConfig {
@@ -571,6 +694,42 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_invalid_udp_payloads() {
+        let mut invalid = node("udp");
+        invalid.target = ProbeTarget::UdpRequest {
+            port: NonZeroU16::new(53).unwrap(),
+            request_payload: Vec::new(),
+            expected_response_prefix: None,
+        };
+        let config = ProbeTaskConfig {
+            concurrency: NonZeroUsize::new(1).unwrap(),
+            nodes: vec![invalid],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ProbeConfigError::EmptyUdpRequestPayload { .. })
+        ));
+
+        let mut invalid = node("udp");
+        invalid.target = ProbeTarget::UdpRequest {
+            port: NonZeroU16::new(53).unwrap(),
+            request_payload: vec![0; MAX_UDP_PAYLOAD_BYTES + 1],
+            expected_response_prefix: None,
+        };
+        let config = ProbeTaskConfig {
+            concurrency: NonZeroUsize::new(1).unwrap(),
+            nodes: vec![invalid],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ProbeConfigError::UdpPayloadTooLarge {
+                field: "request_payload",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn config_rejects_blank_name_and_host() {
         let config = ProbeTaskConfig {
             concurrency: NonZeroUsize::new(1).unwrap(),
@@ -638,6 +797,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ProbeProtocol::TcpConnect).unwrap(),
             r#""tcp_connect""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProbeProtocol::UdpRequest).unwrap(),
+            r#""udp_request""#
         );
         assert_eq!(
             serde_json::to_string(&ProbeProtocol::Http).unwrap(),

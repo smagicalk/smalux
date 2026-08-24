@@ -2,18 +2,18 @@
 
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::DiskIoTaskConfig;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::io::DiskIoCollector,
 };
 
-use super::{blocking::CollectState, selection::filter_disk};
+use super::{blocking::BlockingCollectorState, selection::filter_disk};
 
 /// 独立维护磁盘 IO 增量基线的调度任务。
 pub struct DiskIoTask {
-    state: CollectState<DiskIoCollector>,
+    state: BlockingCollectorState<DiskIoCollector>,
     config: DiskIoTaskConfig,
 }
 
@@ -29,7 +29,7 @@ impl DiskIoTask {
     /// 使用显式磁盘筛选配置创建 Task。
     pub fn with_config(config: DiskIoTaskConfig) -> Self {
         Self {
-            state: CollectState::new(DiskIoCollector::new()),
+            state: BlockingCollectorState::new(DiskIoCollector::new()),
             config,
         }
     }
@@ -56,13 +56,7 @@ impl ReportingTask for DiskIoTask {
         if let Some(selection) = self.config.disks.as_ref() {
             filter_disk(&mut output.snapshot, selection);
         }
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::DiskIo(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::DiskIo))
     }
 
     fn kind(&self) -> &'static str {

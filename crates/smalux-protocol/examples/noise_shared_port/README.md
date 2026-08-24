@@ -92,7 +92,14 @@ cargo run -p smalux-protocol --example noise_shared_port_server
 cargo run -p smalux-protocol --example noise_shared_port_server -- --mode driver
 ```
 
-Server 启动后在控制台执行 `token generate`，得到一条随机的一次性 Token：
+Server 启动后在控制台执行 `token generate [display-name]`，得到一条随机的一次性 Token。
+展示名称由 Server 绑定；省略时使用注册时生成的 Agent ID：
+
+```text
+server> token generate edge-agent-01
+```
+
+然后在另一个终端启动 Client：
 
 ```powershell
 cargo run -p smalux-protocol --example noise_shared_port_client
@@ -202,10 +209,10 @@ Agent ID，但没有事务 ID/完成标记，Client 会打印 legacy metadata �
 `SMALUX_EXAMPLE_REVOKE_AGENT` 和控制台都是示例管理入口，不是生产管理 API。每条 Token 只能
 绑定一台 Agent；要注册更多 Agent，执行 `token create` 为每台分别签发。
 
-第二台 Agent 必须使用独立数据目录；展示名称可以重复：
+第二台 Agent 必须使用独立数据目录；如需展示名称，在 Server 为它单独签发 Token：
 
 ```powershell
-$env:SMALUX_EXAMPLE_AGENT_NAME = "agent-2"
+server> token generate agent-2
 $env:SMALUX_EXAMPLE_AGENT_DATA_DIR = "target/smalux-noise-agent-2"
 cargo run -p smalux-protocol --example noise_shared_port_client
 ```
@@ -232,7 +239,7 @@ Server 启动后可以直接在同一控制台输入命令：
 
 ```text
 server> help
-server> token generate
+server> token generate [display-name]
 server> token list
 server> token revoke <id>
 server> agents
@@ -240,7 +247,7 @@ server> revoke <agent-id>
 server> quit
 ```
 
-- `token generate` 签发一条新的独立 Token；`token create` 是兼容别名；`token list` 只显示公开 ID；`token revoke <id>` 吊销它；
+- `token generate [display-name]` 签发一条新的独立 Token，并可绑定展示名称；省略时默认使用生成的 Agent ID；`token create` 是兼容别名；`token list` 只显示公开 ID；`token revoke <id>` 吊销它；
 - `agents` 列出磁盘注册表中已登记的 Agent；
 - `revoke <agent-id>` 按稳定 ID 删除该 Agent 公钥，已经建立的流保持到自行关闭，新的 IK 会被拒绝；
 - `quit` 触发 Tonic/Axum 正常关闭，不需要直接终止进程。
@@ -322,13 +329,15 @@ cargo run -p smalux-protocol --example noise_shared_port_client
    身份或缺少 committed 标记时，使用原身份恢复首次注册。
 2. `register_agent` 调用 `AgentProtocolClient::prepare_registration` 完成 XXpsk3，发送
    `RegistrationRequest` 并取得 `AgentPendingRegistration`。
-3. Client 调用 `save_pending_registration`，保存成功后才调用 `pending.commit()`；收到
+3. Client 调用 `save_pending_registration`，保存成功后才调用
+   `pending.send_registration_commit_and_receive_committed()`；收到
    `RegistrationCommitted` 后写入完成标记。协议层不替调用方决定具体存储。
 4. Server 的 `open_session` 把 Tonic 流交给
    `ServerSessionAcceptor::accept_incoming`，得到 `IncomingSession::Registration` 或
    `IncomingSession::Authentication`。
-5. 注册分支依次调用 `receive_request`、注册表 `prepare`、协议 `prepare`、`wait_for_commit`、
-   注册表 `commit` 和协议 `complete`；失败返回加密 `SecureError`。
+5. 注册分支依次调用 `receive_registration_request`、注册表 `prepare`、协议
+   `send_registration_prepared`、`receive_registration_commit`、注册表 `commit` 和协议
+   `send_registration_committed`；失败通过 `send_rejection` 返回加密 `SecureError`。
 6. 首次注册和后续 IK 最终都调用 `run_messages`。只有已有身份或断线重连时才由
    `open_ik_session` 调用 `AgentProtocolClient::connect`；成功后双方通过
    manual 模式使用 `TonicNoiseSession` 小方法，driver 模式使用 `SessionHandle/SessionEventReceiver`。

@@ -2,18 +2,18 @@
 
 use async_trait::async_trait;
 pub use smalux_protocol::agent::v1::LocalIpTaskConfig;
-use smalux_protocol::agent::v1::{SampleMetadata, TaskResult, task_result};
+use smalux_protocol::agent::v1::{TaskResult, task_result};
 
 use crate::{
     scheduler::{ReportingTask, TaskContext, TaskError},
     tasks::collect::collectors::ip::LocalIpCollector,
 };
 
-use super::{blocking::CollectState, selection::filter_local_ip};
+use super::{blocking::BlockingCollectorState, selection::filter_local_ip};
 
 /// 使用独立接口发现状态采集本地 IP 的调度任务。
 pub struct LocalIpTask {
-    state: CollectState<LocalIpCollector>,
+    state: BlockingCollectorState<LocalIpCollector>,
     config: LocalIpTaskConfig,
 }
 
@@ -29,7 +29,7 @@ impl LocalIpTask {
     /// 使用显式网卡筛选配置创建 Task。
     pub fn with_config(config: LocalIpTaskConfig) -> Self {
         Self {
-            state: CollectState::new(LocalIpCollector::new()),
+            state: BlockingCollectorState::new(LocalIpCollector::new()),
             config,
         }
     }
@@ -56,13 +56,7 @@ impl ReportingTask for LocalIpTask {
         if let Some(selection) = self.config.interfaces.as_ref() {
             filter_local_ip(&mut output.snapshot, selection);
         }
-        Ok(TaskResult {
-            sample: Some(SampleMetadata {
-                sampled_at_ms: output.sampled_at_ms,
-                sample_interval_ms: output.sample_interval_ms,
-            }),
-            result: Some(task_result::Result::LocalIp(output.snapshot)),
-        })
+        Ok(output.into_task_result(task_result::Result::LocalIp))
     }
 
     fn kind(&self) -> &'static str {

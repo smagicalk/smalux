@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// 长期 Noise 静态身份轮换；与当前 Session 的对称 rekey 相互独立。
+message KeyRotationMessage {
+  oneof body {
+    AgentKeyRotationRequest agent_request = 1;
+    AgentKeyRotationAccepted agent_accepted = 2;
+    ServerKeyAnnouncement server_announcement = 3;
+    ServerKeyAcknowledgement server_acknowledgement = 4;
+  }
+}
+
+message AgentKeyRotationRequest {
+  // 16 字节随机轮换事务 ID。
+  bytes rotation_id = 1;
+  // 新 Agent X25519 静态公钥，固定 32 字节；私钥绝不进入协议。
+  bytes new_public_key = 2;
+  // 新公钥的 BLAKE2s-256 指纹，接收端必须重新计算。
+  bytes new_key_id = 3;
+}
+
+message AgentKeyRotationAccepted {
+  // 必须匹配 AgentKeyRotationRequest.rotation_id。
+  bytes rotation_id = 1;
+}
+
+message ServerKeyAnnouncement {
+  // 16 字节随机轮换事务 ID。
+  bytes rotation_id = 1;
+  bytes new_public_key = 2;
+  bytes new_key_id = 3;
+}
+
+message ServerKeyAcknowledgement {
+  // 必须匹配 ServerKeyAnnouncement.rotation_id。
+  bytes rotation_id = 1;
+  // Agent 实际持久化的新 Server key ID。
+  bytes key_id = 2;
+}

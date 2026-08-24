@@ -8,19 +8,24 @@ pub mod entity;
 pub mod migration;
 
 mod agent_registration;
-mod config;
 mod connection;
+mod error;
 mod keyring;
+mod management;
+mod plugin_schema;
 
-pub(crate) use agent_registration::{
-    PendingAgentRegistration, PersistedAgentAuthorization, PrepareAgentRegistrationError,
-};
-pub use config::{
+pub use crate::config::{
     DATABASE_ACQUIRE_TIMEOUT_ENV, DATABASE_CONNECT_TIMEOUT_ENV, DATABASE_IDLE_TIMEOUT_ENV,
     DATABASE_MAX_CONNECTIONS_ENV, DATABASE_MAX_LIFETIME_ENV, DATABASE_MIN_CONNECTIONS_ENV,
     DATABASE_PASSWORD_ENV, DATABASE_RECORD_STMT_IN_SPANS_ENV, DATABASE_SQLX_LOGGING_ENV,
-    DATABASE_URL_ENV, DATABASE_USERNAME_ENV, DatabaseBackend, DatabaseConfig, DatabaseError,
+    DATABASE_URL_ENV, DATABASE_USERNAME_ENV, DatabaseBackend, DatabaseConfig, DatabaseConfigError,
     DatabasePoolConfig, default_database_url,
 };
+pub(crate) use agent_registration::{
+    PendingAgentRegistration, PersistedAgentAuthorization, PrepareAgentRegistrationError,
+};
 pub use connection::ServerDatabase;
+pub use error::DatabaseError;
 pub use keyring::ServerKeyRingRecord;
+pub(crate) use management::{AgentRecord, RegistrationTokenRecord, RevokeTokenOutcome};
+pub use plugin_schema::PluginSchemaRecord;

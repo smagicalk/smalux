@@ -121,11 +121,21 @@ pub(crate) async fn collect_public_families(
     request_ipv6: bool,
 ) -> PublicIpSnapshot {
     let client = reqwest::Client::new();
+    collect_public_families_with_client(&client, timeout, request_ipv4, request_ipv6).await
+}
+
+/// 使用调用方持有的 HTTP Client 查询公网地址，允许周期 Task 跨执行复用连接池。
+pub(crate) async fn collect_public_families_with_client(
+    client: &reqwest::Client,
+    timeout: Duration,
+    request_ipv4: bool,
+    request_ipv6: bool,
+) -> PublicIpSnapshot {
     match (request_ipv4, request_ipv6) {
         (true, true) => {
             let (ipv4, ipv6) = tokio::join!(
-                fetch_from_endpoints(&client, IPV4_ENDPOINTS, timeout),
-                fetch_from_endpoints(&client, IPV6_ENDPOINTS, timeout)
+                fetch_from_endpoints(client, IPV4_ENDPOINTS, timeout),
+                fetch_from_endpoints(client, IPV6_ENDPOINTS, timeout)
             );
             PublicIpSnapshot {
                 ipv4: Some(into_public_ip_state(ipv4)),
@@ -134,14 +144,14 @@ pub(crate) async fn collect_public_families(
         }
         (true, false) => PublicIpSnapshot {
             ipv4: Some(into_public_ip_state(
-                fetch_from_endpoints(&client, IPV4_ENDPOINTS, timeout).await,
+                fetch_from_endpoints(client, IPV4_ENDPOINTS, timeout).await,
             )),
             ipv6: Some(public_ip_not_requested()),
         },
         (false, true) => PublicIpSnapshot {
             ipv4: Some(public_ip_not_requested()),
             ipv6: Some(into_public_ip_state(
-                fetch_from_endpoints(&client, IPV6_ENDPOINTS, timeout).await,
+                fetch_from_endpoints(client, IPV6_ENDPOINTS, timeout).await,
             )),
         },
         (false, false) => PublicIpSnapshot {

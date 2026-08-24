@@ -57,6 +57,46 @@ pub(crate) enum PrepareAgentRegistrationError {
 }
 
 impl ServerDatabase {
+    /// 插入一条尚未绑定 Agent 的 active 注册 Token。
+    ///
+    /// PSK 只以原始 32 字节保存；完整 `token_id.psk` 凭据永远不进入数据库层。
+    pub(crate) async fn insert_registration_token(
+        &self,
+        token_id: &str,
+        psk: &[u8; 32],
+        display_name: Option<&str>,
+        valid_for: Option<std::time::Duration>,
+    ) -> Result<Option<i64>, DatabaseError> {
+        let now = unix_timestamp_micros()?;
+        let expires_at = valid_for
+            .map(|duration| {
+                let duration_micros: i64 = duration.as_micros().try_into().map_err(|_| {
+                    DatabaseError::InvalidAgentRegistration(
+                        "registration token duration does not fit in i64 microseconds".to_owned(),
+                    )
+                })?;
+                now.checked_add(duration_micros).ok_or_else(|| {
+                    DatabaseError::InvalidAgentRegistration(
+                        "registration token expiration timestamp overflow".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        registration_token::ActiveModel {
+            token_id: Set(token_id.to_owned()),
+            psk: Set(psk.to_vec()),
+            display_name: Set(display_name.map(str::to_owned)),
+            status: Set(TokenStatus::ACTIVE.to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            expires_at: Set(expires_at),
+            used_at: Set(None),
+        }
+        .insert(self.connection())
+        .await?;
+        Ok(expires_at)
+    }
+
     /// 删除过期且尚未 commit 的注册事务，释放 Token 与公钥的唯一索引。
     pub(crate) async fn cleanup_expired_agent_registrations(&self) -> Result<u64, DatabaseError> {
         let now = unix_timestamp_micros()?;
@@ -118,7 +158,6 @@ impl ServerDatabase {
         token_id: &str,
         request_psk: &[u8; 32],
         agent_public_key: &[u8; 32],
-        agent_name: &str,
     ) -> Result<PendingAgentRegistration, PrepareAgentRegistrationError> {
         let public_key = agent_public_key.to_vec();
         let now = unix_timestamp_micros().map_err(PrepareAgentRegistrationError::Database)?;
@@ -185,12 +224,13 @@ impl ServerDatabase {
         let registration_uuid = Uuid::new_v4();
         let registration_id = registration_uuid.into_bytes();
         let agent_id = Uuid::new_v4().to_string();
+        let agent_name = token.display_name.unwrap_or_else(|| agent_id.clone());
         agent_registration::ActiveModel {
             registration_id: Set(registration_uuid.to_string()),
             token_id: Set(token_id.to_owned()),
             agent_id: Set(None),
             reserved_agent_id: Set(agent_id.clone()),
-            agent_name: Set(agent_name.to_owned()),
+            agent_name: Set(agent_name),
             agent_public_key: Set(public_key),
             status: Set(RegistrationStatus::PREPARED.to_owned()),
             created_at: Set(now),
@@ -231,7 +271,8 @@ impl ServerDatabase {
             ));
         }
 
-        if RegistrationStatus::parse(&registration.status) == Some(RegistrationStatus::Committed) {
+        let registration_status = RegistrationStatus::parse(&registration.status);
+        if registration_status == Some(RegistrationStatus::Committed) {
             let agent_id = registration.agent_id.as_deref().ok_or_else(|| {
                 DatabaseError::InvalidAgentRegistration(
                     "committed registration has no Agent ID".to_owned(),
@@ -253,7 +294,7 @@ impl ServerDatabase {
             transaction.commit().await?;
             return Ok(());
         }
-        if RegistrationStatus::parse(&registration.status) != Some(RegistrationStatus::Prepared)
+        if registration_status != Some(RegistrationStatus::Prepared)
             || registration
                 .expires_at
                 .is_some_and(|expires_at| expires_at <= now)
@@ -404,7 +445,7 @@ impl RegistrationStatus {
     }
 }
 
-fn unix_timestamp_micros() -> Result<i64, DatabaseError> {
+pub(super) fn unix_timestamp_micros() -> Result<i64, DatabaseError> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
     duration.as_micros().try_into().map_err(|_| {
         DatabaseError::InvalidAgentRegistration("Unix timestamp does not fit in i64".to_owned())
@@ -472,6 +513,7 @@ mod tests {
         registration_token::ActiveModel {
             token_id: Set(token_id.clone()),
             psk: Set(vec![public_key_byte; 32]),
+            display_name: Set(Some(format!("Agent {suffix}"))),
             status: Set("active".to_owned()),
             created_at: Set(1),
             updated_at: Set(1),
