@@ -32,6 +32,8 @@ pub enum NoiseError {
     Crypto(snow::Error),
     /// Noise 解密成功，但内层字节不是合法的 `SecureMessage`。
     Encode(prost::DecodeError),
+    /// 加密消息超过当前传输层允许的安全上限。
+    MessageTooLarge,
     /// 操作系统安全随机源不可用。
     Random(getrandom::Error),
 }
@@ -51,6 +53,7 @@ impl fmt::Display for NoiseError {
             Self::RotationIdMismatch => "key rotation ID does not match",
             Self::Crypto(_) => "Noise cryptographic operation failed",
             Self::Encode(_) => "encrypted protobuf message is invalid",
+            Self::MessageTooLarge => "encrypted protobuf message is too large",
             Self::Random(_) => "secure random generation failed",
         })
     }

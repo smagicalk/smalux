@@ -12,6 +12,97 @@ struct JobUpdatePlan {
 }
 
 impl SchedulerActor {
+    /// 在单个 Actor 临界区内预检并应用新增、更新、删除计划。
+    pub(super) fn reconcile_jobs(
+        &mut self,
+        plan: SchedulerReconcilePlan,
+    ) -> Result<Vec<JobSnapshot>, SchedulerError> {
+        let target_ids = plan
+            .updates
+            .iter()
+            .map(|update| update.job_id)
+            .chain(plan.additions.iter().map(|addition| addition.job_id))
+            .collect::<Vec<_>>();
+        let deleted = plan
+            .deletions
+            .iter()
+            .map(|(job_id, _)| *job_id)
+            .collect::<std::collections::HashSet<_>>();
+        if deleted.len() != plan.deletions.len() {
+            return Err(SchedulerError::Actor(
+                "duplicate Job deletion in reconcile plan".to_owned(),
+            ));
+        }
+        let mut touched = deleted.clone();
+        for update in &plan.updates {
+            if !touched.insert(update.job_id) {
+                return Err(SchedulerError::Actor(
+                    "Job appears more than once in reconcile plan".to_owned(),
+                ));
+            }
+            self.plan_job_update(update.job_id, update.expected_version, &update.patch)?;
+        }
+        for addition in &plan.additions {
+            if !touched.insert(addition.job_id) || self.jobs.contains_key(&addition.job_id) {
+                return Err(SchedulerError::JobAlreadyExists(addition.job_id));
+            }
+            validate_trigger(&addition.trigger, &addition.options, &self.config)?;
+            validate_task_cancellation_mode(&addition.trigger, addition.task.cancellation_mode())?;
+        }
+        let final_count = self
+            .jobs
+            .len()
+            .saturating_sub(plan.deletions.len())
+            .saturating_add(plan.additions.len());
+        if final_count > self.config.max_jobs {
+            return Err(SchedulerError::MaximumJobsReached(self.config.max_jobs));
+        }
+        for (job_id, expected_version) in &plan.deletions {
+            let job = self
+                .jobs
+                .get(job_id)
+                .ok_or(SchedulerError::JobNotFound(*job_id))?;
+            if job.version != *expected_version {
+                return Err(SchedulerError::VersionConflict {
+                    job_id: *job_id,
+                    expected: *expected_version,
+                    actual: job.version,
+                });
+            }
+        }
+
+        // 预检完成后，所有操作均在同一个 Actor 调用内执行，外部命令无法插入。
+        for update in plan.updates {
+            let snapshot = self.update_job(update.job_id, update.expected_version, update.patch)?;
+            if update.enabled && !matches!(snapshot.state, JobState::Enabled) {
+                self.enable_job(snapshot.id, snapshot.version)?;
+            } else if !update.enabled && matches!(snapshot.state, JobState::Enabled) {
+                self.disable_job(
+                    snapshot.id,
+                    snapshot.version,
+                    "disabled by authoritative remote Job snapshot".to_owned(),
+                )?;
+            }
+        }
+        for (job_id, expected_version) in plan.deletions {
+            self.delete_job(job_id, expected_version, true)?;
+        }
+        for addition in plan.additions {
+            self.add_job(
+                Some(addition.job_id),
+                1,
+                addition.enabled,
+                addition.trigger,
+                addition.task,
+                addition.options,
+            )?;
+        }
+        Ok(target_ids
+            .into_iter()
+            .filter_map(|job_id| self.jobs.get(&job_id).map(|job| self.snapshot(job)))
+            .collect())
+    }
+
     /// 校验 Job 数量、Trigger 和策略，生成唯一 JobId 并安排首次运行。
     pub(super) fn add_job(
         &mut self,

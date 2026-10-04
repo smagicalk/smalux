@@ -31,6 +31,8 @@ use crate::{
 ///
 /// “编译”只表示单个定义已经完成解析和类型转换，不会修改 Scheduler。
 pub(super) struct CompiledJob {
+    /// 已完成校验的原始协议定义，用于 ReplaceAll 的精确内容比较。
+    pub(super) definition: proto::JobDefinition,
     /// Server 分配的稳定 Job UUID，同时也是 Scheduler 的主键。
     pub(super) id: JobId,
     /// Server 维护的单 Job 业务版本，随 [`TaskReport`](proto::TaskReport) 上报。
@@ -111,12 +113,9 @@ impl TaskFactory {
                     "plugin_version is required"
                 );
                 anyhow::ensure!(!config.task_kind.is_empty(), "plugin task_kind is required");
-                anyhow::ensure!(
-                    !self
-                        .plugins
-                        .is_paused(&config.plugin_id, &config.plugin_version),
-                    "Plus plugin is paused after repeated Worker failures"
-                );
+                self.plugins
+                    .validate_task_config(&config)
+                    .map_err(|error| anyhow::anyhow!(error))?;
                 Ok(self.bind(
                     PluginReportingTask::new(self.plugins.clone(), config),
                     job_revision,
@@ -171,6 +170,7 @@ pub(super) fn compile_job(
     debug_assert_eq!(task.kind(), stable_task_kind);
     // 到这里所有协议值都已变成 Scheduler 可接受的强类型。
     Ok(CompiledJob {
+        definition: definition.clone(),
         id,
         revision: definition.revision,
         enabled: definition.enabled,

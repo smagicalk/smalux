@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package smalux.agent.v1;
+
+// Agent 在认证连接建立后发送的运行状态摘要。
+//
+// 摘要只用于判断 Server 是否需要重新下发权威快照，不替代完整的目录、runtime 或
+// capability 消息。摘要缺失、校验失败或摘要不一致时，Server 必须回退到完整同步。
+message AgentReconcileSummary {
+  // Agent 进程实例 UUID，固定 16 字节；同一进程重连保持不变，重启后重新生成。
+  bytes instance_id = 1;
+  // Agent 当前已经成功应用的远程 Job 目录 revision；尚未应用时为零。
+  uint64 catalog_revision = 2;
+  // 规范化 ReplaceAllJobs 编码的 BLAKE2s-256 摘要；目录 revision 为零时应为空。
+  bytes catalog_digest = 3;
+  // Agent 当前已经成功应用的 Plus runtime revision；尚未应用时为零。
+  uint64 runtime_revision = 4;
+  // 规范化 PluginRuntimeSnapshot 编码的 BLAKE2s-256 摘要；revision 为零时应为空。
+  bytes runtime_digest = 5;
+}

@@ -9,8 +9,9 @@ use tracing::{debug, info, warn};
 use crate::{
     agent::v1::{
         AgentCapabilitySync, AgentJobPolicySync, AgentKeyRotationAccepted, AgentPluginSync,
-        DiagnosticMessage, JobCommand, JobCommandResult, KeyRotationMessage, SecureMessage,
-        ServerKeyAcknowledgement, TaskReport, key_rotation_message, secure_message,
+        AgentReconcileSummary, DiagnosticMessage, JobCommand, JobCommandResult, JobEvent,
+        KeyRotationMessage, SecureMessage, ServerKeyAcknowledgement, TaskReport,
+        key_rotation_message, secure_message,
     },
     noise::{AgentRotationPrepared, KeyId, RotationId, ServerRotationPrepared},
 };
@@ -97,6 +98,25 @@ impl SessionHandle {
     pub async fn send_task_report(&self, report: TaskReport) -> Result<(), TransportError> {
         self.send(SecureMessage {
             body: Some(secure_message::Body::TaskReport(Box::new(report))),
+        })
+        .await
+    }
+
+    /// 发送一条 Agent Scheduler 生命周期事件。
+    pub async fn send_job_event(&self, event: JobEvent) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::JobEvent(event)),
+        })
+        .await
+    }
+
+    /// 通过 Driver 发送 Agent 远程状态摘要。
+    pub async fn send_reconcile_summary(
+        &self,
+        summary: AgentReconcileSummary,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::ReconcileSummary(summary)),
         })
         .await
     }

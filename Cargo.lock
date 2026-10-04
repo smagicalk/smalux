@@ -3077,6 +3077,15 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
@@ -3470,6 +3479,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b80ea363c31af2de2b92e3c07ed1156628f7838c4afb4df75ee78a37fedbd1"
+dependencies = [
+ "base64",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde-value",
 ]
 
 [[package]]
@@ -4248,7 +4270,7 @@ dependencies = [
  "ipnetwork",
  "jiff",
  "mac_address",
- "ordered-float",
+ "ordered-float 4.6.0",
  "pgvector",
  "rust_decimal",
  "sea-query-derive",
@@ -4279,7 +4301,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39b2f86e9b1518cb343febd75fb24074b05e3f34e53d2f7cdd212a203f59393"
 dependencies = [
- "ordered-float",
+ "ordered-float 4.6.0",
  "serde",
 ]
 
@@ -4371,6 +4393,16 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float 2.10.1",
+ "serde",
 ]
 
 [[package]]
@@ -4700,6 +4732,7 @@ name = "smalux-plus-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "prost",
  "prost-types",
  "serde",
@@ -4766,6 +4799,7 @@ dependencies = [
  "humantime",
  "mime_guess",
  "prost",
+ "prost-reflect",
  "prost-types",
  "rust-embed",
  "sea-orm",

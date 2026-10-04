@@ -15,9 +15,9 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     agent::v1::{
         AgentCapabilitySync, AgentJobPolicySync, AgentKeyRotationAccepted, AgentPluginSync,
-        JobCommand, JobCommandResult, KeyRotationMessage, Ping, ProtocolFrame, RekeyRequest,
-        RekeyRequired, SecureMessage, ServerKeyAcknowledgement, SessionControl, TaskReport,
-        key_rotation_message, secure_message, session_control,
+        AgentReconcileSummary, JobCommand, JobCommandResult, JobEvent, KeyRotationMessage, Ping,
+        ProtocolFrame, RekeyRequest, RekeyRequired, SecureMessage, ServerKeyAcknowledgement,
+        SessionControl, TaskReport, key_rotation_message, secure_message, session_control,
     },
     noise::{AgentRotationPrepared, NoiseError, RotationId, SecureSession, ServerRotationPrepared},
 };
@@ -74,6 +74,8 @@ pub struct TonicNoiseSession {
     heartbeat: HeartbeatPolicy,
     /// 当前 rekey 参数。
     rekey: RekeyPolicy,
+    /// 等待同步 rekey ACK 的最长时间。
+    rekey_timeout: Duration,
     /// rekey 等待 ACK 时提前到达的业务消息，完成换钥后按原顺序返回。
     buffered_messages: VecDeque<SecureMessage>,
 }
@@ -127,6 +129,7 @@ impl TonicNoiseSession {
             heartbeat_stats: HeartbeatStats::default(),
             heartbeat: HeartbeatPolicy::default(),
             rekey: RekeyPolicy::default(),
+            rekey_timeout: Duration::from_secs(5),
             buffered_messages: VecDeque::new(),
         }
     }
@@ -141,6 +144,11 @@ impl TonicNoiseSession {
     pub fn set_rekey_policy(&mut self, policy: RekeyPolicy) {
         debug!(?policy, "updated Noise session rekey policy");
         self.rekey = policy;
+    }
+
+    /// 设置同步 rekey 等待 ACK 的超时；通常与建连握手超时保持一致。
+    pub fn set_rekey_timeout(&mut self, timeout: Duration) {
+        self.rekey_timeout = timeout;
     }
 
     /// 返回当前心跳策略副本，便于状态展示或诊断。
@@ -233,6 +241,27 @@ impl TonicNoiseSession {
     pub async fn send_task_report(&mut self, report: TaskReport) -> Result<(), TransportError> {
         self.send(SecureMessage {
             body: Some(secure_message::Body::TaskReport(Box::new(report))),
+        })
+        .await
+    }
+
+    /// 发送一条 Agent Scheduler 生命周期事件。
+    pub async fn send_job_event(&mut self, event: JobEvent) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::JobEvent(event)),
+        })
+        .await
+    }
+
+    /// 发送 Agent 当前远程目录和 Plus runtime 的状态摘要。
+    ///
+    /// 摘要不包含任务参数或 Secret；Server 只据此决定是否需要重发完整快照。
+    pub async fn send_reconcile_summary(
+        &mut self,
+        summary: AgentReconcileSummary,
+    ) -> Result<(), TransportError> {
+        self.send(SecureMessage {
+            body: Some(secure_message::Body::ReconcileSummary(summary)),
         })
         .await
     }
@@ -484,10 +513,9 @@ impl TonicNoiseSession {
         })))
         .await?;
         loop {
-            let frame = self
-                .inbound
-                .message()
-                .await?
+            let frame = tokio::time::timeout(self.rekey_timeout, self.inbound.message())
+                .await
+                .map_err(|_| TransportError::Timeout("waiting for Noise rekey acknowledgement"))??
                 .ok_or(TransportError::Closed)?;
             let message = self.secure.decrypt(frame)?;
             match message.body {
@@ -644,9 +672,11 @@ fn secure_message_kind(message: &SecureMessage) -> &'static str {
         Some(secure_message::Body::JobCommand(_)) => "job_command",
         Some(secure_message::Body::JobCommandResult(_)) => "job_command_result",
         Some(secure_message::Body::TaskReport(_)) => "task_report",
+        Some(secure_message::Body::JobEvent(_)) => "job_event",
         Some(secure_message::Body::AgentJobPolicy(_)) => "agent_job_policy",
         Some(secure_message::Body::AgentCapability(_)) => "agent_capability",
         Some(secure_message::Body::AgentPlugin(_)) => "agent_plugin",
+        Some(secure_message::Body::ReconcileSummary(_)) => "reconcile_summary",
         Some(secure_message::Body::SessionControl(_)) => "session_control",
         Some(secure_message::Body::Error(_)) => "error",
         None => "empty",

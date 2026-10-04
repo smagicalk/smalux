@@ -48,10 +48,11 @@ plugins/
 
 ## 参数 Schema
 
-`schema.pb` 是 `PluginSchemaBundle` 的 Protobuf 编码，由两部分组成：
+`schema.pb` 是 `PluginSchemaBundle` 的 Protobuf 编码，由三部分组成：
 
 - `FileDescriptorSet`：参数与结果消息的真实 Protobuf 类型；
 - 声明式 UI 提示：字段名称、控件、默认值、单位、静态选项和基础验证规则。
+- `PluginRuntimeSchema`：Worker 启动时的共享运行时配置消息；没有共享参数也必须声明一个空消息。
 
 第一版控件包括 `AUTO`、`TEXT`、`TEXTAREA`、`NUMBER`、`SELECT`、`COMBOBOX`、
 `TOGGLE` 和 `PASSWORD`。`SELECT` 只能选择静态选项；`COMBOBOX` 可以选择预设值，也可以
@@ -62,13 +63,16 @@ HTML 或 React 页面。
 Agent 不解释该字节，只将其交给对应 Worker：
 
 ```text
-Server 表单/配置
+Server 表单/配置 JSON
   -> 根据 FileDescriptorSet 编码 task_config
   -> PluginTaskConfig
   -> Agent PluginManager
   -> Worker ExecuteTask.config
   -> PlusTask::execute
 ```
+
+共享 runtime 配置走相同机制：Server 使用已保存的 schema hash 校验插件 ID/版本，再把 JSON 动态
+编码为 `PluginRuntimeConfig.config`。Server 只保存并转发 bytes，不编译、加载或执行插件 Rust 类型。
 
 ### Echo 示例参数
 
@@ -135,12 +139,16 @@ Agent 会周期检查 Worker 子进程和 stdout reader。异常退出会按本�
 进行后台恢复，默认在 `10m` 内失败 `3` 次后进入 `paused`，停止该 Worker，并发送
 `AgentPluginSync.pause_notice`。配置替换和主动 Shutdown 不计入崩溃次数。
 
-Worker 的 Hello、Initialize 和 Execute 都受 Agent 本地超时保护；Worker 不响应时 Agent 会发送
-Cancel，仍不退出则回收子进程。配置替换会先等待优雅 Shutdown，超时后才强制终止。
+Worker 的 Hello、Initialize 和 Execute 都受 Agent 本地超时保护；每个 Execute 只返回一个最终 Result 或 Error，不使用 Started、Pong 或独立 Cancelled 中间帧。Worker 不响应时 Agent 会发送
+Cancel，Worker 在任务真正结束后返回 `TaskResult(Cancelled)`；仍不退出则回收子进程。配置替换会先等待优雅 Shutdown，超时后才强制终止。插件 Task panic 会转换成带 request_id 的失败结果，结果帧写失败会尽量返回小型 `ErrorResponse`。
 
-Initialize 会把共享 `runtime_config` 交给每个 `PlusTask::initialize`。所有 Task 初始化成功后
+插件返回 `InvalidConfig` 时，Worker 使用 IPC v2 的独立状态上报，Agent 将其映射为永久 Task 错误并停用对应 Job，不会使用同一份无效参数重试。
+
+Worker 的 stdin EOF 视为父进程断开，会取消活动任务、等待其结束并调用每个 Task 的 `shutdown`，避免管道正常关闭时跳过插件清理。
+
+Initialize 会把共享 `runtime_config` 和 `runtime_config_version` 交给每个 `PlusTask::initialize`。所有 Task 初始化成功后
 Worker 才发送 Ready；Agent 下发的并发上限与插件自身上限取较小值，实际并发会在 Worker Ready
-中确认。Worker 在 Initialize 前收到 Execute 或重复 Initialize 会拒绝协议。
+中确认。当前 Worker IPC 主版本为 `2`；旧协议插件会在发现阶段被拒绝。Worker 在 Initialize 前收到 Execute 或重复 Initialize 会拒绝协议。
 
 Server 按 `agent_id + plugin_id + version` 保存暂停状态，只从该 Agent 的 Job 快照中移除对应
 插件任务，其他 Agent 仍可使用同一插件。暂停通知得到 `pause_acknowledgement` 后不再重复发送；
@@ -186,7 +194,7 @@ shell 命令或任意路径直接放进 Job Proto。
 可选 Plus 能力可使用 Cargo feature 或不同 Agent 发行物控制，但协议字段不能因 feature 改变编号。
 Server 必须依据 Agent 上报的 capability 下发任务；未启用的 Agent 返回明确不支持错误。
 
-当前实现固定使用独立 Worker 子进程，不把第三方动态库加载进 Agent 地址空间。Echo 的
+当前实现只支持独立 Worker 子进程，不存在 DLL、SO 或 dylib 的进程内加载路径。Echo 的
 `build.rs` 从 `proto/echo.proto` 同时生成 Rust 类型和临时 Schema；仓库中的 `schema.pb` 是发布
 侧车文件，测试会检查它与当前 `.proto` 生成结果完全一致，Schema 过期会直接导致测试失败。
 

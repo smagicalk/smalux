@@ -8,8 +8,8 @@ use std::{sync::Arc, time::Duration};
 
 use smalux_protocol::{
     agent::v1::{
-        AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, HealthResponse, JobCommandResult,
-        TaskReport,
+        AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, AgentReconcileSummary,
+        HealthResponse, JobCommandResult, JobEvent, TaskReport,
     },
     noise::NoiseError,
     tonic_transport::{HeartbeatStats, SessionEvent, TransportError},
@@ -97,6 +97,12 @@ impl SmaluxClientHandle {
             .await
     }
 
+    /// 通过当前已认证会话上报一次 Scheduler 生命周期事件。
+    pub async fn send_job_event(&self, event: JobEvent) -> Result<(), SmaluxClientError> {
+        self.request(|completed| SupervisorCommand::SendJobEvent { event, completed })
+            .await
+    }
+
     /// 返回 Server 对上一条 Job 命令的结构化执行结果。
     pub async fn send_job_command_result(
         &self,
@@ -133,6 +139,15 @@ impl SmaluxClientHandle {
         message: AgentPluginSync,
     ) -> Result<(), SmaluxClientError> {
         self.request(|completed| SupervisorCommand::SendAgentPlugin { message, completed })
+            .await
+    }
+
+    /// 通过当前认证会话发送目录和 Plus runtime 对账摘要。
+    pub async fn send_reconcile_summary(
+        &self,
+        summary: AgentReconcileSummary,
+    ) -> Result<(), SmaluxClientError> {
+        self.request(|completed| SupervisorCommand::SendReconcileSummary { summary, completed })
             .await
     }
 
@@ -262,6 +277,10 @@ impl SmaluxClient {
 
     pub async fn send_task_report(&self, report: TaskReport) -> Result<(), SmaluxClientError> {
         self.handle()?.send_task_report(report).await
+    }
+
+    pub async fn send_job_event(&self, event: JobEvent) -> Result<(), SmaluxClientError> {
+        self.handle()?.send_job_event(event).await
     }
 
     pub async fn send_job_command_result(

@@ -17,7 +17,9 @@
 - `/api/v1/grpc` 下的 `AgentTransport` gRPC unary 和长期双向流；
 - 基于 Noise XXpsk3 的首次注册、pending/commit/committed 状态和 IK 后续授权；
 - 数据库持久化的 Server keyring、Agent、注册 Token 和注册事务；
-- Agent Job 策略的会话内 Query、Snapshot、ACK 和 Job Provider 扩展边界；
+- 每 Agent 的数据库权威 Job catalog、在线完整对账、命令结果关联和本地策略/能力/插件过滤；
+- `TaskReport` 幂等持久化，以及失败、超时、重试、取消等 `JobEvent` 追加历史；
+- Plus Schema、inventory、runtime 配置持久化；Server 根据 `schema.pb` 动态把 JSON 编码为插件私有 Protobuf bytes；
 - Agent 会话数、注册会话数、gRPC 消息大小限制；
 - 通过本地 Named Pipe/Unix Socket 提供的 Server CLI 管理面；
 - 注册 Token 签发、查询、吊销，以及 Agent、实时 Session 和 keyring 状态管理；
@@ -27,7 +29,7 @@
 仍未完成的应用能力包括：
 
 - 面向 Web 页面的管理 HTTP API、用户登录和操作审计；
-- Job 管理 API、TaskReport 持久化和结果查询；
+- 面向 Web 页面的 Job 编辑 API、任务模板和批量 Agent 分配；
 - Web 管理端和租户/用户授权；
 - Server 进程自身的 TLS listener（生产环境建议由 Nginx/Cloudflare 终止 TLS）；
 - 多实例之间的注册表、Token 和业务数据一致性策略。
@@ -156,6 +158,19 @@ cargo run -p smalux-server -- agent revoke <AGENT_ID> --yes
 cargo run -p smalux-server -- session list --agent-id <AGENT_ID>
 cargo run -p smalux-server -- session disconnect <SESSION_ID> --yes
 
+# 每个文件是一条编码后的 JobDefinition；replace 后在线 Agent 立即完整对账
+cargo run -p smalux-server -- job replace <AGENT_ID> --definition cpu-job.pb
+cargo run -p smalux-server -- job list <AGENT_ID>
+cargo run -p smalux-server -- job clear <AGENT_ID> --yes
+
+# 插件 runtime JSON 由 Server 依据 schema.pb 动态编码；不需要安装插件 crate
+cargo run -p smalux-server -- plugin runtime-replace <AGENT_ID> --file echo-runtime.json
+cargo run -p smalux-server -- plugin runtime-list <AGENT_ID>
+
+# 已持久化的成功数据和异常生命周期事件
+cargo run -p smalux-server -- report --agent-id <AGENT_ID>
+cargo run -p smalux-server -- event --agent-id <AGENT_ID>
+
 # 使用现有优雅关闭流程停止 Server
 cargo run -p smalux-server -- shutdown --yes
 ```
@@ -282,13 +297,24 @@ Agent 不在注册请求中上报名称，因此不能自行覆盖 Server 的管
 ## Agent Job 策略
 
 远程 Job 黑名单由 Agent 本地持久化并通过 Noise 密文同步。Server 在每次注册或 IK 授权
-成功后发送 `AgentJobPolicyQuery`，接受 Agent 主动或应答发送的完整快照并返回 revision ACK。
-Server 只在当前会话保存最新快照，不为它创建数据库表；断线后的新会话会重新查询。
+成功后发送 `AgentJobPolicyQuery`，接受 Agent 主动或应答发送的完整快照并返回 revision ACK；Server
+不为策略建立数据库持久化副本。能力和插件 inventory 会写入数据库，用于管理查询；当前会话仍使用新鲜快照做下发判断。
 
-业务循环获得快照前不会主动下发 Job。每次接受新 revision 后调用
-`AgentJobCatalogProvider`，传入 `agent_id` 和当前策略；Provider 可以返回权威
-`ReplaceAllJobs`。当前默认 Provider 只记录日志并返回 `None`，因此本阶段完成策略闭环，
-但不提供正式 Job 数据来源。后续接入数据库或管理服务时只需替换 Provider。
+业务循环获得策略、能力、插件 inventory 与 runtime ACK 前不会主动下发 Job。完成后，数据库
+`AgentJobCatalogProvider` 读取该 Agent 的权威完整目录，过滤本地黑名单、能力、插件 inventory、
+已 ACK runtime 和 Worker 暂停状态，再发送 `ReplaceAllJobs`。本地 CLI 或未来页面替换目录/runtime
+后会唤醒该 Agent 的在线 Session；离线 Agent 在下次连接获得最新完整快照。
+
+目录和 Plus runtime 使用独立的 Session 通知通道。修改普通 Job 不会重启插件 Worker；runtime
+变更则必须先等待 Agent 的 runtime ACK，再重新过滤和下发插件 Job。控制面写入支持可选
+`expected_revision`：传入时执行数据库 CAS，冲突返回 `conflict` 且不会删除旧目录；省略时保留
+旧 CLI 的无条件替换行为，但仍由当前 Server 进程写锁串行化。
+
+Agent 重连后会先发送 `AgentReconcileSummary`。Server 比较目录/runtime revision 和 BLAKE2s-256
+摘要，匹配时跳过对应快照；摘要缺失、摘要不一致或检测到新的 Agent 进程实例时执行完整同步。
+Job catalog 还保留 `agent_job_versions` 历史定义，用于校验延迟到达的 TaskReport/JobEvent。
+TaskReport 按执行身份幂等保存，JobEvent 按 `agent_id + instance_id + sequence` 幂等保存，并
+记录序号缺口和重复 payload 冲突。
 
 策略 ACK 仅表示 Server 接收了该会话的快照，不表示 Provider 已经重新下发 Job。完整线序、
 revision 规则和 Agent 本地停用语义见

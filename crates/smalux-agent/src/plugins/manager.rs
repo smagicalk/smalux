@@ -11,7 +11,9 @@ use std::{
 
 use futures_util::future::join_all;
 use smalux_plus_core::{AgentContext, protocol::AgentContextMessage};
-use smalux_protocol::agent::v1::{PluginPauseNotice, PluginRuntimeConfig, PluginRuntimeSnapshot};
+use smalux_protocol::agent::v1::{
+    PluginPauseNotice, PluginRuntimeConfig, PluginRuntimeSnapshot, PluginTaskConfig,
+};
 
 use super::worker::WorkerStartOptions;
 use super::{
@@ -72,6 +74,7 @@ impl WorkerState {
 struct ManagedWorker {
     worker: Option<Arc<PluginWorkerClient>>,
     config: Vec<u8>,
+    runtime_config_version: u32,
     requested_concurrency: u32,
     effective_concurrency: u32,
     config_revision: u64,
@@ -294,9 +297,35 @@ impl PluginManager {
         }
     }
 
+    /// 停止当前会话创建的全部 Worker，并等待子进程退出。
+    ///
+    /// Agent 退出前调用本方法，确保 Scheduler 已经停止产生新任务后，插件进程也能
+    /// 收到 Shutdown 并在超时后被回收。方法会清空活跃映射，因此重复调用是安全的。
+    pub async fn shutdown_all(&self) {
+        let workers = {
+            let mut active = self.workers.write().expect("Plugin Worker lock poisoned");
+            active
+                .drain()
+                .filter_map(|(_, managed)| managed.worker)
+                .collect::<Vec<_>>()
+        };
+        if workers.is_empty() {
+            tracing::debug!("no Plus Worker needs shutdown");
+            return;
+        }
+        tracing::info!(workers = workers.len(), "shutting down Plus Workers");
+        join_all(workers.into_iter().map(|worker| async move {
+            worker.shutdown().await;
+        }))
+        .await;
+    }
+
     /// 启动快照中的 Worker；全部成功才替换当前活跃映射。
     pub async fn apply_snapshot(&self, snapshot: &PluginRuntimeSnapshot) -> Result<(), String> {
         let mut workers = HashMap::new();
+        if snapshot.revision == 0 {
+            return Err("Plus runtime snapshot revision must be greater than zero".to_owned());
+        }
         if snapshot.plugins.len() > self.limits.max_workers {
             return Err(format!(
                 "Plus Worker count exceeds local limit {}",
@@ -317,14 +346,26 @@ impl PluginManager {
                     key.0, key.1
                 ));
             }
+            if config.schema_version == 0 {
+                return Err(format!(
+                    "Plus plugin {} {} runtime schema_version must be greater than zero",
+                    key.0, key.1
+                ));
+            }
+            if config.requested_concurrency == 0 {
+                return Err(format!(
+                    "Plus plugin {} {} requested_concurrency must be greater than zero",
+                    key.0, key.1
+                ));
+            }
             let concurrency = config
                 .requested_concurrency
-                .max(1)
                 .min(self.limits.max_concurrency);
             if let Some(existing) = current.get(&key)
                 && existing.state == WorkerState::Running
                 && existing.worker.is_some()
                 && existing.config == config.config
+                && existing.runtime_config_version == config.schema_version
                 && existing.requested_concurrency == concurrency
             {
                 workers.insert(
@@ -332,6 +373,7 @@ impl PluginManager {
                     ManagedWorker {
                         worker: existing.worker.clone(),
                         config: existing.config.clone(),
+                        runtime_config_version: config.schema_version,
                         requested_concurrency: concurrency,
                         effective_concurrency: existing.effective_concurrency,
                         config_revision: snapshot.revision,
@@ -369,6 +411,7 @@ impl PluginManager {
                 ManagedWorker {
                     worker: Some(worker),
                     config: config.config.clone(),
+                    runtime_config_version: config.schema_version,
                     requested_concurrency: concurrency,
                     effective_concurrency,
                     config_revision: snapshot.revision,
@@ -421,11 +464,12 @@ impl PluginManager {
         let plugin = self
             .find_installed(config)
             .map_err(PluginWorkerError::TaskFailed)?;
-        PluginWorkerClient::start(
+        PluginWorkerClient::spawn_and_initialize(
             plugin,
             WorkerStartOptions {
                 config_revision: revision,
                 runtime_config: config.config.clone(),
+                runtime_config_version: config.schema_version,
                 max_concurrency: concurrency,
                 agent_context: self.agent_context_for_plugin(&config.plugin_id, &config.version),
                 task_timeout: self.limits.task_timeout,
@@ -450,7 +494,7 @@ impl PluginManager {
                 PluginRuntimeConfig {
                     plugin_id: key.0.clone(),
                     version: key.1.clone(),
-                    schema_version: 0,
+                    schema_version: worker.runtime_config_version,
                     config: worker.config.clone(),
                     requested_concurrency: worker.requested_concurrency,
                 },
@@ -613,6 +657,75 @@ impl PluginManager {
             .await
     }
 
+    /// 在编译远程 Job 时验证插件、任务版本和当前 Worker 状态。
+    ///
+    /// 运行时快照是唯一的 Worker 启动入口；只检查字符串会让一个未安装或未初始化的
+    /// 插件进入 Scheduler，直到真正执行时才失败。因此这里提前校验完整能力链。
+    pub(crate) fn validate_task_config(&self, config: &PluginTaskConfig) -> Result<(), String> {
+        if config.plugin_id.is_empty()
+            || config.plugin_version.is_empty()
+            || config.task_kind.is_empty()
+            || config.schema_version == 0
+        {
+            return Err("plugin task identity and schema_version are required".to_owned());
+        }
+        if self.is_paused(&config.plugin_id, &config.plugin_version) {
+            return Err("Plus plugin is paused after repeated Worker failures".to_owned());
+        }
+        let plugin = self
+            .catalog
+            .plugins()
+            .find(|plugin| {
+                plugin.manifest.plugin_id == config.plugin_id
+                    && plugin.manifest.version.to_string() == config.plugin_version
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Plus plugin {} {} is not installed",
+                    config.plugin_id, config.plugin_version
+                )
+            })?;
+        if !plugin.manifest.supports_task(&config.task_kind) {
+            return Err(format!(
+                "Plus plugin {} {} does not declare task {}",
+                config.plugin_id, config.plugin_version, config.task_kind
+            ));
+        }
+        let schema = plugin
+            .schema()
+            .map_err(|error| format!("failed to load Plus plugin schema: {error}"))?;
+        let task_schema = schema
+            .tasks
+            .iter()
+            .find(|task| task.task_kind == config.task_kind)
+            .ok_or_else(|| {
+                format!(
+                    "Plus plugin schema does not contain task {}",
+                    config.task_kind
+                )
+            })?;
+        if task_schema.schema_version != config.schema_version {
+            return Err(format!(
+                "Plus task {} schema version {} is not supported (expected {})",
+                config.task_kind, config.schema_version, task_schema.schema_version
+            ));
+        }
+        let key = (config.plugin_id.clone(), config.plugin_version.clone());
+        let active = self
+            .workers
+            .read()
+            .expect("Plugin Worker lock poisoned")
+            .get(&key)
+            .is_some_and(|worker| worker.state == WorkerState::Running && worker.worker.is_some());
+        if !active {
+            return Err(format!(
+                "Plus plugin {} {} Worker is not active",
+                config.plugin_id, config.plugin_version
+            ));
+        }
+        Ok(())
+    }
+
     fn find_installed(&self, config: &PluginRuntimeConfig) -> Result<&InstalledPlugin, String> {
         self.catalog
             .plugins()
@@ -639,6 +752,7 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ManagedWorker, PluginManager, WorkerState};
+    use smalux_protocol::agent::v1::PluginTaskConfig;
     use std::collections::VecDeque;
 
     fn manager_with_worker() -> (PluginManager, (String, String)) {
@@ -649,6 +763,7 @@ mod tests {
             ManagedWorker {
                 worker: None,
                 config: Vec::new(),
+                runtime_config_version: 1,
                 requested_concurrency: 1,
                 effective_concurrency: 1,
                 config_revision: 7,
@@ -753,5 +868,85 @@ mod tests {
             .clone();
         assert_eq!(worker.state, WorkerState::Running);
         assert!(worker.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_is_idempotent_and_clears_active_workers() {
+        let (manager, key) = manager_with_worker();
+        assert!(
+            manager
+                .workers
+                .read()
+                .expect("worker lock")
+                .contains_key(&key)
+        );
+        manager.shutdown_all().await;
+        assert!(manager.workers.read().expect("worker lock").is_empty());
+        manager.shutdown_all().await;
+    }
+
+    #[test]
+    fn paused_plugin_is_rejected_before_worker_or_catalog_lookup() {
+        let (manager, key) = manager_with_worker();
+        manager
+            .workers
+            .write()
+            .expect("worker lock")
+            .get_mut(&key)
+            .expect("test worker")
+            .state = WorkerState::Paused;
+
+        let error = manager
+            .validate_task_config(&PluginTaskConfig {
+                plugin_id: key.0,
+                plugin_version: key.1,
+                task_kind: "smalux.plus.test.v1".to_owned(),
+                schema_version: 1,
+                task_config: Vec::new(),
+            })
+            .expect_err("paused plugin must be rejected");
+        assert!(error.contains("paused"));
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_rejects_zero_revision_schema_and_concurrency() {
+        let manager = PluginManager::empty();
+        assert!(
+            manager
+                .apply_snapshot(&smalux_protocol::agent::v1::PluginRuntimeSnapshot {
+                    revision: 0,
+                    plugins: Vec::new(),
+                })
+                .await
+                .unwrap_err()
+                .contains("revision")
+        );
+
+        let runtime = |schema_version, requested_concurrency| {
+            smalux_protocol::agent::v1::PluginRuntimeSnapshot {
+                revision: 1,
+                plugins: vec![smalux_protocol::agent::v1::PluginRuntimeConfig {
+                    plugin_id: "smalux.plus.test".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    schema_version,
+                    config: Vec::new(),
+                    requested_concurrency,
+                }],
+            }
+        };
+        assert!(
+            manager
+                .apply_snapshot(&runtime(0, 1))
+                .await
+                .unwrap_err()
+                .contains("schema_version")
+        );
+        assert!(
+            manager
+                .apply_snapshot(&runtime(1, 0))
+                .await
+                .unwrap_err()
+                .contains("requested_concurrency")
+        );
     }
 }

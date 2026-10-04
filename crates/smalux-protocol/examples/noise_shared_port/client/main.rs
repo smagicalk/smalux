@@ -170,7 +170,7 @@ async fn open_ik_session(
     let mut client = AgentProtocolClient::new(endpoint);
     client.set_grpc_prefix(GRPC_PREFIX);
     let session = client
-        .connect(&identity.noise, identity.server_public_key)
+        .connect_ik(&identity.noise, identity.server_public_key)
         .await?;
     println!("[client][ik] authenticated Server and Agent");
     info!(

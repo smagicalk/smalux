@@ -96,7 +96,8 @@ Task::NewType(config)   -> NewTypeTask
 版本、排序后的稳定 Task kind 和 Probe 协议；Server 也可以通过 `AgentCapabilityQuery` 要求重发。
 新增内置 Task 时必须同步更新 Capability Registry，否则 Server 无法知道该二进制已经支持它。
 
-当前 Server 已校验并保留会话内快照，但权威 Job Provider 尚未依据能力过滤目录。完成该过滤前，Server
-仍应把 `UNSUPPORTED_TASK` 视为明确兼容结果并停止重复下发，而不是不断重试。
+当前正式 Server 使用数据库 Job Provider：它会先应用 Agent 会话内上报的本地策略，再按能力快照和插件 inventory 过滤
+实际下发目录。被过滤的 Job 仍保留在 Server 的权威目录和管理查询中；Agent 应把 `UNSUPPORTED_TASK` 视为明确兼容结果，
+而不是不断重试。
 Task 配置本身若需要独立演进，可以增加配置版本或新的 oneof 分支；不要让同一字段随 Agent 版本静默改变
 含义。

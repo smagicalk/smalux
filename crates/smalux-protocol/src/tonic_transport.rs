@@ -88,7 +88,7 @@ pub fn parse_registration_credential(
     }
 
     let mut psk = [0_u8; REGISTRATION_PSK_BYTES];
-    for (index, pair) in encoded_psk.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded_psk.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]).ok_or_else(invalid_registration_psk)?;
         let low = hex_nibble(pair[1]).ok_or_else(invalid_registration_psk)?;
         psk[index] = (high << 4) | low;

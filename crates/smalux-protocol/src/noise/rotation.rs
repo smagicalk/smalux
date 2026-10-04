@@ -372,7 +372,7 @@ impl ServerKeyRing {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Agent 固定的 Server 公钥集合 snapshot。
 pub struct PinnedServerKeysSnapshot {
     /// 当前稳定信任的 Server 公钥。
@@ -418,15 +418,25 @@ impl PinnedServerKeys {
     ///
     /// 成功后应先保存 `snapshot()`，再通过旧加密会话发送确认。
     pub fn stage(&mut self, announcement: &ServerKeyAnnouncement) -> Result<(), NoiseError> {
-        if self.state.pending.is_some() {
-            warn!("pinned Server key rotation already has a pending key");
-            return Err(NoiseError::RotationAlreadyInProgress);
-        }
         let rotation_id = RotationId::from_bytes(&announcement.rotation_id)?;
         let key = NoisePublicKey::from_bytes(&announcement.new_public_key)?;
         if key.key_id() != KeyId::from_bytes(&announcement.new_key_id)? {
             warn!("Server key announcement contains mismatched key ID");
             return Err(NoiseError::AuthenticationFailed);
+        }
+        if self.state.pending.is_some() {
+            if self.state.rotation_id == Some(rotation_id) && self.state.pending == Some(key) {
+                debug!(rotation_id = ?rotation_id, "replayed identical Server key announcement");
+                return Ok(());
+            }
+            warn!("pinned Server key rotation already has a pending key");
+            return Err(NoiseError::RotationAlreadyInProgress);
+        }
+        if key == self.state.current || self.state.previous == Some(key) {
+            // 轮换成功后，旧会话中迟到的同一公告仍可能到达；它已经被 promote，
+            // 不能再次创建 pending，否则下一次连接会重复走一轮换钥流程。
+            debug!(rotation_id = ?rotation_id, "ignored an already applied Server key announcement");
+            return Ok(());
         }
         let new_key_id = key.key_id();
         self.state.pending = Some(key);

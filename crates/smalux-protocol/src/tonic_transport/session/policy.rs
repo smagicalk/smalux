@@ -5,9 +5,9 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::agent::v1::{
-    AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, DiagnosticMessage, JobCommand,
-    JobCommandResult, KeyRotationMessage, RegistrationMessage, SecureMessage, TaskReport,
-    secure_message,
+    AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, AgentReconcileSummary,
+    DiagnosticMessage, JobCommand, JobCommandResult, JobEvent, KeyRotationMessage,
+    RegistrationMessage, SecureMessage, TaskReport, secure_message,
 };
 
 use super::super::TransportError;
@@ -119,12 +119,16 @@ pub enum SessionEvent {
     JobCommandResult(Box<JobCommandResult>),
     /// Agent 上报的强类型 Task 执行结果。
     TaskReport(Box<TaskReport>),
+    /// Agent Scheduler 上报的异常或状态变化事件。
+    JobEvent(Box<JobEvent>),
     /// Agent 本地远程 Job 策略的查询、快照或确认。
     AgentJobPolicy(AgentJobPolicySync),
     /// Agent 可执行 Task 与 Probe 协议的查询或完整快照。
     AgentCapability(AgentCapabilitySync),
     /// Plus 插件清单、运行时快照或应用确认。
     AgentPlugin(AgentPluginSync),
+    /// Agent 认证连接建立后发送的目录/runtime 对账摘要。
+    ReconcileSummary(AgentReconcileSummary),
 }
 
 impl TryFrom<SecureMessage> for SessionEvent {
@@ -141,9 +145,13 @@ impl TryFrom<SecureMessage> for SessionEvent {
                 Ok(Self::JobCommandResult(value))
             }
             Some(secure_message::Body::TaskReport(value)) => Ok(Self::TaskReport(value)),
+            Some(secure_message::Body::JobEvent(value)) => Ok(Self::JobEvent(Box::new(value))),
             Some(secure_message::Body::AgentJobPolicy(value)) => Ok(Self::AgentJobPolicy(value)),
             Some(secure_message::Body::AgentCapability(value)) => Ok(Self::AgentCapability(value)),
             Some(secure_message::Body::AgentPlugin(value)) => Ok(Self::AgentPlugin(value)),
+            Some(secure_message::Body::ReconcileSummary(value)) => {
+                Ok(Self::ReconcileSummary(value))
+            }
             Some(secure_message::Body::Error(error)) => {
                 let code = crate::agent::v1::SecureErrorCode::try_from(error.code)
                     .unwrap_or(crate::agent::v1::SecureErrorCode::Unspecified);
@@ -180,8 +188,8 @@ impl Default for RekeyPolicy {
 #[cfg(test)]
 mod tests {
     use crate::agent::v1::{
-        AgentCapabilityQuery, AgentCapabilitySync, SecureMessage, agent_capability_sync,
-        secure_message,
+        AgentCapabilityQuery, AgentCapabilitySync, AgentReconcileSummary, JobEvent, SecureMessage,
+        agent_capability_sync, secure_message,
     };
 
     use super::SessionEvent;
@@ -197,5 +205,36 @@ mod tests {
         .unwrap();
 
         assert!(matches!(event, SessionEvent::AgentCapability(_)));
+    }
+
+    #[test]
+    fn job_event_envelope_is_exposed_as_a_typed_session_event() {
+        let event = SessionEvent::try_from(SecureMessage {
+            body: Some(secure_message::Body::JobEvent(JobEvent {
+                sequence: 9,
+                ..Default::default()
+            })),
+        })
+        .unwrap();
+        assert!(matches!(event, SessionEvent::JobEvent(value) if value.sequence == 9));
+    }
+
+    #[test]
+    fn reconcile_summary_envelope_is_exposed_as_a_typed_session_event() {
+        let event = SessionEvent::try_from(SecureMessage {
+            body: Some(secure_message::Body::ReconcileSummary(
+                AgentReconcileSummary {
+                    instance_id: vec![1; 16],
+                    catalog_revision: 2,
+                    catalog_digest: vec![2; 32],
+                    ..Default::default()
+                },
+            )),
+        })
+        .unwrap();
+        assert!(matches!(
+            event,
+            SessionEvent::ReconcileSummary(value) if value.catalog_revision == 2
+        ));
     }
 }

@@ -1,8 +1,12 @@
 //! Server 业务层向已认证 Agent 提供远程 Job 目录的边界。
 
 use smalux_protocol::agent::v1::{
-    AgentJobPolicySnapshot, AgentPluginInventory, PluginRuntimeSnapshot, ReplaceAllJobs,
+    AgentCapabilitySnapshot, AgentJobPolicySnapshot, AgentPluginInventory, PluginRuntimeSnapshot,
+    ReplaceAllJobs,
 };
+use std::sync::Arc;
+
+use crate::database::ServerDatabase;
 
 /// 按 Agent 身份和其本地策略读取权威 Job 目录。
 #[tonic::async_trait]
@@ -15,6 +19,8 @@ pub trait AgentJobCatalogProvider: Send + Sync {
         &self,
         agent_id: &str,
         policy: &AgentJobPolicySnapshot,
+        capability: &AgentCapabilitySnapshot,
+        inventory: &AgentPluginInventory,
     ) -> anyhow::Result<Option<ReplaceAllJobs>>;
 }
 
@@ -27,8 +33,38 @@ impl AgentJobCatalogProvider for EmptyAgentJobCatalogProvider {
         &self,
         _agent_id: &str,
         _policy: &AgentJobPolicySnapshot,
+        _capability: &AgentCapabilitySnapshot,
+        _inventory: &AgentPluginInventory,
     ) -> anyhow::Result<Option<ReplaceAllJobs>> {
         Ok(None)
+    }
+}
+
+/// 读取 Server 数据库中每个 Agent 的权威完整 Job 目录。
+pub struct DatabaseAgentJobCatalogProvider {
+    database: Arc<ServerDatabase>,
+}
+
+impl DatabaseAgentJobCatalogProvider {
+    pub fn new(database: Arc<ServerDatabase>) -> Self {
+        Self { database }
+    }
+}
+
+#[tonic::async_trait]
+impl AgentJobCatalogProvider for DatabaseAgentJobCatalogProvider {
+    async fn load_catalog(
+        &self,
+        agent_id: &str,
+        policy: &AgentJobPolicySnapshot,
+        capability: &AgentCapabilitySnapshot,
+        inventory: &AgentPluginInventory,
+    ) -> anyhow::Result<Option<ReplaceAllJobs>> {
+        Ok(self
+            .database
+            .load_agent_job_catalog_for_session(agent_id, policy, capability, inventory)
+            .await?
+            .map(|record| record.catalog))
     }
 }
 
@@ -60,5 +96,30 @@ impl AgentPluginRuntimeProvider for EmptyAgentPluginRuntimeProvider {
             revision: 1,
             plugins: Vec::new(),
         })
+    }
+}
+
+/// 从数据库加载与当前 Agent inventory 匹配的 Plus Worker 运行时快照。
+pub struct DatabaseAgentPluginRuntimeProvider {
+    database: Arc<ServerDatabase>,
+}
+
+impl DatabaseAgentPluginRuntimeProvider {
+    pub fn new(database: Arc<ServerDatabase>) -> Self {
+        Self { database }
+    }
+}
+
+#[tonic::async_trait]
+impl AgentPluginRuntimeProvider for DatabaseAgentPluginRuntimeProvider {
+    async fn load_runtime(
+        &self,
+        agent_id: &str,
+        inventory: &AgentPluginInventory,
+    ) -> anyhow::Result<PluginRuntimeSnapshot> {
+        Ok(self
+            .database
+            .load_agent_plugin_runtime(agent_id, inventory)
+            .await?)
     }
 }

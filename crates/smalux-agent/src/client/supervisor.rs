@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use smalux_protocol::{
     agent::v1::{
-        AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, JobCommandResult,
-        KeyRotationMessage, TaskReport, key_rotation_message,
+        AgentCapabilitySync, AgentJobPolicySync, AgentPluginSync, AgentReconcileSummary,
+        JobCommandResult, JobEvent, KeyRotationMessage, TaskReport, key_rotation_message,
     },
     noise::{KeyId, NoiseError, NoisePublicKey, RotationId},
     tonic_transport::{HeartbeatStats, RunningSession, SessionEvent, TransportError},
@@ -29,6 +29,10 @@ pub(super) enum SupervisorCommand {
         report: TaskReport,
         completed: oneshot::Sender<Result<(), SmaluxClientError>>,
     },
+    SendJobEvent {
+        event: JobEvent,
+        completed: oneshot::Sender<Result<(), SmaluxClientError>>,
+    },
     SendJobCommandResult {
         result: JobCommandResult,
         completed: oneshot::Sender<Result<(), SmaluxClientError>>,
@@ -43,6 +47,10 @@ pub(super) enum SupervisorCommand {
     },
     SendAgentPlugin {
         message: AgentPluginSync,
+        completed: oneshot::Sender<Result<(), SmaluxClientError>>,
+    },
+    SendReconcileSummary {
+        summary: AgentReconcileSummary,
         completed: oneshot::Sender<Result<(), SmaluxClientError>>,
     },
     HeartbeatStats {
@@ -174,8 +182,8 @@ async fn process_session_event(
     let rotation_id = RotationId::from_bytes(&announcement.rotation_id)?;
     let updated = active
         .state
-        .with_server_public_key(public_key)
-        .map_err(SmaluxClientError::state_store)?;
+        .stage_server_key(&announcement)
+        .map_err(SmaluxClientError::Noise)?;
 
     // 必须先持久化再 ACK；进程在这两步之间退出时，重连仍保留新旧两把 Server key。
     store
@@ -323,6 +331,16 @@ async fn handle_connected_command(command: SupervisorCommand, running: &RunningS
             );
             true
         }
+        SupervisorCommand::SendJobEvent { event, completed } => {
+            let _ = completed.send(
+                running
+                    .handle
+                    .send_job_event(event)
+                    .await
+                    .map_err(SmaluxClientError::Transport),
+            );
+            true
+        }
         SupervisorCommand::SendJobCommandResult { result, completed } => {
             let _ = completed.send(
                 running
@@ -363,6 +381,16 @@ async fn handle_connected_command(command: SupervisorCommand, running: &RunningS
             );
             true
         }
+        SupervisorCommand::SendReconcileSummary { summary, completed } => {
+            let _ = completed.send(
+                running
+                    .handle
+                    .send_reconcile_summary(summary)
+                    .await
+                    .map_err(SmaluxClientError::Transport),
+            );
+            true
+        }
         SupervisorCommand::HeartbeatStats { completed } => {
             let _ = completed.send(
                 running
@@ -384,10 +412,12 @@ async fn handle_connected_command(command: SupervisorCommand, running: &RunningS
 fn reject_disconnected_command(command: SupervisorCommand) {
     match command {
         SupervisorCommand::SendTaskReport { completed, .. }
+        | SupervisorCommand::SendJobEvent { completed, .. }
         | SupervisorCommand::SendJobCommandResult { completed, .. }
         | SupervisorCommand::SendAgentJobPolicy { completed, .. }
         | SupervisorCommand::SendAgentCapability { completed, .. }
-        | SupervisorCommand::SendAgentPlugin { completed, .. } => {
+        | SupervisorCommand::SendAgentPlugin { completed, .. }
+        | SupervisorCommand::SendReconcileSummary { completed, .. } => {
             let _ = completed.send(Err(SmaluxClientError::TemporarilyUnavailable));
         }
         SupervisorCommand::HeartbeatStats { completed } => {
@@ -400,8 +430,13 @@ fn reject_disconnected_command(command: SupervisorCommand) {
 }
 
 impl SmaluxClientError {
-    pub(super) fn is_retryable(&self) -> bool {
+    /// 判断错误是否来自可恢复的临时传输故障。
+    ///
+    /// 该分类同时供连接监督器和 Agent 的有限 Outbox 使用；认证、协议、Token
+    /// 以及业务拒绝不会被误放入重试队列。
+    pub fn is_retryable(&self) -> bool {
         match self {
+            Self::NotConnected | Self::TemporarilyUnavailable => true,
             Self::Transport(
                 TransportError::Transport(_)
                 | TransportError::Timeout(_)
@@ -434,6 +469,8 @@ mod tests {
     #[test]
     fn retryable_errors_are_limited_to_transient_transport_failures() {
         for error in [
+            SmaluxClientError::NotConnected,
+            SmaluxClientError::TemporarilyUnavailable,
             SmaluxClientError::Transport(TransportError::Closed),
             SmaluxClientError::Transport(TransportError::HeartbeatTimeout),
             SmaluxClientError::Transport(TransportError::Timeout("handshake")),

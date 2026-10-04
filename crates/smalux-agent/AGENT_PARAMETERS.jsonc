@@ -1,0 +1,1668 @@
+{
+  // 这是一份阅读用的参数参考，不是 Agent 运行时自动读取的配置文件。
+  // 文件采用 JSONC：允许使用 // 和 /* */ 注释；需要严格 JSON 时请先移除注释。
+  "document": {
+    "name": "Smalux Agent 参数参考",
+    "format": "jsonc",
+    "version": 1,
+    "purpose": "说明 Agent 启动参数、环境变量、Job 调度参数以及全部内置/Plus Task 参数",
+    "runtime_loading": false,
+    "parameter_precedence": [
+      "cli",
+      "environment",
+      "default"
+    ],
+    "duration_notation": "本文用 5s、30s、1m 等人类可读字符串表示 Duration；通过 Proto 发送时使用 google.protobuf.Duration。",
+    "bytes_notation": "本文中的 bytes 示例使用 base64 或占位字符串；通过 Proto 发送时仍是原始 bytes。",
+    "enum_notation": "示例使用项目中的语义 snake_case 名称；使用 protobuf JSON 编解码器时按生成代码要求转换为枚举名称。",
+    "security": {
+      "never_put_real_secrets_here": true,
+      "sensitive_examples_are_placeholders": true,
+      "registration_token_usage": "Token 只在首次 XXpsk3 注册或 pending 恢复时读取；Registered 状态会直接使用 IK，忽略配置中的 Token。"
+    }
+  },
+
+  // 命令行和环境变量只负责 Agent 进程本身的连接、资源限制和本地管理。
+  // Job 与 Task 的业务配置由 Server 通过 smalux.agent.v1 Proto 下发。
+  "agent": {
+    "global_options": [
+      {
+        "name": "control_endpoint",
+        "cli": "--control-endpoint",
+        "environment": "SMALUX_CONTROL_ENDPOINT",
+        "type": "path",
+        "default": {
+          "windows": "\\\\.\\pipe\\smalux-agent",
+          "linux_macos": "<data_dir>/agent/control.sock"
+        },
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "只用于本地管理 IPC",
+          "不监听 TCP",
+          "Windows 使用命名管道，Linux/macOS 使用 Unix socket"
+        ],
+        "description": "status、jobs、tasks、plugins、config 和 identity 命令连接正在运行的 Agent 所使用的端点。"
+      }
+    ],
+
+    "run_options": [
+      {
+        "name": "server_endpoint",
+        "cli": "--server-endpoint",
+        "environment": "SMALUX_SERVER_ENDPOINT",
+        "type": "string<url>",
+        "default": "http://127.0.0.1:12345",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "不能为空",
+          "通常只包含 scheme、host 和 port",
+          "https:// 使用 TLS；http:// 使用 h2c/Tonic 明文传输层，业务内容仍由 Noise 加密"
+        ],
+        "description": "Server 的基础地址。反向代理路径不要拼在这里，应使用 grpc_prefix。",
+        "example": "https://agent.example.com"
+      },
+      {
+        "name": "grpc_prefix",
+        "cli": "--grpc-prefix",
+        "environment": "SMALUX_GRPC_PREFIX",
+        "type": "string<path>|null",
+        "default": "/api/v1/grpc",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "与 no_grpc_prefix 互斥",
+          "用于 Axum/NGINX/Cloudflare 等反向代理暴露的路径前缀"
+        ],
+        "description": "为标准 gRPC service path 增加反向代理前缀。",
+        "example": "/api/v1/grpc"
+      },
+      {
+        "name": "no_grpc_prefix",
+        "cli": "--no-grpc-prefix",
+        "environment": null,
+        "type": "boolean",
+        "default": false,
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "与 grpc_prefix 互斥",
+          "启用后直接使用标准 gRPC service path"
+        ],
+        "description": "当 Server 没有套反向代理路径时使用。"
+      },
+      {
+        "name": "token",
+        "cli": "--token",
+        "environment": "SMALUX_REGISTRATION_TOKEN",
+        "type": "string<secret>",
+        "default": null,
+        "required": false,
+        "sensitive": true,
+        "constraints": [
+          "不能为空且不能包含控制字符",
+          "与 token_file 互斥",
+          "实际注册时必须满足 Server 签发的 Token 格式"
+        ],
+        "description": "首次注册或 pending 恢复使用的一次性 Token。命令行参数可能出现在 shell 历史和进程列表中。",
+        "example": "<registration-token>"
+      },
+      {
+        "name": "token_file",
+        "cli": "--token-file",
+        "environment": null,
+        "type": "path<secret-file>",
+        "default": null,
+        "required": false,
+        "sensitive": true,
+        "constraints": [
+          "与 token 互斥",
+          "按 UTF-8 读取，只移除文件末尾的 CR/LF",
+          "文件权限由部署环境负责保护"
+        ],
+        "description": "从文件读取注册 Token，避免把 Token 直接写入命令行。",
+        "example": "C:/smalux/registration-token.txt"
+      },
+      {
+        "name": "state_file",
+        "cli": "--state-file",
+        "environment": null,
+        "type": "path",
+        "default": "<data_dir>/agent/connection-state.json",
+        "required": false,
+        "sensitive": true,
+        "constraints": [
+          "包含 Agent 长期 Noise 私钥和 Server 公钥轮换状态",
+          "使用 .new/.bak 原子替换和恢复逻辑",
+          "不能放在 cache 目录或提交到版本库"
+        ],
+        "description": "Agent 身份、注册阶段、registration_id 和 Server current/pending/previous 公钥的本地状态文件。"
+      },
+      {
+        "name": "plugin_directory",
+        "cli": "--plugin-directory",
+        "environment": "SMALUX_PLUGIN_DIRECTORY",
+        "type": "path",
+        "default": "<data_dir>/agent/plugins",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "目录布局为 <plugin_id>/<version>/plugin.json",
+          "插件必须先通过 Manifest、Schema、平台和 Worker 入口校验"
+        ],
+        "description": "手工安装的 Plus Worker 根目录；当前不负责远程下载。"
+      },
+      {
+        "name": "handshake_timeout",
+        "cli": "--handshake-timeout",
+        "environment": "SMALUX_HANDSHAKE_TIMEOUT",
+        "type": "duration",
+        "default": "5s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "统一用于连接、XX/IK 握手、授权验证和部分 rekey 等待"
+        ],
+        "description": "Noise 注册、认证和连接恢复的单次等待上限。"
+      },
+      {
+        "name": "heartbeat_interval",
+        "cli": "--heartbeat-interval",
+        "environment": "SMALUX_HEARTBEAT_INTERVAL",
+        "type": "duration",
+        "default": "30s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "没有入站帧达到该时间时发送加密 Ping"
+        ],
+        "description": "长流连接的主动心跳间隔。"
+      },
+      {
+        "name": "heartbeat_timeout",
+        "cli": "--heartbeat-timeout",
+        "environment": "SMALUX_HEARTBEAT_TIMEOUT",
+        "type": "duration",
+        "default": "90s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于 heartbeat_interval",
+          "超过该时间没有成功接收入站帧时关闭当前会话并重连"
+        ],
+        "description": "判定会话失活的最长入站空闲时间。"
+      },
+      {
+        "name": "reconnect_initial_delay",
+        "cli": "--reconnect-initial-delay",
+        "environment": "SMALUX_RECONNECT_INITIAL_DELAY",
+        "type": "duration",
+        "default": "1s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "首次 IK 重连前等待时间"
+        ],
+        "description": "断线后的第一次重连退避时间。"
+      },
+      {
+        "name": "reconnect_max_delay",
+        "cli": "--reconnect-max-delay",
+        "environment": "SMALUX_RECONNECT_MAX_DELAY",
+        "type": "duration",
+        "default": "30s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须不小于 reconnect_initial_delay",
+          "指数退避不会超过该上限"
+        ],
+        "description": "连续 IK 重连失败时的最大等待时间。"
+      },
+      {
+        "name": "task_report_buffer_capacity",
+        "cli": "--task-report-buffer-capacity",
+        "environment": "SMALUX_TASK_REPORT_BUFFER_CAPACITY",
+        "type": "positive_integer",
+        "default": 1024,
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "断线期间 TaskReport 使用有界 FIFO",
+          "满载时丢弃最旧报告"
+        ],
+        "description": "采集结果的短时断线缓冲容量；不跨进程持久化。"
+      },
+      {
+        "name": "job_result_buffer_capacity",
+        "cli": "--job-result-buffer-capacity",
+        "environment": "SMALUX_JOB_RESULT_BUFFER_CAPACITY",
+        "type": "positive_integer",
+        "default": 1024,
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "断线期间 JobCommandResult 使用有界 FIFO",
+          "满载时丢弃最旧结果"
+        ],
+        "description": "Job 控制命令执行结果的短时断线缓冲容量；不跨进程持久化。"
+      },
+      {
+        "name": "shutdown_drain_timeout",
+        "cli": "--shutdown-drain-timeout",
+        "environment": "SMALUX_SHUTDOWN_DRAIN_TIMEOUT",
+        "type": "duration",
+        "default": "5s",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "只等待内存中的结果出口，不会保证断电后恢复"
+        ],
+        "description": "Agent 退出时排空 Job 结果和 TaskReport 的总等待时间。"
+      },
+      {
+        "name": "offline_job_timeout",
+        "cli": "--offline-job-timeout",
+        "environment": "SMALUX_OFFLINE_JOB_TIMEOUT",
+        "type": "duration",
+        "default": "30m",
+        "required": false,
+        "sensitive": false,
+        "constraints": [
+          "必须大于零",
+          "从首次断线开始计时",
+          "到期后取消并清空远程 Job；本地 Job 不受影响",
+          "重连后由 Server 重新下发 ReplaceAllJobs"
+        ],
+        "description": "允许 Agent 在短暂断联期间继续运行远程 Job 的最长时间。"
+      },
+      {
+        "name": "scheduler_global_concurrency",
+        "cli": "--scheduler-global-concurrency",
+        "environment": "SMALUX_SCHEDULER_GLOBAL_CONCURRENCY",
+        "type": "positive_integer",
+        "default": "logical_cpu_count * 4",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "所有 Job 合计允许同时执行的 Task 数量。"
+      },
+      {
+        "name": "scheduler_global_max_pending",
+        "cli": "--scheduler-global-max-pending",
+        "environment": "SMALUX_SCHEDULER_GLOBAL_MAX_PENDING",
+        "type": "positive_integer",
+        "default": 8192,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "Scheduler 全局 ReadyQueue 的 Pending 上限。"
+      },
+      {
+        "name": "scheduler_default_job_concurrency",
+        "cli": "--scheduler-default-job-concurrency",
+        "environment": "SMALUX_SCHEDULER_DEFAULT_JOB_CONCURRENCY",
+        "type": "positive_integer",
+        "default": 1,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "Job 未设置 options.concurrency 时继承的单 Job 并发上限。"
+      },
+      {
+        "name": "scheduler_default_job_max_pending",
+        "cli": "--scheduler-default-job-max-pending",
+        "environment": "SMALUX_SCHEDULER_DEFAULT_JOB_MAX_PENDING",
+        "type": "positive_integer",
+        "default": 1024,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "Job 未设置 options.max_pending 时继承的 Pending 上限。"
+      },
+      {
+        "name": "scheduler_max_jobs",
+        "cli": "--scheduler-max-jobs",
+        "environment": "SMALUX_SCHEDULER_MAX_JOBS",
+        "type": "positive_integer",
+        "default": 1024,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "Scheduler 可同时保存的 Job 数量上限。"
+      },
+      {
+        "name": "scheduler_shutdown_timeout",
+        "cli": "--scheduler-shutdown-timeout",
+        "environment": "SMALUX_SCHEDULER_SHUTDOWN_TIMEOUT",
+        "type": "duration",
+        "default": "30s",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零"],
+        "description": "Scheduler 关闭时等待正在运行的 Task 退出的时间。"
+      },
+      {
+        "name": "plugin_max_workers",
+        "cli": "--plugin-max-workers",
+        "environment": "SMALUX_PLUGIN_MAX_WORKERS",
+        "type": "positive_integer",
+        "default": 16,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "超过数量的 Plus runtime snapshot 会被拒绝"],
+        "description": "Agent 同时运行的 Plus Worker 进程数量上限。"
+      },
+      {
+        "name": "plugin_max_concurrency",
+        "cli": "--plugin-max-concurrency",
+        "environment": "SMALUX_PLUGIN_MAX_CONCURRENCY",
+        "type": "positive_integer",
+        "default": 4,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "实际并发取插件声明值和该本地上限的较小值"],
+        "description": "单个 Plus Worker 的本地最大并发。"
+      },
+      {
+        "name": "plugin_task_timeout",
+        "cli": "--plugin-task-timeout",
+        "environment": "SMALUX_PLUGIN_TASK_TIMEOUT",
+        "type": "duration",
+        "default": "5m",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "超时后先发送 Cancel，等待确认，仍未结束才终止 Worker"],
+        "description": "Plus Task 在 Agent 侧的执行上限。"
+      },
+      {
+        "name": "plugin_shutdown_timeout",
+        "cli": "--plugin-shutdown-timeout",
+        "environment": "SMALUX_PLUGIN_SHUTDOWN_TIMEOUT",
+        "type": "duration",
+        "default": "5s",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "同时用于 Worker Shutdown 和取消确认等待"],
+        "description": "旧 Worker 或 Agent 退出时等待优雅关闭的最长时间。"
+      },
+      {
+        "name": "plugin_startup_timeout",
+        "cli": "--plugin-startup-timeout",
+        "environment": "SMALUX_PLUGIN_STARTUP_TIMEOUT",
+        "type": "duration",
+        "default": "10s",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "覆盖 Hello 和 Initialize 两阶段 Worker 握手"],
+        "description": "Plus Worker 启动初始化超时。"
+      },
+      {
+        "name": "plugin_restart_max_attempts",
+        "cli": "--plugin-restart-max-attempts",
+        "environment": "SMALUX_PLUGIN_RESTART_MAX_ATTEMPTS",
+        "type": "positive_integer",
+        "default": 3,
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "达到阈值后进入 paused 并通知 Server"],
+        "description": "Plus Worker 在失败窗口内允许的最大失败次数。"
+      },
+      {
+        "name": "plugin_restart_window",
+        "cli": "--plugin-restart-window",
+        "environment": "SMALUX_PLUGIN_RESTART_WINDOW",
+        "type": "duration",
+        "default": "10m",
+        "required": false,
+        "sensitive": false,
+        "constraints": ["必须大于零", "只统计窗口内的 Worker 异常退出、reader 关闭和启动失败"],
+        "description": "Plus Worker 崩溃熔断统计窗口。"
+      }
+    ],
+
+    // 下面这些值目前没有独立 CLI 参数，但会影响行为；它们属于代码固定默认值。
+    "internal_defaults": {
+      "noise_rekey": {
+        "max_age": "1h",
+        "max_frames": 1048576,
+        "automatic": true,
+        "description": "Initiator 达到时间或帧数阈值时自动同步 rekey。"
+      },
+      "session_driver": {
+        "command_capacity": 32,
+        "event_capacity": 128,
+        "description": "发送命令和已解密事件的有界队列；满载时形成异步反压。"
+      },
+      "scheduler": {
+        "due_batch_size": 256,
+        "event_channel_capacity": 1024,
+        "command_channel_capacity": 256,
+        "minimum_interval": "100ms",
+        "minimum_retry_delay": "100ms",
+        "maximum_catch_up": 1000,
+        "maximum_retry_attempts": 1000
+      },
+      "outbox": {
+        "task_report_capacity": 1024,
+        "job_result_capacity": 1024,
+        "overflow": "drop_oldest"
+      },
+      "logging": {
+        "filter_environment": "RUST_LOG",
+        "component_environment": "SMALUX_LOG_COMPONENT",
+        "default_filter": "info,sea_orm=warn,sqlx=warn,tokio=warn",
+        "file": "<data_dir>/logs/<component>/smalux.log",
+        "rotation": "daily_or_10MiB",
+        "max_history_files": 10,
+        "outputs": ["console", "rolling_text_file"]
+      }
+    }
+  },
+
+  // Agent 的本地管理命令不修改 Server 配置；Job 策略修改只允许通过本机 IPC。
+  "management_commands": {
+    "status": {
+      "command": "smalux-agent status",
+      "parameters": {
+        "watch": {
+          "cli": "--watch",
+          "type": "boolean",
+          "default": false,
+          "description": "持续刷新，直到 Ctrl+C。"
+        },
+        "interval": {
+          "cli": "--interval",
+          "type": "duration",
+          "default": "2s",
+          "constraints": ["必须大于零"]
+        },
+        "output": {
+          "cli": "--output",
+          "type": "enum",
+          "values": ["table", "json"],
+          "default": "table"
+        }
+      },
+      "example": "smalux-agent status --watch --interval 2s --output json"
+    },
+    "jobs": {
+      "list": {
+        "command": "smalux-agent jobs list",
+        "parameters": {
+          "state": {
+            "cli": "--state",
+            "type": "enum|null",
+            "values": ["enabled", "completed", "disabled"],
+            "default": null
+          },
+          "running": {
+            "cli": "--running",
+            "type": "boolean",
+            "default": false
+          },
+          "task_kind": {
+            "cli": "--task-kind",
+            "type": "string|null",
+            "default": null
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        },
+        "example": "smalux-agent jobs list --state enabled --output json"
+      },
+      "show": {
+        "command": "smalux-agent jobs show <job_id>",
+        "parameters": {
+          "job_id": {
+            "type": "uuid",
+            "required": true
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        }
+      },
+      "policy": {
+        "description": "只限制 Server 下发的远程 Job，不影响 Agent 内部本地 Job。",
+        "commands": {
+          "show": "smalux-agent jobs policy show",
+          "add_task": "smalux-agent jobs policy add-task <task_kind>",
+          "remove_task": "smalux-agent jobs policy remove-task <task_kind>",
+          "deny_all": "smalux-agent jobs policy deny-all",
+          "allow_all": "smalux-agent jobs policy allow-all",
+          "repair": "smalux-agent jobs policy repair --reset"
+        },
+        "parameters": {
+          "task_kind": {
+            "type": "string",
+            "required_for": ["add_task", "remove_task"],
+            "description": "可以使用完整 kind 或 tasks list 显示的稳定任务标识。"
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table",
+            "applies_to": ["show", "add_task", "remove_task", "deny_all", "allow_all"]
+          },
+          "reset": {
+            "cli": "--reset",
+            "type": "boolean",
+            "required_for": ["repair"],
+            "description": "必须显式提供；损坏的策略文件会备份后重置为空策略。"
+          }
+        }
+      }
+    },
+    "tasks": {
+      "list": {
+        "command": "smalux-agent tasks list",
+        "parameters": {
+          "source": {
+            "cli": "--source",
+            "type": "enum|null",
+            "values": ["builtin", "plugin"],
+            "default": null
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        },
+        "example": "smalux-agent tasks list --source builtin --output json"
+      },
+      "show": {
+        "command": "smalux-agent tasks show <task_kind>",
+        "parameters": {
+          "task_kind": {
+            "type": "string",
+            "required": true
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        }
+      }
+    },
+    "plugins": {
+      "list": {
+        "command": "smalux-agent plugins list",
+        "parameters": {
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        }
+      },
+      "show": {
+        "command": "smalux-agent plugins show <plugin_id>",
+        "parameters": {
+          "plugin_id": {
+            "type": "string",
+            "required": true
+          },
+          "output": {
+            "cli": "--output",
+            "type": "enum",
+            "values": ["table", "json"],
+            "default": "table"
+          }
+        }
+      }
+    },
+    "config_show": {
+      "command": "smalux-agent config show",
+      "parameters": {
+        "output": {
+          "cli": "--output",
+          "type": "enum",
+          "values": ["table", "json"],
+          "default": "table"
+        }
+      },
+      "description": "读取正在运行进程的最终配置；Token 只显示 <redacted>。"
+    },
+    "identity_show": {
+      "command": "smalux-agent identity show",
+      "parameters": {
+        "state_file": {
+          "cli": "--state-file",
+          "type": "path|null",
+          "default": "<data_dir>/agent/connection-state.json"
+        },
+        "output": {
+          "cli": "--output",
+          "type": "enum",
+          "values": ["table", "json"],
+          "default": "table"
+        }
+      },
+      "description": "离线显示注册阶段和公钥 ID，不输出私钥或 Token。"
+    }
+  },
+
+  // Server 下发的完整远程 Job 定义。Job 的配置版本和 Scheduler generation 不能混用。
+  "job": {
+    "identity_rules": {
+      "job_id": "Server 分配的 16 字节 UUID；Agent 只把它作为稳定主键，不自行替换。",
+      "revision": "单 Job 业务版本，从 1 开始；增量更新必须严格递增；ReplaceAll 中相同 revision 只能重放相同内容。",
+      "scheduler_generation": "Agent Scheduler 内部并发控制版本，不通过 Proto 上报，也不能填入 revision。",
+      "catalog_revision": "Server 远程 Job 集合版本；增量命令必须连续，ReplaceAll 可跨过丢失版本。"
+    },
+    "definition": {
+      "proto": "JobDefinition",
+      "parameters": {
+        "job_id": {
+          "type": "bytes[16]",
+          "required": true,
+          "default": null,
+          "description": "调用方分配的 Job UUID。"
+        },
+        "revision": {
+          "type": "uint64",
+          "required": true,
+          "default": null,
+          "constraints": ["必须大于零", "更新不得回退"]
+        },
+        "enabled": {
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "为 false 时保存定义但不创建新的计划执行。"
+        },
+        "trigger": {
+          "type": "JobTrigger",
+          "required": true,
+          "default": null
+        },
+        "options": {
+          "type": "JobOptions|null",
+          "required": false,
+          "default": "Agent JobOptions 安全默认值"
+        },
+        "task": {
+          "type": "TaskDefinition",
+          "required": true,
+          "default": null
+        }
+      }
+    },
+    "trigger": {
+      "proto": "JobTrigger",
+      "parameters": {
+        "timeout": {
+          "type": "duration|null",
+          "required": false,
+          "default": null,
+          "constraints": ["存在时必须大于零"],
+          "description": "单次 Task 的 Scheduler 执行超时；缺失表示不由 Scheduler 设置超时。"
+        },
+        "misfire": {
+          "type": "MisfirePolicy",
+          "required": true,
+          "default": null,
+          "constraints": ["behavior 不能是 unspecified", "catch_up 时 max_runs 必须大于零"]
+        },
+        "schedule": {
+          "type": "oneof<once|interval|cron>",
+          "required": true,
+          "default": null,
+          "description": "必须且只能配置一种时间规则。"
+        }
+      },
+      "schedules": {
+        "once": {
+          "proto": "OnceSchedule",
+          "parameters": {
+            "at": {
+              "type": "timestamp",
+              "required": true,
+              "description": "UTC 计划时间；过去时间会在注册后尽快执行。"
+            }
+          }
+        },
+        "interval": {
+          "proto": "IntervalSchedule",
+          "parameters": {
+            "every": {
+              "type": "duration",
+              "required": true,
+              "constraints": ["必须大于 Agent minimum_interval，当前默认 100ms"]
+            },
+            "start_at": {
+              "type": "timestamp|null",
+              "required": false,
+              "default": null,
+              "description": "缺失时从 Agent 应用 Job 的时间开始计算。"
+            }
+          }
+        },
+        "cron": {
+          "proto": "CronSchedule",
+          "parameters": {
+            "expression": {
+              "type": "string",
+              "required": true,
+              "description": "Cron 表达式，例如 0 */5 * * * *。"
+            },
+            "timezone": {
+              "type": "string<IANA timezone>",
+              "required": true,
+              "example": "Asia/Shanghai"
+            }
+          }
+        }
+      },
+      "misfire_values": {
+        "skip": {
+          "behavior": "skip",
+          "max_runs": 0,
+          "description": "丢弃错过的周期，只保留下一次未来计划。"
+        },
+        "fire_once": {
+          "behavior": "fire_once",
+          "max_runs": 0,
+          "description": "把错过的周期合并为一次立即执行。"
+        },
+        "catch_up": {
+          "behavior": "catch_up",
+          "max_runs": 10,
+          "description": "按时间顺序补执行，次数受 Scheduler maximum_catch_up 限制。"
+        }
+      }
+    },
+    "options": {
+      "proto": "JobOptions",
+      "parameters": {
+        "concurrency": {
+          "type": "uint32|null",
+          "required": false,
+          "default": "继承 scheduler_default_job_concurrency",
+          "constraints": ["存在时必须大于零"]
+        },
+        "max_pending": {
+          "type": "uint32|null",
+          "required": false,
+          "default": "继承 scheduler_default_job_max_pending",
+          "constraints": ["存在时必须大于零"]
+        },
+        "priority": {
+          "type": "uint32|null",
+          "required": false,
+          "default": 5,
+          "constraints": ["范围 0..=10，数值越大越优先"]
+        },
+        "coalescing": {
+          "type": "enum",
+          "required": false,
+          "default": "按 Trigger 类型选择 Agent 默认策略",
+          "values": ["unspecified", "keep_all", "keep_latest"]
+        },
+        "capacity": {
+          "type": "enum",
+          "required": false,
+          "default": "按 Trigger 类型选择 Agent 默认策略",
+          "values": ["unspecified", "backpressure", "skip_newest", "replace_oldest_trigger"]
+        },
+        "retry": {
+          "type": "RetryPolicy|null",
+          "required": false,
+          "default": "none",
+          "description": "缺失时不在同一逻辑执行内重试。"
+        },
+        "failure": {
+          "type": "FailurePolicy|null",
+          "required": false,
+          "default": {
+            "disable_after_consecutive_failures": 5,
+            "count_timeout": true,
+            "count_panic": true
+          },
+          "description": "缺失时使用 Agent 默认的连续失败停用策略。显式空消息则可关闭阈值。"
+        }
+      },
+      "retry_policy": {
+        "no_retry": {
+          "policy": "no_retry",
+          "description": "不重试。"
+        },
+        "exponential": {
+          "policy": "exponential",
+          "parameters": {
+            "max_attempts": {
+              "type": "uint32",
+              "required": true,
+              "constraints": ["必须大于零", "包含首次执行"]
+            },
+            "initial_delay": {
+              "type": "duration",
+              "required": true,
+              "constraints": ["允许为零", "不能低于 Scheduler minimum_retry_delay（非零时）"]
+            },
+            "max_delay": {
+              "type": "duration",
+              "required": true,
+              "constraints": ["必须大于零", "应不小于 initial_delay"]
+            },
+            "retry_on": {
+              "type": "RetryCondition|null",
+              "required": false,
+              "default": {
+                "transient_error": true,
+                "timeout": true,
+                "panic": false
+              }
+            }
+          }
+        }
+      },
+      "failure_policy": {
+        "parameters": {
+          "disable_after_consecutive_failures": {
+            "type": "uint32|null",
+            "required": false,
+            "default": null,
+            "constraints": ["存在时必须大于零", "缺失表示不按次数自动停用"]
+          },
+          "count_timeout": {
+            "type": "boolean",
+            "required": false,
+            "default": false
+          },
+          "count_panic": {
+            "type": "boolean",
+            "required": false,
+            "default": false
+          }
+        }
+      }
+    },
+    "examples": {
+      "cpu_interval": {
+        "job_id": "<base64-encoded-16-byte-uuid>",
+        "revision": 1,
+        "enabled": true,
+        "trigger": {
+          "interval": {
+            "every": "30s"
+          },
+          "misfire": {
+            "behavior": "skip",
+            "max_runs": 0
+          }
+        },
+        "task": {
+          "cpu": {}
+        }
+      },
+      "process_detailed": {
+        "job_id": "<base64-encoded-16-byte-uuid>",
+        "revision": 1,
+        "enabled": true,
+        "trigger": {
+          "interval": {
+            "every": "1m"
+          },
+          "misfire": {
+            "behavior": "fire_once",
+            "max_runs": 0
+          }
+        },
+        "options": {
+          "concurrency": 1,
+          "max_pending": 2,
+          "priority": 7,
+          "retry": {
+            "exponential": {
+              "max_attempts": 3,
+              "initial_delay": "1s",
+              "max_delay": "10s",
+              "retry_on": {
+                "transient_error": true,
+                "timeout": true,
+                "panic": false
+              }
+            }
+          }
+        },
+        "task": {
+          "process": {
+            "mode": "detailed",
+            "selection": {
+              "include_pids": [],
+              "include_names": [],
+              "exclude_names": ["smalux-helper"]
+            },
+            "ranking": "cpu_usage",
+            "max_entries": 128
+          }
+        }
+      }
+    }
+  },
+
+  // 所有固定 Task 都是 TaskDefinition.oneof 的一个分支。
+  // Task 只返回 TaskResult；Job、Scheduler 和连接层负责触发、重试和上报。
+  "tasks": {
+    "common_enums": {
+      "collection_mode": {
+        "summary": {
+          "wire_name": "COLLECTION_MODE_SUMMARY",
+          "description": "最低成本；只返回总数和聚合统计，不枚举条目。"
+        },
+        "basic": {
+          "wire_name": "COLLECTION_MODE_BASIC",
+          "description": "中等成本；返回基础条目，不读取昂贵扩展详情。"
+        },
+        "detailed": {
+          "wire_name": "COLLECTION_MODE_DETAILED",
+          "description": "最高成本；返回进程关联、命令行等扩展信息。"
+        },
+        "unspecified": {
+          "wire_name": "COLLECTION_MODE_UNSPECIFIED",
+          "description": "需要成本语义的 Task 会拒绝该值。"
+        }
+      },
+      "ip_family_selection": ["both", "v4", "v6"],
+      "interface_selection": {
+        "include": "非空时先使用白名单",
+        "exclude": "仅在 include 完全为空时作为排除列表；include 非空时忽略 exclude",
+        "empty": "include 和 exclude 都为空时选择全部可见网卡"
+      },
+      "disk_selection": {
+        "include_names": "设备名称白名单",
+        "include_mount_points": "挂载点白名单",
+        "exclude_names": "设备名称黑名单",
+        "exclude_mount_points": "挂载点黑名单",
+        "empty": "全部列表为空时选择全部可见磁盘"
+      }
+    },
+
+    "builtin": {
+      "system": {
+        "kind": "smalux.collect.system.v1",
+        "proto": "SystemTaskConfig",
+        "result": "SystemSnapshot",
+        "parameters": {
+          "disk_io": {
+            "type": "DiskIoTaskConfig|null",
+            "default": "null（全部磁盘）",
+            "description": "可嵌套 disks 选择。"
+          },
+          "network_io": {
+            "type": "NetworkIoTaskConfig|null",
+            "default": "null（全部网卡）",
+            "description": "可嵌套 interfaces 选择。"
+          },
+          "local_ip": {
+            "type": "LocalIpTaskConfig|null",
+            "default": "null（全部网卡地址）",
+            "description": "可嵌套 interfaces 选择；组合 Task 不请求公网 IP。"
+          }
+        },
+        "fixed_children": {
+          "process": "组合采集使用进程 SUMMARY 模式，当前没有独立 ProcessSelection 参数。",
+          "socket": "组合采集使用 Socket SUMMARY 模式，当前没有独立 SocketProtocolSelection 参数。"
+        },
+        "example": {
+          "system": {
+            "disk_io": {
+              "disks": {
+                "include_names": [],
+                "include_mount_points": ["C:/"],
+                "exclude_names": [],
+                "exclude_mount_points": []
+              }
+            },
+            "network_io": {
+              "interfaces": {
+                "include": ["Ethernet"],
+                "exclude": []
+              }
+            },
+            "local_ip": {
+              "interfaces": {
+                "include": [],
+                "exclude": ["Loopback Pseudo-Interface 1"]
+              }
+            }
+          }
+        }
+      },
+
+      "cpu": {
+        "kind": "smalux.collect.cpu.v1",
+        "proto": "CpuTaskConfig",
+        "result": "CpuSnapshot",
+        "parameters": {},
+        "description": "当前没有业务参数；必须发送空配置对象以选择 cpu 分支。",
+        "example": {
+          "cpu": {}
+        }
+      },
+
+      "memory": {
+        "kind": "smalux.collect.memory.v1",
+        "proto": "MemoryTaskConfig",
+        "result": "MemorySnapshot",
+        "parameters": {},
+        "description": "当前没有业务参数；采集物理内存和交换区。",
+        "example": {
+          "memory": {}
+        }
+      },
+
+      "load": {
+        "kind": "smalux.collect.load.v1",
+        "proto": "LoadTaskConfig",
+        "result": "LoadSnapshot",
+        "parameters": {},
+        "description": "当前没有业务参数；不支持的平台会返回 supported=false。",
+        "example": {
+          "load": {}
+        }
+      },
+
+      "host": {
+        "kind": "smalux.collect.host.v1",
+        "proto": "HostTaskConfig",
+        "result": "HostSnapshot",
+        "parameters": {},
+        "description": "当前没有业务参数；采集主机名、系统、内核、架构和启动时间。",
+        "example": {
+          "host": {}
+        }
+      },
+
+      "disk_io": {
+        "kind": "smalux.collect.disk_io.v1",
+        "proto": "DiskIoTaskConfig",
+        "result": "DiskIoSnapshot",
+        "parameters": {
+          "disks": {
+            "type": "DiskSelection|null",
+            "default": "null（全部磁盘）",
+            "fields": {
+              "include_names": {
+                "type": "string[]",
+                "default": [],
+                "description": "设备名称白名单。"
+              },
+              "include_mount_points": {
+                "type": "string[]",
+                "default": [],
+                "description": "挂载点白名单。"
+              },
+              "exclude_names": {
+                "type": "string[]",
+                "default": [],
+                "description": "设备名称排除列表。"
+              },
+              "exclude_mount_points": {
+                "type": "string[]",
+                "default": [],
+                "description": "挂载点排除列表。"
+              }
+            },
+            "precedence": "include 列表任一非空时只保留白名单，exclude 被忽略；全空时使用 exclude 排除。"
+          }
+        },
+        "example": {
+          "disk_io": {
+            "disks": {
+              "include_names": [],
+              "include_mount_points": ["/", "/var"],
+              "exclude_names": [],
+              "exclude_mount_points": ["/proc"]
+            }
+          }
+        }
+      },
+
+      "network_io": {
+        "kind": "smalux.collect.network_io.v1",
+        "proto": "NetworkIoTaskConfig",
+        "result": "NetworkIoSnapshot",
+        "parameters": {
+          "interfaces": {
+            "type": "InterfaceSelection|null",
+            "default": "null（全部网卡）",
+            "fields": {
+              "include": {
+                "type": "string[]",
+                "default": [],
+                "description": "网卡完整名称白名单。"
+              },
+              "exclude": {
+                "type": "string[]",
+                "default": [],
+                "description": "网卡完整名称排除列表。"
+              }
+            },
+            "precedence": "include 非空时只保留白名单，exclude 被忽略；全空时使用 exclude 排除。"
+          }
+        },
+        "example": {
+          "network_io": {
+            "interfaces": {
+              "include": ["eth0"],
+              "exclude": []
+            }
+          }
+        }
+      },
+
+      "local_ip": {
+        "kind": "smalux.collect.local_ip.v1",
+        "proto": "LocalIpTaskConfig",
+        "result": "IpSnapshot",
+        "parameters": {
+          "interfaces": {
+            "type": "InterfaceSelection|null",
+            "default": "null（全部网卡）",
+            "description": "与 NetworkIoTask 使用相同的 include/exclude 选择规则。"
+          }
+        },
+        "example": {
+          "local_ip": {
+            "interfaces": {
+              "include": [],
+              "exclude": ["lo"]
+            }
+          }
+        }
+      },
+
+      "public_ip": {
+        "kind": "smalux.collect.public_ip.v1",
+        "proto": "PublicIpTaskConfig",
+        "result": "PublicIpSnapshot",
+        "parameters": {
+          "timeout": {
+            "type": "duration",
+            "required": true,
+            "default": null,
+            "constraints": ["必须大于零", "Proto 字段缺失会被拒绝"],
+            "description": "每个外部解析服务请求的超时。"
+          },
+          "family": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["both", "v4", "v6"],
+            "constraints": ["不能为 unspecified"],
+            "description": "选择执行公网 IPv4、IPv6 或两者解析。"
+          }
+        },
+        "example": {
+          "public_ip": {
+            "timeout": "5s",
+            "family": "both"
+          }
+        }
+      },
+
+      "process": {
+        "kind": "smalux.collect.process.v1",
+        "proto": "ProcessTaskConfig",
+        "result": "ProcessSnapshot",
+        "parameters": {
+          "mode": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["summary", "basic", "detailed"],
+            "constraints": ["不能为 unspecified"]
+          },
+          "selection": {
+            "type": "ProcessSelection|null",
+            "default": "null（全部进程）",
+            "fields": {
+              "include_pids": {
+                "type": "uint32[]",
+                "default": [],
+                "description": "PID 精确白名单；与 include_names 都为空时不启用白名单。"
+              },
+              "include_names": {
+                "type": "string[]",
+                "default": [],
+                "description": "进程名称精确白名单。"
+              },
+              "exclude_names": {
+                "type": "string[]",
+                "default": [],
+                "description": "进程名称排除列表；白名单启用时不改变白名单选择结果。"
+              }
+            },
+            "precedence": "include_pids 或 include_names 任一非空时只保留白名单，exclude_names 被忽略；两者都为空时使用 exclude_names 排除。"
+          },
+          "ranking": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["pid", "cpu_usage", "memory"],
+            "constraints": ["不能为 unspecified", "cpu_usage 和 memory 只允许 detailed 模式"]
+          },
+          "max_entries": {
+            "type": "uint32|null",
+            "required": false,
+            "default": {
+              "summary": 0,
+              "basic": 256,
+              "detailed": 128
+            },
+            "constraints": ["存在时必须大于零", "只限制返回 entries，不改变 total_processes 和 matched_processes"]
+          }
+        },
+        "cost_model": {
+          "summary": "只统计进程总数和状态分布，entries 为空。",
+          "basic": "返回基础进程信息，不读取昂贵资源详情。",
+          "detailed": "返回资源、可执行文件、命令行等详情，CPU/Memory 排名只在此模式可用。"
+        },
+        "example": {
+          "process": {
+            "mode": "detailed",
+            "selection": {
+              "include_pids": [],
+              "include_names": [],
+              "exclude_names": []
+            },
+            "ranking": "memory",
+            "max_entries": 128
+          }
+        }
+      },
+
+      "socket": {
+        "kind": "smalux.collect.socket.v1",
+        "proto": "SocketTaskConfig",
+        "result": "SocketSnapshot",
+        "parameters": {
+          "mode": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["summary", "basic", "detailed"],
+            "constraints": ["不能为 unspecified"]
+          },
+          "protocols": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["both", "tcp", "udp"],
+            "constraints": ["不能为 unspecified"]
+          },
+          "address_families": {
+            "type": "enum",
+            "required": true,
+            "default": null,
+            "values": ["both", "ipv4", "ipv6"],
+            "constraints": ["不能为 unspecified"]
+          },
+          "max_entries": {
+            "type": "uint32|null",
+            "required": false,
+            "default": {
+              "summary": 0,
+              "basic": 256,
+              "detailed": 128
+            },
+            "constraints": ["存在时必须大于零", "只限制返回 entries，不改变 tcp_total 和 udp_total"]
+          }
+        },
+        "cost_model": {
+          "summary": "只返回 TCP/UDP 数量和 TCP 状态聚合。",
+          "basic": "返回地址和连接基础明细，不关联 PID。",
+          "detailed": "返回基础明细并尝试关联 PID；空 associated_pids 不能单独解释为无进程。"
+        },
+        "example": {
+          "socket": {
+            "mode": "summary",
+            "protocols": "both",
+            "address_families": "both"
+          }
+        }
+      },
+
+      "probe": {
+        "kind": "smalux.probe.network.v1",
+        "proto": "ProbeTaskConfig",
+        "result": "ProbeSnapshot",
+        "parameters": {
+          "concurrency": {
+            "type": "uint32",
+            "required": true,
+            "default": null,
+            "constraints": ["必须大于零", "最大 64"]
+          },
+          "nodes": {
+            "type": "ProbeNodeConfig[]",
+            "required": true,
+            "default": [],
+            "constraints": ["至少 1 个节点", "最多 256 个节点", "同一 Task 内 name 必须唯一"]
+          }
+        },
+        "node_parameters": {
+          "name": {
+            "type": "string",
+            "required": true,
+            "constraints": ["不能为空或全空白", "同一 Probe Task 内唯一"]
+          },
+          "host": {
+            "type": "string",
+            "required": true,
+            "constraints": ["不能为空", "ICMP/TCP/UDP 使用主机名或 IP；HTTP 使用统一展示字段"]
+          },
+          "attempts": {
+            "type": "uint32",
+            "required": true,
+            "constraints": ["范围 1..=20"]
+          },
+          "timeout": {
+            "type": "duration",
+            "required": true,
+            "constraints": ["大于零", "最大 60s"]
+          },
+          "interval": {
+            "type": "duration",
+            "required": false,
+            "default": "0s",
+            "constraints": ["允许为零", "最大 60s"]
+          },
+          "target": {
+            "type": "oneof<icmp_echo|tcp_connect|udp_request|http>",
+            "required": true,
+            "default": null
+          }
+        },
+        "targets": {
+          "icmp_echo": {
+            "proto": "IcmpEchoTarget",
+            "parameters": {},
+            "constraints": ["当前无额外参数", "平台或权限不支持时记录节点失败"]
+          },
+          "tcp_connect": {
+            "proto": "TcpConnectTarget",
+            "parameters": {
+              "port": {
+                "type": "uint32",
+                "required": true,
+                "constraints": ["范围 1..=65535"]
+              }
+            }
+          },
+          "udp_request": {
+            "proto": "UdpRequestTarget",
+            "parameters": {
+              "port": {
+                "type": "uint32",
+                "required": true,
+                "constraints": ["范围 1..=65535"]
+              },
+              "request_payload": {
+                "type": "bytes",
+                "required": true,
+                "constraints": ["不能为空", "最大 4096 字节"],
+                "description": "每次尝试发送的原始 UDP 数据。"
+              },
+              "expected_response_prefix": {
+                "type": "bytes|null",
+                "required": false,
+                "default": null,
+                "constraints": ["最大 4096 字节", "缺失或为空时收到任意响应数据报即成功"]
+              }
+            }
+          },
+          "http": {
+            "proto": "HttpTarget",
+            "parameters": {
+              "url": {
+                "type": "string<http-url>",
+                "required": true,
+                "constraints": ["必须是带主机的 http 或 https URL"]
+              },
+              "expected_status_min": {
+                "type": "uint32",
+                "required": true,
+                "constraints": ["范围 100..=599"]
+              },
+              "expected_status_max": {
+                "type": "uint32",
+                "required": true,
+                "constraints": ["范围 100..=599", "不得小于 expected_status_min"]
+              },
+              "follow_redirects": {
+                "type": "boolean",
+                "required": false,
+                "default": false,
+                "description": "是否跟随最多 10 次重定向。"
+              }
+            }
+          }
+        },
+        "limits": {
+          "max_nodes": 256,
+          "max_concurrency": 64,
+          "max_attempts_per_node": 20,
+          "max_timeout": "60s",
+          "max_interval": "60s",
+          "max_udp_payload_bytes": 4096
+        },
+        "examples": {
+          "icmp_and_tcp": {
+            "probe": {
+              "concurrency": 2,
+              "nodes": [
+                {
+                  "name": "gateway-icmp",
+                  "host": "192.168.1.1",
+                  "attempts": 3,
+                  "timeout": "1s",
+                  "interval": "100ms",
+                  "icmp_echo": {}
+                },
+                {
+                  "name": "service-tcp",
+                  "host": "service.example.com",
+                  "attempts": 2,
+                  "timeout": "2s",
+                  "interval": "0s",
+                  "tcp_connect": {
+                    "port": 443
+                  }
+                }
+              ]
+            }
+          },
+          "udp": {
+            "probe": {
+              "concurrency": 1,
+              "nodes": [
+                {
+                  "name": "dns-udp",
+                  "host": "8.8.8.8",
+                  "attempts": 1,
+                  "timeout": "2s",
+                  "interval": "0s",
+                  "udp_request": {
+                    "port": 53,
+                    "request_payload": "<base64-encoded-dns-request>",
+                    "expected_response_prefix": null
+                  }
+                }
+              ]
+            }
+          },
+          "http": {
+            "probe": {
+              "concurrency": 1,
+              "nodes": [
+                {
+                  "name": "api-health",
+                  "host": "api.example.com",
+                  "attempts": 2,
+                  "timeout": "3s",
+                  "interval": "500ms",
+                  "http": {
+                    "url": "https://api.example.com/health",
+                    "expected_status_min": 200,
+                    "expected_status_max": 299,
+                    "follow_redirects": true
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+
+    // Plus Task 不是 Agent 编译进程中的固定 Rust 分支；它要求当前会话已经确认对应 Worker。
+    "plus": {
+      "task_kind": "由插件 Manifest 声明的稳定 Task kind，例如 smalux.plus.echo.v1",
+      "proto": "PluginTaskConfig",
+      "result": "PluginTaskResult",
+      "parameters": {
+        "plugin_id": {
+          "type": "string",
+          "required": true,
+          "constraints": ["必须匹配本地已安装 Manifest"]
+        },
+        "plugin_version": {
+          "type": "string",
+          "required": true,
+          "constraints": ["必须匹配本地已安装版本和当前 runtime snapshot"]
+        },
+        "task_kind": {
+          "type": "string",
+          "required": true,
+          "constraints": ["必须在 Manifest 和 Schema 中声明"]
+        },
+        "schema_version": {
+          "type": "uint32",
+          "required": true,
+          "constraints": ["必须大于零", "必须与该 Task Schema 版本匹配"]
+        },
+        "task_config": {
+          "type": "bytes",
+          "required": false,
+          "default": "empty bytes",
+          "description": "插件私有 Protobuf 配置；Agent 不解析，只校验身份和 Schema 版本。"
+        }
+      },
+      "preconditions": [
+        "插件已安装且 Manifest 通过校验",
+        "Manifest 声明 task_kind",
+        "Schema Bundle 中存在 task_kind 且版本匹配",
+        "Server 已下发并且 Agent 已确认 PluginRuntimeSnapshot",
+        "对应 Worker 处于 running 状态",
+        "插件未因连续失败进入 paused"
+      ],
+      "runtime_config_difference": "PluginRuntimeConfig 是 Worker 共享运行配置和并发参数；PluginTaskConfig 是某个 Job 单次执行的私有参数。",
+      "example": {
+        "plugin": {
+          "plugin_id": "smalux.plus.echo",
+          "plugin_version": "0.1.0",
+          "task_kind": "smalux.plus.echo.v1",
+          "schema_version": 1,
+          "task_config": "<base64-encoded-plugin-protobuf-config>"
+        }
+      }
+    }
+  },
+
+  // 目录由 smalux-core 统一解析；SMALUX_HOME 设置后会覆盖平台默认根目录。
+  "paths": {
+    "root_environment": "SMALUX_HOME",
+    "layout_when_root_is_set": {
+      "config_dir": "<SMALUX_HOME>/config",
+      "data_dir": "<SMALUX_HOME>/data",
+      "cache_dir": "<SMALUX_HOME>/cache"
+    },
+    "agent_paths": {
+      "state_file": "<data_dir>/agent/connection-state.json",
+      "job_policy_file": "<data_dir>/agent/job-policy.json",
+      "plugin_directory": "<data_dir>/agent/plugins",
+      "plugin_data_directory": "<data_dir>/plus/<plugin_id>/<plugin_version>",
+      "log_directory": "<data_dir>/logs/<component>",
+      "log_file": "<data_dir>/logs/<component>/smalux.log"
+    },
+    "platform_defaults": {
+      "windows": {
+        "config_dir": "%APPDATA%/smalux",
+        "data_dir": "%LOCALAPPDATA%/smalux",
+        "cache_dir": "%LOCALAPPDATA%/smalux/cache"
+      },
+      "linux_macos": {
+        "config_dir": "$XDG_CONFIG_HOME/smalux 或 ~/.config/smalux",
+        "data_dir": "$XDG_DATA_HOME/smalux 或 ~/.local/share/smalux",
+        "cache_dir": "$XDG_CACHE_HOME/smalux 或 ~/.cache/smalux"
+      }
+    },
+    "rules": [
+      "身份私钥、Server 公钥和策略文件属于 data/config，不应放入 cache",
+      "Plus 插件业务状态只允许写入自己的 plugin_data_directory",
+      "日志按日期或 10 MiB 滚动，最多保留 10 个历史文件",
+      "目录解析函数本身不创建目录；Agent 启动阶段显式创建需要的目录"
+    ]
+  },
+
+  // 一个最小的端到端配置示意；它只用于理解参数之间的关系，不会被程序读取。
+  "complete_example": {
+    "agent_start": {
+      "command": "smalux-agent run --server-endpoint https://agent.example.com --grpc-prefix /api/v1/grpc --heartbeat-interval 30s --offline-job-timeout 30m",
+      "environment": {
+        "RUST_LOG": "smalux_agent=info,smalux_protocol=info",
+        "SMALUX_HOME": "C:/smalux",
+        "SMALUX_REGISTRATION_TOKEN": "<registration-token-only-for-first-registration>"
+      }
+    },
+    "remote_job_shape": {
+      "job_id": "<base64-encoded-16-byte-uuid>",
+      "revision": 1,
+      "enabled": true,
+      "trigger": {
+        "interval": {
+          "every": "30s"
+        },
+        "misfire": {
+          "behavior": "skip",
+          "max_runs": 0
+        }
+      },
+      "task": {
+        "system": {}
+      }
+    },
+    "flow": [
+      "Agent 读取 CLI、环境变量和默认值并完成本地限制校验",
+      "首次连接使用 Token 完成 XXpsk3；已注册连接使用 IK",
+      "Server 下发 JobDefinition，Agent 校验 Trigger、JobOptions 和 Task oneof",
+      "Scheduler 按 Trigger 执行固定 Task，Task 返回 TaskResult",
+      "TaskReportSink 把结果交给加密会话；断线时进入有界内存 Outbox",
+      "连接恢复后按 FIFO 补发，长期断线到期后清空远程 Job，Server 再次下发"
+    ]
+  }
+}

@@ -2,6 +2,7 @@
 //!
 //! 本模块只处理管理请求和领域服务调用；协议 DTO 位于 protocol 子模块，本地传输位于 ipc 子模块。
 
+use prost::Message;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -17,6 +18,7 @@ use crate::{
     database::{AgentRecord, RegistrationTokenRecord, RevokeTokenOutcome, ServerDatabase},
     service::agent::{
         agent_registry::AgentRegistry,
+        control_plane::AgentControlPlane,
         keyring_manager::ServerKeyRingManager,
         session_registry::{SessionRegistry, SessionSnapshot},
     },
@@ -39,6 +41,8 @@ pub(crate) struct AdminService {
     keyring: Arc<ServerKeyRingManager>,
     /// 当前进程 Session 的查询和取消入口。
     sessions: SessionRegistry,
+    /// 远程 Job 目录的事务提交与在线会话对账入口。
+    control_plane: Arc<AgentControlPlane>,
     /// 启动时已验证的非敏感运行配置快照。
     runtime_config: RuntimeConfig,
     /// 与 HTTP/gRPC Server 共用的全局关闭令牌。
@@ -52,6 +56,7 @@ impl AdminService {
         registry: Arc<AgentRegistry>,
         keyring: Arc<ServerKeyRingManager>,
         sessions: SessionRegistry,
+        control_plane: Arc<AgentControlPlane>,
         runtime_config: RuntimeConfig,
         shutdown: CancellationToken,
     ) -> Self {
@@ -61,6 +66,7 @@ impl AdminService {
             registry,
             keyring,
             sessions,
+            control_plane,
             runtime_config,
             shutdown,
         }
@@ -246,6 +252,113 @@ impl AdminService {
                     disconnected_sessions,
                 })
             }
+            ControlRequest::ReplaceAgentJobCatalog {
+                agent_id,
+                definitions,
+                expected_revision,
+            } => {
+                validate_agent_id(&agent_id)?;
+                let jobs = definitions
+                    .iter()
+                    .map(|definition| {
+                        smalux_protocol::agent::v1::JobDefinition::decode(definition.as_slice())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        AdminError::invalid(format!("invalid JobDefinition payload: {error}"))
+                    })?;
+                let catalog = self
+                    .control_plane
+                    .replace_catalog_if_revision(&agent_id, jobs, expected_revision)
+                    .await
+                    .map_err(map_control_plane_error)?;
+                Ok(ControlResponse::AgentJobCatalog(Some(catalog_view(
+                    catalog,
+                ))))
+            }
+            ControlRequest::GetAgentJobCatalog { agent_id } => {
+                validate_agent_id(&agent_id)?;
+                let catalog = self
+                    .database
+                    .load_agent_job_catalog(&agent_id, &Default::default())
+                    .await
+                    .map_err(AdminError::internal)?;
+                Ok(ControlResponse::AgentJobCatalog(catalog.map(catalog_view)))
+            }
+            ControlRequest::ReplaceAgentPluginRuntime {
+                agent_id,
+                runtimes,
+                expected_revision,
+            } => {
+                validate_agent_id(&agent_id)?;
+                let mut stored = Vec::with_capacity(runtimes.len());
+                for runtime in runtimes {
+                    let hash = parse_schema_hash(&runtime.schema_hash)?;
+                    let (schema_version, config) =
+                        crate::service::agent::plugin_config::encode_runtime_config(
+                            &self.database,
+                            &runtime.plugin_id,
+                            &runtime.plugin_version,
+                            &hash,
+                            &runtime.config,
+                        )
+                        .await
+                        .map_err(AdminError::internal)?;
+                    stored.push(crate::database::StoredPluginRuntime {
+                        plugin_id: runtime.plugin_id,
+                        plugin_version: runtime.plugin_version,
+                        schema_hash: hash.to_vec(),
+                        schema_version,
+                        config,
+                        requested_concurrency: runtime.requested_concurrency,
+                    });
+                }
+                let revision = self
+                    .control_plane
+                    .replace_plugin_runtime_if_revision(&agent_id, stored, expected_revision)
+                    .await
+                    .map_err(map_control_plane_error)?;
+                Ok(ControlResponse::AgentPluginRuntimeUpdated { agent_id, revision })
+            }
+            ControlRequest::GetAgentPluginRuntime { agent_id } => {
+                validate_agent_id(&agent_id)?;
+                let runtime = self
+                    .database
+                    .get_agent_plugin_runtime(&agent_id)
+                    .await
+                    .map_err(AdminError::internal)?;
+                Ok(ControlResponse::AgentPluginRuntime(
+                    runtime.map(plugin_runtime_view),
+                ))
+            }
+            ControlRequest::ListTaskReports { agent_id, limit } => {
+                validate_page_limit(limit)?;
+                if let Some(agent_id) = agent_id.as_deref() {
+                    validate_agent_id(agent_id)?;
+                }
+                let reports = self
+                    .database
+                    .list_task_reports(agent_id.as_deref(), limit as u64)
+                    .await
+                    .map_err(AdminError::internal)?;
+                Ok(ControlResponse::TaskReports(
+                    reports.into_iter().map(task_report_view).collect(),
+                ))
+            }
+            ControlRequest::ListJobEvents { agent_id, limit } => {
+                validate_page_limit(limit)?;
+                if let Some(agent_id) = agent_id.as_deref() {
+                    validate_agent_id(agent_id)?;
+                }
+                let events = self
+                    .database
+                    .list_job_events(agent_id.as_deref(), limit as u64)
+                    .await
+                    .map_err(AdminError::internal)?;
+                Ok(ControlResponse::JobEvents(
+                    events.into_iter().map(job_event_view).collect(),
+                ))
+            }
             ControlRequest::ListSessions { agent_id, state } => {
                 validate_filter(
                     state.as_deref(),
@@ -334,6 +447,16 @@ impl AdminService {
     }
 }
 
+/// 把控制面 CAS 冲突转换为本地 IPC 可识别的 `conflict` 错误，其余原因保持脱敏内部错误。
+fn map_control_plane_error(error: anyhow::Error) -> AdminError {
+    if let Some(crate::database::DatabaseError::RevisionConflict { .. }) =
+        error.downcast_ref::<crate::database::DatabaseError>()
+    {
+        return AdminError::conflict(error.to_string());
+    }
+    AdminError::internal(error)
+}
+
 /// 管理边界内部错误；`message` 必须适合直接返回本地调用方。
 struct AdminError {
     code: String,
@@ -401,6 +524,75 @@ fn agent_view(record: AgentRecord, sessions: &[SessionSnapshot]) -> AgentView {
     }
 }
 
+fn catalog_view(record: crate::database::AgentJobCatalogRecord) -> AgentJobCatalogView {
+    AgentJobCatalogView {
+        agent_id: record.agent_id,
+        catalog_revision: record.catalog.catalog_revision,
+        definitions: record
+            .catalog
+            .jobs
+            .iter()
+            .map(Message::encode_to_vec)
+            .collect(),
+    }
+}
+
+fn task_report_view(record: crate::database::TaskReportRecord) -> TaskReportView {
+    TaskReportView {
+        report_id: record.report_id,
+        agent_id: record.agent_id,
+        job_id: record.job_id,
+        job_revision: record.job_revision,
+        run_id: record.run_id,
+        attempt: record.attempt,
+        scheduled_at_unix_micros: record.scheduled_at,
+        started_at_unix_micros: record.started_at,
+        result_kind: record.result_kind,
+        payload: record.payload,
+        received_at_unix_micros: record.received_at,
+    }
+}
+
+fn job_event_view(record: crate::database::JobEventRecord) -> JobEventView {
+    JobEventView {
+        event_id: record.event_id,
+        agent_id: record.agent_id,
+        instance_id: record.instance_id,
+        sequence: record.sequence,
+        kind: record.kind,
+        job_id: record.job_id,
+        revision: record.revision,
+        run_id: record.run_id,
+        attempt: record.attempt,
+        emitted_at_unix_micros: record.emitted_at,
+        message: record.message,
+        will_retry: record.will_retry,
+        gap_detected: record.gap_detected,
+        payload: record.payload,
+    }
+}
+
+fn plugin_runtime_view(
+    record: crate::database::AgentPluginRuntimeRecord,
+) -> AgentPluginRuntimeView {
+    AgentPluginRuntimeView {
+        agent_id: record.agent_id,
+        revision: record.revision,
+        runtimes: record
+            .runtimes
+            .into_iter()
+            .map(|runtime| StoredPluginRuntimeView {
+                plugin_id: runtime.plugin_id,
+                plugin_version: runtime.plugin_version,
+                schema_hash: runtime.schema_hash,
+                schema_version: runtime.schema_version,
+                config: runtime.config,
+                requested_concurrency: runtime.requested_concurrency,
+            })
+            .collect(),
+    }
+}
+
 /// 将内部 Session 快照映射为稳定字符串状态的 IPC DTO。
 fn session_view(snapshot: SessionSnapshot) -> SessionView {
     SessionView {
@@ -446,6 +638,36 @@ fn validate_token_id(token_id: &str) -> Result<(), AdminError> {
         .map_err(|_| AdminError::invalid("registration Token ID is invalid"))
 }
 
+/// Agent ID 是 Server 生成的稳定键；管理接口只接受非空、受限长度的值。
+fn validate_agent_id(agent_id: &str) -> Result<(), AdminError> {
+    if agent_id.is_empty() || agent_id.len() > 64 || agent_id.chars().any(char::is_control) {
+        return Err(AdminError::invalid("Agent ID is invalid"));
+    }
+    Ok(())
+}
+
+fn parse_schema_hash(value: &str) -> Result<[u8; 32], AdminError> {
+    if value.len() != 64 || !value.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(AdminError::invalid(
+            "plugin Schema hash must be 64 hexadecimal characters",
+        ));
+    }
+    let mut output = [0u8; 32];
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        output[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Ok(output)
+}
+
+fn hex_nibble(value: u8) -> Result<u8, AdminError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(AdminError::invalid("plugin Schema hash is invalid")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -459,8 +681,8 @@ mod tests {
         config::{DatabaseConfig, RuntimeConfig},
         database::{ServerDatabase, entity::agent},
         service::agent::{
-            agent_registry::AgentRegistry, keyring_manager::ServerKeyRingManager,
-            session_registry::SessionRegistry,
+            agent_registry::AgentRegistry, control_plane::AgentControlPlane,
+            keyring_manager::ServerKeyRingManager, session_registry::SessionRegistry,
         },
     };
     use tokio_util::sync::CancellationToken;
@@ -487,12 +709,17 @@ mod tests {
                 .unwrap(),
         );
         let sessions = SessionRegistry::default();
+        let control_plane = Arc::new(AgentControlPlane::new(
+            Arc::clone(&database),
+            sessions.clone(),
+        ));
         (
             AdminService::new(
                 Arc::clone(&database),
                 registry,
                 keyring,
                 sessions.clone(),
+                control_plane,
                 RuntimeConfig {
                     address: "127.0.0.1".to_owned(),
                     port: 12345,

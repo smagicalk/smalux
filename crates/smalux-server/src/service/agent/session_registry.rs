@@ -3,9 +3,14 @@
 //! 数据库保存长期 Agent 身份，这里只保存随连接存在的诊断状态和独立取消令牌。记录不含
 //! Noise 密钥、注册 Token 或业务明文；Server 重启后目录自然清空。
 
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::SystemTime,
+};
 
-use tokio::sync::RwLock;
+use smalux_protocol::agent::v1::AgentReconcileSummary;
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +56,12 @@ pub(crate) struct SessionSnapshot {
 struct SessionEntry {
     snapshot: SessionSnapshot,
     cancellation: CancellationToken,
+    /// 权威 Job catalog 发生变更时唤醒业务循环；watch 会合并高频连续更新。
+    catalog_change: watch::Sender<u64>,
+    /// Plus Worker runtime 发生变更时唤醒业务循环。
+    ///
+    /// 目录和 runtime 使用两个独立信号，修改普通 Job 时不会无条件重启 Worker。
+    runtime_change: watch::Sender<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -60,6 +71,11 @@ struct SessionEntry {
 /// 释放锁，不会把锁守卫带入数据库或网络操作。
 pub(crate) struct SessionRegistry {
     entries: Arc<RwLock<BTreeMap<u64, SessionEntry>>>,
+    /// 当前 Server 进程最近见到的每个 Agent 进程实例 ID。
+    ///
+    /// 该缓存只用于重连优化，不是持久化授权状态；Server 重启后第一次连接自然执行
+    /// 完整同步，新的 Agent 进程实例也必须执行完整同步。
+    reconcile_instances: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
 impl SessionRegistry {
@@ -68,6 +84,8 @@ impl SessionRegistry {
     /// worker 必须在结束时调用 [`Self::remove`]，否则管理状态会保留陈旧连接。
     pub(crate) async fn register(&self, session_id: u64) -> CancellationToken {
         let cancellation = CancellationToken::new();
+        let (catalog_change, _) = watch::channel(0u64);
+        let (runtime_change, _) = watch::channel(0u64);
         let now = unix_timestamp_micros();
         self.entries.write().await.insert(
             session_id,
@@ -81,6 +99,8 @@ impl SessionRegistry {
                     last_activity_at_unix_micros: now,
                 },
                 cancellation: cancellation.clone(),
+                catalog_change,
+                runtime_change,
             },
         );
         cancellation
@@ -179,6 +199,74 @@ impl SessionRegistry {
         matches.len()
     }
 
+    /// 订阅指定 Session 的权威目录变化；Session 已结束时返回 None。
+    pub(crate) async fn subscribe_catalog_changes(
+        &self,
+        session_id: u64,
+    ) -> Option<watch::Receiver<u64>> {
+        self.entries
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| entry.catalog_change.subscribe())
+    }
+
+    /// 订阅指定 Session 的 Plus runtime 变化；Session 已结束时返回 None。
+    pub(crate) async fn subscribe_runtime_changes(
+        &self,
+        session_id: u64,
+    ) -> Option<watch::Receiver<u64>> {
+        self.entries
+            .read()
+            .await
+            .get(&session_id)
+            .map(|entry| entry.runtime_change.subscribe())
+    }
+
+    /// 通知指定 Agent 的全部在线会话在安全边界重新读取并下发完整目录。
+    pub(crate) async fn notify_catalog_changed(&self, agent_id: &str) -> usize {
+        let entries = self.entries.read().await;
+        let mut notified = 0;
+        for entry in entries.values() {
+            if entry.snapshot.agent_id.as_deref() == Some(agent_id) {
+                entry.catalog_change.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
+                notified += 1;
+            }
+        }
+        notified
+    }
+
+    /// 通知指定 Agent 的全部在线会话重新读取并下发 runtime 快照。
+    pub(crate) async fn notify_runtime_changed(&self, agent_id: &str) -> usize {
+        let entries = self.entries.read().await;
+        let mut notified = 0;
+        for entry in entries.values() {
+            if entry.snapshot.agent_id.as_deref() == Some(agent_id) {
+                entry.runtime_change.send_modify(|generation| {
+                    *generation = generation.wrapping_add(1);
+                });
+                notified += 1;
+            }
+        }
+        notified
+    }
+
+    /// 记录 Agent 对账摘要的进程实例，并返回是否是该 Agent 的新进程实例。
+    pub(crate) async fn observe_reconcile_instance(
+        &self,
+        agent_id: &str,
+        summary: &AgentReconcileSummary,
+    ) -> bool {
+        let mut instances = self.reconcile_instances.write().await;
+        let changed = instances
+            .get(agent_id)
+            .is_none_or(|current| current.as_slice() != summary.instance_id.as_slice());
+        instances.insert(agent_id.to_owned(), summary.instance_id.clone());
+        changed
+    }
+
     /// worker 退出后删除实时记录；删除不存在的 ID 保持幂等。
     pub(crate) async fn remove(&self, session_id: u64) {
         self.entries.write().await.remove(&session_id);
@@ -201,6 +289,7 @@ fn unix_timestamp_micros() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{SessionRegistry, SessionStage};
+    use smalux_protocol::agent::v1::AgentReconcileSummary;
 
     #[tokio::test]
     async fn disconnecting_an_agent_cancels_only_its_sessions() {
@@ -225,5 +314,51 @@ mod tests {
         registry.register(7).await;
         registry.remove(7).await;
         assert!(registry.get(7).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_and_runtime_notifications_are_independent() {
+        let registry = SessionRegistry::default();
+        registry.register(1).await;
+        registry.mark_authenticated(1, "agent-a", "ik").await;
+        let mut catalog = registry.subscribe_catalog_changes(1).await.unwrap();
+        let mut runtime = registry.subscribe_runtime_changes(1).await.unwrap();
+
+        assert_eq!(registry.notify_catalog_changed("agent-a").await, 1);
+        assert!(catalog.changed().await.is_ok());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), runtime.changed())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(registry.notify_runtime_changed("agent-a").await, 1);
+        assert!(runtime.changed().await.is_ok());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), catalog.changed())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn new_agent_process_instance_is_detected_across_reconnects() {
+        let registry = SessionRegistry::default();
+        let first = AgentReconcileSummary {
+            instance_id: vec![1; 16],
+            ..Default::default()
+        };
+        let same = first.clone();
+        let second = AgentReconcileSummary {
+            instance_id: vec![2; 16],
+            ..Default::default()
+        };
+        assert!(registry.observe_reconcile_instance("agent-a", &first).await);
+        assert!(!registry.observe_reconcile_instance("agent-a", &same).await);
+        assert!(
+            registry
+                .observe_reconcile_instance("agent-a", &second)
+                .await
+        );
     }
 }

@@ -6,7 +6,17 @@
 //! repository/service 层组合。
 
 pub mod agent;
+pub mod agent_capability;
+pub mod agent_job;
+pub mod agent_job_catalog;
+pub mod agent_job_version;
+pub mod agent_plugin_inventory;
+pub mod agent_plugin_runtime;
+pub mod agent_plugin_runtime_catalog;
 pub mod agent_registration;
+pub mod job_command;
+pub mod job_event;
 pub mod plugin_schema;
 pub mod registration_token;
 pub mod server_keyring;
+pub mod task_report;

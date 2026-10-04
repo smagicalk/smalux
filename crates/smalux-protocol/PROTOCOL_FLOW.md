@@ -78,7 +78,7 @@ let server_key = store.load_server_public_key()?;
 // 2. IK 在两条握手消息内完成双方静态身份认证。
 let mut client = AgentProtocolClient::new("https://agent.example.com");
 client.set_grpc_prefix("/api/v1/grpc");
-let session = client.connect(&identity, server_key).await?;
+let session = client.connect_ik(&identity, server_key).await?;
 
 // 3. 后续只在当前会话上收发业务消息，不再提交注册 Token。
 let mut running = SessionDriver::spawn(session, SessionDriverConfig::default());
@@ -275,7 +275,7 @@ Server 的注册存储应以 Token、Agent 公钥和注册事务 ID保证幂等�
 ### 5.1 Agent 调用顺序
 
 1. 恢复 Agent `NoiseIdentity` 和已固定的 Server 公钥。
-2. 调用 `AgentProtocolClient::connect(identity, server_key)`。
+2. 调用 `AgentProtocolClient::connect_ik(identity, server_key)`。
 3. Server 换钥窗口内可以调用 `connect_with_candidates()`按顺序尝试多把可信 Server 公钥。
 4. IK 两消息握手成功后获得 `TonicNoiseSession`。
 
@@ -446,8 +446,43 @@ Server 通过 `send_job_command()`下发 `JobCommand`。Agent 收到 `SessionEve
 
 连接断开不会自动删除 Agent 已安装的 Job，短时波动期间仍可继续采集。
 
-当前协议没有为 `TaskReport`定义跨连接持久化 ACK 和重放状态机。需要保证断线不丢数据时，Agent
-应先把 TaskReport 写入本地队列，连接恢复后再发送；去重 ID、确认水位和过期策略需要后续单独设计。
+如果 Agent 收到增量命令时发现 `catalog_revision` 不是当前版本加一，会返回
+`JobCommandStatus::RESYNC_REQUIRED`。Server 收到后重新读取数据库权威目录，并发送新的完整
+`ReplaceAllJobs`；同一目录版本的恢复请求在会话内只处理一次，避免丢包或重试造成命令风暴：
+
+```text
+Agent current catalog = 4
+Server sends Upsert(catalog_revision = 6)
+    -> Agent returns RESYNC_REQUIRED(current = 4)
+    -> Server loads the latest catalog from database
+    -> Server records and sends ReplaceAllJobs(catalog_revision = N)
+    -> Agent applies snapshot and returns APPLIED
+```
+
+重连时 Agent 先发送 `AgentReconcileSummary`，内容是进程实例 UUID、目录/runtime revision 和
+BLAKE2s-256 digest。Server 在 capability、inventory 和 runtime 条件满足后比较摘要：
+
+```rust,ignore
+let (catalog_revision, catalog_digest) = remote_jobs.catalog_reconcile_state().await;
+let (runtime_revision, runtime_digest) = plugin_runtime.reconcile_state();
+handle.send_reconcile_summary(AgentReconcileSummary {
+    instance_id: process_instance_id.to_vec(),
+    catalog_revision,
+    catalog_digest,
+    runtime_revision,
+    runtime_digest,
+}).await?;
+```
+
+revision 和 digest 都相同则跳过对应完整快照；只有不一致的资源才重新发送。摘要缺失、非法
+或进程实例发生变化时回退到完整同步。Agent 进程实例 ID 不写入磁盘，重启一定会触发一次
+完整同步；同一进程断线重连可以复用现有 Job 和 Worker 状态。
+
+`TaskReport` 和 `JobEvent` 没有额外的业务 ACK，但 Server 会持久化并幂等处理：TaskReport
+按 `agent_id + job_id + job_revision + run_id + attempt` 去重，并通过 Job 历史版本校验
+归属；JobEvent 按 `agent_id + instance_id + sequence` 去重。相同身份、不同 payload 会被
+拒绝。JobEvent 的 sequence 只对实际发出的诊断事件编号，Server 会把跳号记录为事件缺口。
+Agent 当前仍使用有界内存队列，断电或进程崩溃前的未发送结果不会自动恢复。
 
 ## 13. 错误和关闭
 

@@ -49,9 +49,10 @@ Smalux 采用 Rust workspace 组织项目结构，将可执行程序与共享库
   The monitoring probe deployed close to observed systems.  
   Responsible for data collection, preprocessing, buffering, and reporting.
 
-- **smalux-server**  
-  The central collector and management service.  
-  Handles data ingestion, aggregation, querying, and configuration management.
+- **smalux-server**
+  The server-side control plane and data intake process.
+  Handles Agent registration, Job catalogs, reconciliation, and report/event persistence.
+  Management HTTP APIs, dashboards, and long-term metric aggregation remain future work.
 
 - **smalux-core**  
   Shared core library containing common types, configuration models, error definitions, and utilities.
@@ -83,13 +84,16 @@ Smalux consists of a small set of focused components, each responsible for a wel
   Runs close to the observed system and performs data collection, preprocessing, buffering, and reporting.
 
 - **Collector / Server**  
-  Receives, validates, aggregates, and exposes monitoring data through query and management APIs.
+  Receives and validates Agent messages, persists Job state and reports, and exposes the current
+  local management interface. Query APIs and metric aggregation are planned separately.
 
 - **Storage Layer**  
-  Persists metrics, events, and configuration data using purpose-built storage backends.
+  Persists registration, Job/runtime state, reports, and lifecycle events using SeaORM backends.
+  A time-series aggregation and retention model is not part of the current minimal loop.
 
 - **Web Interface**  
-  Provides visualization, system overview, and operational access.
+  The current `website/` is a Docusaurus documentation site. A monitoring management interface
+  has not been added yet.
 
 - **gRPC Transport**
   Provides a built-in, strongly-typed bidirectional transport definition for Agent and Server communication.
@@ -101,13 +105,15 @@ Smalux 由一组职责明确的核心组件构成：
   运行在被监控系统附近，负责数据采集、预处理、缓冲以及数据上报。
 
 - **收集器 / 服务端**  
-  接收、校验、聚合监控数据，并通过查询与管理接口对外提供服务。
+  接收并校验 Agent 消息，保存注册、Job、报告和事件状态，并提供本地管理 IPC；查询 API、
+  聚合和告警能力留待后续实现。
 
 - **存储层**  
-  使用合适的存储后端对指标、事件和配置数据进行持久化。
+  使用 SeaORM 后端持久化注册、Job/runtime、报告和生命周期事件；当前尚未定义完整的时序
+  指标聚合与保留模型。
 
 - **Web 界面**  
-  用于系统状态可视化与运维操作。
+  当前 `website/` 是 Docusaurus 文档站，监控管理界面尚未实现。
 
 - **gRPC Transport**
   提供 Agent 与 Server 通信所需的内置强类型双向流定义。
@@ -165,15 +171,17 @@ Rust is used consistently across probe agents and server-side components to ensu
 
 ### Frontend | 前端
 
-The Smalux web interface is built with **React** and **TypeScript**, focusing on clarity, responsiveness, and ease of iteration.
+The current `website/` is a **Docusaurus** documentation site built with React, TypeScript, and
+pnpm. It is not yet the monitoring management UI.
 
 ---
 
 ### Data & Communication | 数据与通信
 
-HTTP-based interfaces are used as the primary integration surface, prioritizing debuggability and operational transparency.
-
-The Protocol crate is being reduced to a shared, versioned gRPC schema. Concrete RPC contracts will be added only after their reporting, Job, authentication, and streaming boundaries are defined.
+HTTP-based interfaces are used for health checks and future management integration. Agent/Server
+business traffic uses the shared, versioned Protocol crate, which already contains the generated
+Proto model, Noise authentication/encryption, Tonic streaming transport, Job/Task messages, and
+reconciliation contracts.
 
 ---
 
@@ -197,7 +205,8 @@ New capabilities can be introduced incrementally while preserving the core princ
 
 Smalux is developed iteratively, with an emphasis on correctness, operational experience, and real-world feedback.
 
-Future work includes improvements to observability quality, operational ergonomics, and versioned gRPC interactions between Agent and Server.
+Future work includes management APIs and UI, metric querying/retention, production deployment,
+and further operational hardening around the existing Agent/Server Protocol loop.
 
 ---
 

@@ -18,7 +18,7 @@ pub use error::PluginError;
 pub use manifest::{PluginManifest, PluginPlatform, PluginVersion};
 pub use protocol::{WorkerFrame, WorkerRequest, WorkerResponse};
 pub use schema::{
-    FieldControl, PluginFieldSchema, PluginSchemaBundle, PluginSchemaError, PluginTaskSchema,
-    SCHEMA_FORMAT_VERSION, SchemaHash,
+    FieldControl, PluginFieldSchema, PluginRuntimeSchema, PluginSchemaBundle, PluginSchemaError,
+    PluginTaskSchema, SCHEMA_FORMAT_VERSION, SchemaHash,
 };
 pub use task::{AgentContext, PlusTask, PlusTaskContext, PlusTaskError, PlusTaskOutput};

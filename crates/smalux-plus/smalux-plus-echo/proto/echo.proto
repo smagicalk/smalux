@@ -9,6 +9,9 @@ enum EchoMode {
   ECHO_MODE_DIAGNOSTIC = 2;
 }
 
+// Worker 共享运行时配置；Echo 不需要共享参数，保留空消息演示通用初始化流程。
+message EchoRuntimeConfig {}
+
 // 一次 Echo Task 的参数。
 message EchoTaskConfig {
   // 成功时原样返回的文本。

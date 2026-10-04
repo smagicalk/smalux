@@ -78,11 +78,12 @@ TLS 取决于网络边界；跨不可信网络时仍应使用 TLS。
 
 ## Agent 本地持久化
 
-Agent 至少需要分别持久化：Noise identity 与固定 Server key、注册状态、远程 Job 目录版本、离线上报
-队列。密钥材料和普通缓存的权限不同，实际部署时不应把所有文件放在可被普通用户读取的同一目录。
+Agent 当前分别持久化 Noise identity 与固定 Server key、注册状态和本地远程 Job policy；远程 Job 目录版本、离线上报
+队列、Scheduler 执行态和报告/event outbox 只在当前进程内，Server 数据库保存权威 Job catalog、报告和事件。密钥材料
+和普通缓存的权限不同，实际部署时不应把所有文件放在可被普通用户读取的同一目录。
 
-远程 Job 在断线后默认仍能按 Scheduler 继续执行。应用层可配置离线运行窗口；窗口到期后暂停远程 Job，
-但本地安全或维护 Job 可继续。重新连接后先完成目录 revision 对账，再恢复远程调度和上报。
+远程 Job 在断线后默认仍能按 Scheduler 继续执行。应用层可配置离线运行窗口；窗口到期后 Agent 清空远程 Job，
+但本地安全或维护 Job 可继续。重新连接后由 Server 按当前策略、能力和插件 inventory 过滤权威目录并重新下发。
 
 ## 多实例 Server
 

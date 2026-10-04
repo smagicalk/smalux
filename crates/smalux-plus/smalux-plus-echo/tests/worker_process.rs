@@ -3,11 +3,12 @@ use smalux_plus_core::{
     AgentContext,
     framing::{read_frame, write_frame},
     protocol::{
-        self, AgentContextMessage, ExecuteTask, Hello, InitializeWorker, Shutdown, WorkerFrame,
-        WorkerRequest, WorkerResponse, worker_frame, worker_request, worker_response,
+        self, AgentContextMessage, CancelTask, ExecuteTask, Hello, InitializeWorker, Shutdown,
+        WorkerFrame, WorkerRequest, WorkerResponse, worker_frame, worker_request, worker_response,
     },
 };
 use smalux_plus_echo::{EchoMode, EchoTaskConfig, EchoTaskResult};
+use tokio::time::{Duration, timeout};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 fn request(body: worker_request::Body) -> WorkerFrame {
@@ -70,6 +71,7 @@ async fn real_echo_worker_executes_with_agent_context_and_shutdown() {
             protocol_version: protocol::WORKER_PROTOCOL_VERSION,
             plugin_id: smalux_plus_echo::PLUGIN_ID.to_owned(),
             config_revision: 7,
+            runtime_config_version: 1,
             runtime_config: Vec::new(),
             max_concurrency: 1,
             agent_context: Some(context(&data_dir)),
@@ -99,7 +101,6 @@ async fn real_echo_worker_executes_with_agent_context_and_shutdown() {
     )
     .await
     .unwrap();
-    let _ = read_frame(&mut stdout).await.unwrap().unwrap();
     let result = read_frame(&mut stdout).await.unwrap().unwrap();
     let Some(worker_frame::Body::Response(WorkerResponse {
         body: Some(worker_response::Body::Result(result)),
@@ -112,6 +113,50 @@ async fn real_echo_worker_executes_with_agent_context_and_shutdown() {
     assert_eq!(output.target, "test-target");
     assert_eq!(output.mode, EchoMode::Diagnostic as i32);
     assert!(data_dir.join("plugin-data/execution-count.txt").is_file());
+
+    // Cancel 必须等任务真正结束后才由 Worker 返回 TaskResult(Cancelled)，而不是
+    // 仅确认 Cancel 帧已经写入 stdin。
+    let delayed = EchoTaskConfig {
+        message: "cancel-me".to_owned(),
+        delay_millis: 5_000,
+        fail: false,
+        mode: EchoMode::Normal as i32,
+        target: "cancel-target".to_owned(),
+    };
+    write_frame(
+        &mut stdin,
+        &request(worker_request::Body::Execute(ExecuteTask {
+            request_id: "request-2".to_owned(),
+            run_id: vec![2; 16],
+            task_kind: smalux_plus_echo::TASK_KIND.to_owned(),
+            schema_version: 1,
+            config: delayed.encode_to_vec(),
+            deadline_unix_millis: 0,
+        })),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut stdin,
+        &request(worker_request::Body::Cancel(CancelTask {
+            request_id: "request-2".to_owned(),
+            reason: "test cancellation".to_owned(),
+        })),
+    )
+    .await
+    .unwrap();
+    let cancelled = timeout(Duration::from_secs(2), read_frame(&mut stdout))
+        .await
+        .expect("Worker must confirm cancellation before the test timeout")
+        .unwrap()
+        .unwrap();
+    let Some(worker_frame::Body::Response(WorkerResponse {
+        body: Some(worker_response::Body::Result(cancelled)),
+    })) = cancelled.body
+    else {
+        panic!("expected cancelled task result")
+    };
+    assert_eq!(cancelled.status, protocol::TaskStatus::Cancelled as i32);
 
     write_frame(
         &mut stdin,

@@ -8,7 +8,7 @@ use std::{collections::VecDeque, future::Future};
 use smalux_protocol::agent::v1::{JobCommandResult, TaskReport};
 
 use smalux_agent::client::{SmaluxClientError, SmaluxClientHandle};
-use smalux_agent::management::JobResultBufferStats;
+use smalux_agent::management::{JobEventBufferStats, JobResultBufferStats};
 
 /// 短时断线期间保存采集结果的有界内存队列。
 ///
@@ -18,6 +18,90 @@ pub(super) struct TaskReportOutbox {
     pending: VecDeque<TaskReport>,
     capacity: usize,
     dropped: u64,
+}
+
+/// 短时断线期间保存 Scheduler 生命周期事件的有界内存队列。
+pub(super) struct JobEventOutbox {
+    pending: VecDeque<smalux_protocol::agent::v1::JobEvent>,
+    capacity: usize,
+    dropped: u64,
+    stats: std::sync::Arc<JobEventBufferStats>,
+}
+
+impl JobEventOutbox {
+    pub(super) fn new(
+        capacity: usize,
+        stats: std::sync::Arc<JobEventBufferStats>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            capacity > 0,
+            "Job event outbox capacity must be greater than zero"
+        );
+        Ok(Self {
+            pending: VecDeque::with_capacity(capacity),
+            capacity,
+            dropped: 0,
+            stats,
+        })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+    pub(super) fn dropped_count(&self) -> u64 {
+        self.dropped
+    }
+
+    /// 在线发送；临时传输错误进入 FIFO，认证或协议错误继续返回。
+    pub(super) async fn submit(
+        &mut self,
+        client: &SmaluxClientHandle,
+        event: smalux_protocol::agent::v1::JobEvent,
+    ) -> anyhow::Result<()> {
+        if !self.pending.is_empty() {
+            self.push(event);
+            return Ok(());
+        }
+        match client.send_job_event(event.clone()).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_retryable() => {
+                self.push(event);
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) async fn flush(&mut self, client: &SmaluxClientHandle) -> anyhow::Result<()> {
+        while let Some(event) = self.pending.front().cloned() {
+            match client.send_job_event(event).await {
+                Ok(()) => {
+                    self.pending.pop_front();
+                    self.stats.update(self.pending.len(), self.dropped);
+                }
+                Err(error) if error.is_retryable() => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, event: smalux_protocol::agent::v1::JobEvent) {
+        if self.pending.len() == self.capacity {
+            self.pending.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+            tracing::warn!(
+                capacity = self.capacity,
+                dropped_events = self.dropped,
+                "Agent Job event outbox dropped its oldest event"
+            );
+        }
+        self.pending.push_back(event);
+        self.stats.update(self.pending.len(), self.dropped);
+    }
 }
 
 impl TaskReportOutbox {
@@ -67,7 +151,7 @@ impl TaskReportOutbox {
         }
         match send(report.clone()).await {
             Ok(()) => Ok(()),
-            Err(SmaluxClientError::TemporarilyUnavailable) => {
+            Err(error) if error.is_retryable() => {
                 self.push(report);
                 Ok(())
             }
@@ -91,7 +175,7 @@ impl TaskReportOutbox {
                 Ok(()) => {
                     self.pending.pop_front();
                 }
-                Err(SmaluxClientError::TemporarilyUnavailable) => return Ok(()),
+                Err(error) if error.is_retryable() => return Ok(()),
                 Err(error) => return Err(error.into()),
             }
         }
@@ -172,7 +256,7 @@ impl JobResultOutbox {
         }
         match send(result.clone()).await {
             Ok(()) => Ok(()),
-            Err(SmaluxClientError::TemporarilyUnavailable) => {
+            Err(error) if error.is_retryable() => {
                 tracing::warn!(
                     pending_results = self.pending.len() + 1,
                     "Agent queued a Job command result until the session reconnects"
@@ -202,7 +286,7 @@ impl JobResultOutbox {
                     self.pending.pop_front();
                     self.stats.update(self.pending.len(), self.dropped);
                 }
-                Err(SmaluxClientError::TemporarilyUnavailable) => return Ok(()),
+                Err(error) if error.is_retryable() => return Ok(()),
                 Err(error) => return Err(error.into()),
             }
         }
@@ -233,8 +317,8 @@ mod tests {
 
     use smalux_protocol::agent::v1::JobCommandResult;
 
-    use super::{JobResultOutbox, SmaluxClientError, TaskReportOutbox};
-    use smalux_agent::management::JobResultBufferStats;
+    use super::{JobEventOutbox, JobResultOutbox, SmaluxClientError, TaskReportOutbox};
+    use smalux_agent::management::{JobEventBufferStats, JobResultBufferStats};
 
     fn result(command_id: &str) -> JobCommandResult {
         JobCommandResult {
@@ -260,6 +344,21 @@ mod tests {
 
         assert_eq!(outbox.pending_len(), 1);
         assert_eq!(outbox.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_transport_is_buffered_like_other_retryable_failures() {
+        let mut outbox = TaskReportOutbox::new(2).unwrap();
+        outbox
+            .submit_with(Default::default(), |_| async {
+                Err(SmaluxClientError::Transport(
+                    smalux_protocol::tonic_transport::TransportError::Closed,
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outbox.pending_len(), 1);
     }
 
     #[tokio::test]
@@ -294,6 +393,22 @@ mod tests {
             &[b"second".to_vec(), b"third".to_vec()]
         );
         assert!(outbox.is_empty());
+    }
+
+    #[test]
+    fn job_event_outbox_drops_oldest_and_updates_shared_stats() {
+        let stats = Arc::new(JobEventBufferStats::default());
+        let mut outbox = JobEventOutbox::new(2, Arc::clone(&stats)).unwrap();
+        for sequence in 1..=3 {
+            outbox.push(smalux_protocol::agent::v1::JobEvent {
+                sequence,
+                ..Default::default()
+            });
+        }
+        assert_eq!(outbox.dropped_count(), 1);
+        assert_eq!(outbox.pending_len(), 2);
+        assert_eq!(outbox.pending.front().unwrap().sequence, 2);
+        assert_eq!(stats.snapshot(), (2, 1));
     }
 
     #[tokio::test]

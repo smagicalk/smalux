@@ -76,6 +76,10 @@ smalux-protocol = { path = "../smalux-protocol"}
 smalux-plus-core = { path = "../smalux-plus/smalux-plus-core" }
 # Echo 示例需要直接调用 Prost 的 Message 编解码 trait。
 prost = "0.14.4"
+# TaskReport 和动态插件 Schema 使用标准 Protobuf 时间与描述符类型。
+prost-types = "0.14.4"
+# 根据 Agent 上传并校验的 FileDescriptorSet 动态校验和编码插件私有 Protobuf 参数。
+prost-reflect = { version = "0.16.5", features = ["serde"] }
 tonic = "0.14.6"
 # Noise XXpsk3/IK 握手和 transport mode 加密。
 snow = "0.10.0"
@@ -85,8 +89,6 @@ snow = "0.10.0"
 ctor = "1.0.8"
 # 使用正式 Agent Client 验证 Token 注册、状态落盘和 IK 重连链路。
 smalux-agent = { path = "../smalux-agent" }
-# 构造真实 FileDescriptorSet，验证 Plus Schema 数据库和缓存闭环。
-prost-types = "0.14.4"
 
 [target.'cfg(windows)'.dependencies]
 # 为本地管理命名管道设置仅本机所有者/管理员可访问的 ACL。

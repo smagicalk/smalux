@@ -233,7 +233,7 @@ async fn identity(command: IdentityCommand) -> anyhow::Result<()> {
         .to_owned(),
         agent_public_key_id: format!("{:?}", state.identity().public_key().key_id()),
         server_public_key_ids: state
-            .server_public_keys()
+            .server_key_candidates()
             .iter()
             .map(|key| format!("{:?}", key.key_id()))
             .collect(),

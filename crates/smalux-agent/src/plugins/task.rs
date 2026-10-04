@@ -42,7 +42,12 @@ impl ReportingTask for PluginReportingTask {
                 cancellation: context.cancellation,
             })
             .await
-            .map_err(|error| TaskError::Transient(anyhow::anyhow!(error)))?;
+            .map_err(|error| match error {
+                super::PluginWorkerError::InvalidTaskConfig(message) => {
+                    TaskError::Permanent(anyhow::anyhow!(message))
+                }
+                error => TaskError::Transient(anyhow::anyhow!(error)),
+            })?;
         Ok(TaskResult {
             sample: Some(SampleMetadata {
                 sampled_at_ms: context.started_at.timestamp_millis().max(0) as u64,

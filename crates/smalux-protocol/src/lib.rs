@@ -4,6 +4,7 @@
 //! Tonic 双向流适配和密钥轮换状态方法。持久化、授权和业务处理仍由调用方负责。
 
 pub mod noise;
+pub mod reconciliation;
 pub mod tonic_transport;
 
 /// Agent 交互协议。

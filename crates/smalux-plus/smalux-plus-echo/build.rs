@@ -14,6 +14,22 @@ struct SchemaBundle {
     descriptor_set: Vec<u8>,
     #[prost(message, repeated, tag = "5")]
     tasks: Vec<TaskSchema>,
+    #[prost(message, optional, tag = "6")]
+    runtime: Option<RuntimeSchema>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RuntimeSchema {
+    #[prost(uint32, tag = "1")]
+    schema_version: u32,
+    #[prost(string, tag = "2")]
+    config_message: String,
+    #[prost(string, tag = "3")]
+    display_name: String,
+    #[prost(string, tag = "4")]
+    description: String,
+    #[prost(message, repeated, tag = "5")]
+    fields: Vec<FieldSchema>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -99,6 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             description: "回显文本，用于验证 Plus 参数和结果链路。".to_owned(),
             fields: fields(),
         }],
+        runtime: Some(RuntimeSchema {
+            schema_version: 1,
+            config_message: "smalux.plus.echo.v1.EchoRuntimeConfig".to_owned(),
+            display_name: "Echo 运行时".to_owned(),
+            description: "Echo Worker 没有共享运行时参数。".to_owned(),
+            fields: Vec::new(),
+        }),
     };
     fs::write(&schema_path, bundle.encode_to_vec())?;
     println!(

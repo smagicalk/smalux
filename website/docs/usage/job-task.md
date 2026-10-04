@@ -127,13 +127,17 @@ session_handle.send_job_command_result(result).await?;
 ```
 
 `catalog_revision` 表示整个远程 Job 集合版本。增量命令必须恰好等于 Agent 当前版本加一，否则 Agent
-返回 `RESYNC_REQUIRED`，Server 应发送新的 `ReplaceAllJobs`，不能继续盲目追加增量。`ReplaceAllJobs`
+返回 `RESYNC_REQUIRED`，Server 会自动读取最新权威目录并发送新的 `ReplaceAllJobs`，不能继续盲目追加增量。`ReplaceAllJobs`
 携带 Server 的权威快照版本，可以跨过缺失的增量；相同版本可以重放，低于 Agent 当前版本的快照
 必须拒绝。
 
 一次典型对账过程是：Server 先读取 Agent 报告的目录版本；版本一致时继续发送下一条增量命令，版本
 缺失或断档时发送完整 `ReplaceAllJobs`。Agent 只有在完整目录校验并应用成功后才能提交新的
 `catalog_revision`，不能先更新版本再逐项写入，否则中途失败会留下无法解释的半更新状态。
+
+Agent 重连时还会发送目录/runtime 摘要。Server 在摘要的 revision 和 digest 都一致时跳过完整
+快照；新进程、摘要缺失或摘要不一致时自动完整同步。摘要只用于减少重复传输，不改变
+`ReplaceAllJobs` 的权威语义。
 
 ## 本地 Job 与远程 Job
 
@@ -157,7 +161,8 @@ smalux-agent jobs policy allow-all
 
 `add-task` 只接受 `smalux-agent tasks list` 显示的完整稳定 kind。加入后，匹配的远程 Job
 立即变为 Disabled，定时器、Pending 和重试被清理，正在运行的实例收到取消信号；本地 Job
-不受影响。规则只匹配外层 Task kind，CPU 不会连带匹配 System。
+不受影响。规则只匹配外层 Task kind，CPU 不会连带匹配 System。Server 的 `job list` 仍显示未过滤的
+权威原始定义；Agent `jobs list` 才显示策略和能力过滤后的实际安装目录。
 
 `remove-task` 和 `allow-all` 不直接启用旧定义。Agent 上报新策略后，Server 应重新读取权威
 目录并发送 `ReplaceAllJobs`。`allow-all` 只解除 `deny_all`，不会清空逐项黑名单。
@@ -321,7 +326,7 @@ session_handle.send_job_command_result(result).await?;
 
 ## 断线、恢复和旧结果
 
-断线不会自动调用 `RemoteJobController::clear`，已安装的远程 Job 可以继续运行一段时间。重新连接后，
+断线不会自动调用 `RemoteJobController::clear_remote_jobs`，已安装的远程 Job 可以继续运行一段时间。重新连接后，
 Server 应根据 Agent 上报的 `catalog_revision` 选择增量同步或 `ReplaceAllJobs`。如果应用要求“断线
 超过 N 分钟自动停采”，应由连接管理器记录断线时间并显式暂停 Job，不能让 Scheduler 通过 socket
 状态隐式改变业务状态。

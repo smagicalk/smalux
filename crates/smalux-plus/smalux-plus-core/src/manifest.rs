@@ -3,7 +3,7 @@
 //! 清单描述“插件是什么以及能做什么”，不描述插件如何加载。实际发布时清单会由
 //! 仓库元数据签名，Agent 只接受已信任仓库中与清单匹配的二进制文件。
 
-/// 插件版本，采用简单的三段式数字表示，避免 ABI 层依赖第三方 semver 类型。
+/// 插件版本，采用简单的三段式数字表示，避免公共契约依赖第三方 semver 类型。
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -44,7 +44,6 @@ pub struct PluginManifest {
     pub plugin_id: String,
     pub display_name: String,
     pub version: PluginVersion,
-    pub abi_version: u32,
     pub platform: PluginPlatform,
     /// 相对插件版本目录的 Worker 入口文件名，禁止使用绝对路径或父目录跳转。
     pub entrypoint: String,
@@ -63,17 +62,21 @@ impl PluginManifest {
 
     /// 校验清单中的公共身份字段，避免错误信息拖到 Worker 启动后才暴露。
     pub fn validate(&self) -> Result<(), crate::PluginError> {
-        if self.plugin_id.is_empty() || self.plugin_id.len() > 256 {
+        if !is_safe_component(&self.plugin_id) {
             return Err(crate::PluginError::InvalidManifest(
-                "plugin_id must contain 1..=256 bytes".to_owned(),
+                "plugin_id must be a safe 1..=256 byte identifier".to_owned(),
             ));
         }
-        if self.display_name.is_empty() || self.display_name.len() > 256 {
+        if self.display_name.is_empty()
+            || self.display_name.len() > 256
+            || has_control_character(&self.display_name)
+        {
             return Err(crate::PluginError::InvalidManifest(
-                "display_name must contain 1..=256 bytes".to_owned(),
+                "display_name must contain 1..=256 bytes and no control characters".to_owned(),
             ));
         }
         if self.entrypoint.is_empty()
+            || has_control_character(&self.entrypoint)
             || std::path::Path::new(&self.entrypoint).is_absolute()
             || self.entrypoint.split(['/', '\\']).any(|part| part == "..")
         {
@@ -87,6 +90,7 @@ impl PluginManifest {
             ));
         }
         if self.schema_file.is_empty()
+            || has_control_character(&self.schema_file)
             || std::path::Path::new(&self.schema_file).is_absolute()
             || self.schema_file.split(['/', '\\']).any(|part| part == "..")
         {
@@ -95,7 +99,11 @@ impl PluginManifest {
             ));
         }
         if self.task_types.is_empty()
-            || self.task_types.iter().any(|kind| kind.is_empty())
+            || self.task_types.iter().any(|kind| {
+                kind.is_empty()
+                    || kind.len() > 256
+                    || kind.chars().any(|character| character.is_control())
+            })
             || self.task_types.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(crate::PluginError::InvalidManifest(
@@ -103,5 +111,63 @@ impl PluginManifest {
             ));
         }
         Ok(())
+    }
+}
+
+/// 插件身份会进入目录和日志字段，只允许稳定的 ASCII 路径组件。
+fn is_safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn has_control_character(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> PluginManifest {
+        PluginManifest {
+            plugin_id: "smalux.plus.test".to_owned(),
+            display_name: "Test".to_owned(),
+            version: PluginVersion::new(1, 0, 0),
+            platform: PluginPlatform::Windows,
+            entrypoint: "worker.exe".to_owned(),
+            protocol_version: 1,
+            schema_file: "schema.pb".to_owned(),
+            task_types: vec!["smalux.plus.test.v1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn validation_rejects_path_traversal_identity() {
+        let mut value = manifest();
+        value.plugin_id = "../outside".to_owned();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn validation_accepts_stable_task_names() {
+        assert!(manifest().validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_control_characters_in_display_and_paths() {
+        let mut value = manifest();
+        value.display_name = "Test\nPlugin".to_owned();
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.entrypoint = "worker\0.exe".to_owned();
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.schema_file = "schema\t.pb".to_owned();
+        assert!(value.validate().is_err());
     }
 }

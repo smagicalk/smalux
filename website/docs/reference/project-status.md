@@ -21,6 +21,10 @@ description: 区分当前已实现、示例实现和待完成的能力。
 - ICMP、TCP Connect、UDP Request、HTTP 多节点探测；
 - Proto JobDefinition、JobCommand、TaskDefinition、TaskReport；
 - RemoteJobController 命令幂等、目录 revision 和远程所有权；
+- Server Job/runtime 控制面可选 CAS、目录和 runtime 独立通知；
+- Server 保留 Job 历史 revision，用于校验延迟 TaskReport/JobEvent 的 Agent 归属；
+- 重连 `AgentReconcileSummary` 摘要对账，以及新的 Agent 进程实例检测；
+- JobEvent 的进程实例序号、重复 payload 拒绝和序号缺口记录；
 - Noise XXpsk3、IK、加密 Session、心跳和同步 rekey；
 - Agent/Server 静态密钥轮换状态与 snapshot；
 - Tonic Client/Server 适配和 SessionDriver；
@@ -50,20 +54,21 @@ Example 用于说明调用流程，不具备生产数据库、审计、限流和
 正式入口的当前状态也需要单独说明：`smalux-agent` 已组装 Client、Scheduler、RemoteJobController、
 自动心跳和重连循环，并可作为 library 嵌入其他进程；`smalux-server` 已能启动 Axum listener，
 装配健康检查、Agent gRPC/Noise 入口和数据库注册中心。Server 已在认证后查询并确认 Agent 本地 Job
-策略，通过可替换 Provider 预留权威 Job 目录来源，并能接收 JobCommandResult 与 TaskReport；默认
-Provider 仍不下发 Job，接收结果也尚未落库。因此“认证连接已实现”仍不
-等于“端到端监控系统已经可部署”。
+策略、能力和插件 inventory，数据库 Provider 会按 Agent 当前兼容能力返回权威完整 Job 目录；
+JobCommandResult、成功 TaskReport 与异常 JobEvent 都会持久化。Server 的本地 CLI 已可替换/查询/
+清空单 Agent Job catalog，更新/查询/清空 Plus runtime，并查询报告与事件。插件私有参数由
+schema.pb 动态编码，Server 不安装插件二进制。
 
 ## 仍需完成
 
-- TaskReport 本地持久化、跨 Session ACK、去重和重放；
-- Server 端 Job Provider 的真实数据源，以及 JobCommandResult 与 TaskReport 持久化；
-- Server Job/指标数据库模型与迁移，以及 Agent/Token 管理 API；
-- Server 基于能力快照过滤 Job，以及跨版本能力兼容策略；
+- 可选的 TaskReport/JobEvent Agent 本地持久化、跨 Session 业务 ACK 和崩溃后重放（当前轻量设计
+  使用有界内存队列，重启后由 Server 对账重新下发）；
+- Job 模板、批量 Agent 分配、管理 HTTP API 与浏览器表单；
+- 跨版本能力兼容策略和生产级结果归档；
 - 管理 REST API、Web 管理端和用户授权；
 - 安装包、系统服务、容器镜像、升级和回滚；
 - `smalux-plus-rustic` 实际业务实现；
-- 多实例部署下的迁移互斥、事件通知和端到端并发验证；
+- 多实例部署下的迁移互斥、跨进程实时事件通知和端到端并发验证；
 - 生产监控、审计、速率限制和容量测试。
 
 ## 阅读原则

@@ -5,18 +5,19 @@ description: 从源码检查 workspace，并运行 Protocol Client/Server 示例
 
 # 快速开始
 
-当前项目没有发布二进制安装包，推荐从源码开始。以下命令在仓库根目录执行。
+当前仓库提供由 GitHub Actions 手动生成的跨平台 Draft Release 归档，但没有安装器；推荐先从源码构建。以下命令在仓库根目录执行。
 
 ## 当前应该运行哪个入口
 
 | 入口 | 当前行为 | 适合用途 |
 | --- | --- | --- |
-| `smalux-agent` | `main()` 只注册模块后立即退出，尚未启动 Scheduler 或网络连接。 | 编译和库级测试。 |
-| `smalux-server` | 使用空 Axum Router 监听 `127.0.0.1:8080`，尚无正式业务路由。 | 验证 Server 启动骨架。 |
+| `smalux-agent` | 启动本地 IPC、Client、Scheduler 和远程 Job 控制循环，可执行最小连接流程。 | Agent/Server 联调。 |
+| `smalux-server` | 启动数据库、Noise keyring、健康检查、Agent gRPC 路由和本地管理 IPC。 | Agent/Server 联调。 |
 | `noise_shared_port_server` | 提供 REST、WebSocket、gRPC、注册表和控制台。 | 阅读并运行完整协议流程。 |
 | `noise_shared_port_client` | 执行 XXpsk3 注册、IK 重连和加密消息。 | 与 Example Server 联调。 |
 
-因此第一次体验完整交互时，应运行 Protocol 的两个 Example，而不是正式 Agent/Server 二进制。
+要验证 Agent 与 Server 的最小闭环，应优先运行正式的 `smalux-server` 和 `smalux-agent`；
+Protocol 的两个 Example 仍适合单独阅读握手、SessionDriver 和协议错误路径。
 
 ## 1. 检查工具链
 
@@ -29,13 +30,17 @@ cargo --version
 
 Protocol 构建使用 vendored `protoc`，通常不需要单独安装系统 `protoc`。
 
-## 2. 编译 workspace
+## 2. 构建 workspace
+
+先构建正式联调需要的两个二进制：
 
 ```powershell
-cargo check --workspace --all-targets
+cargo build -p smalux-agent -p smalux-server
 ```
 
-第一次构建会下载并编译依赖，耗时明显长于后续增量构建。
+产物位于 `target/debug/smalux-agent.exe` 和 `target/debug/smalux-server.exe`（Unix 去掉 `.exe`）。
+后续三终端直接运行这些已构建的文件，不要在服务运行期间重复调用 `cargo run`，避免多个构建争用
+workspace 的 build directory lock。
 
 只验证某个边界时可以缩小范围：
 
@@ -55,7 +60,53 @@ cargo clippy --workspace --all-targets -- -D warnings
 测试覆盖 Agent Scheduler、采集配置、RemoteJobController、Proto round-trip、Noise 握手、注册恢复、
 Driver 收发和错误路径。
 
-## 4. 运行安全协议示例
+## 4. 运行 Agent/Server 最小联调
+
+使用三个终端，并复用上一节已生成的 `target/debug` 二进制。不要让每个终端都执行 `cargo run`。
+
+终端一：启动 Server。
+
+```powershell
+$serverExe = 'target/debug/smalux-server.exe'
+& $serverExe run
+```
+
+Server 默认监听 `http://127.0.0.1:12345`。
+
+终端二：通过本地管理 IPC 创建只写入文件的一次性注册 Token。目标文件必须不存在：
+
+```powershell
+$serverExe = 'target/debug/smalux-server.exe'
+New-Item -ItemType Directory -Force C:/smalux | Out-Null
+& $serverExe registration-token create `
+  --agent-name edge-agent `
+  --credential-file C:/smalux/edge-agent.token
+```
+
+终端三：优先使用 `--token-file` 启动 Agent，不把完整 Token 放进命令历史或进程列表：
+
+```powershell
+$agentExe = 'target/debug/smalux-agent.exe'
+& $agentExe run `
+  --server-endpoint http://127.0.0.1:12345 `
+  --token-file C:/smalux/edge-agent.token
+```
+
+首次运行执行 XXpsk3 注册，Agent 会上报能力、策略和运行实例摘要。回到终端二可查询连接：
+
+```powershell
+$agentExe = 'target/debug/smalux-agent.exe'
+& $serverExe agent list --online
+& $serverExe session list --state authenticated
+& $agentExe status
+& $agentExe jobs list
+```
+
+此阶段即使没有下发 Job，也能验证注册、加密长流、心跳和断线重连。Agent 的当前 Job、执行态和
+outbox 只在内存中；进程重启后由新的实例摘要触发 Server 重新对账并按策略、能力和插件 inventory
+下发权威目录。CPU Job 的完整生成、替换、查询、报告和清空流程见 [运行闭环文档](../reference/agent-server-runtime.md#cpu-example)。
+
+## 5. 运行安全协议示例
 
 先启动 Server：
 
@@ -95,7 +146,7 @@ target/smalux-noise-agent/    Agent Noise 身份、Server 公钥和注册状态
 第二次运行 Client 时，如果目录完整且带有 committed 标记，它不会再次读取 Token，而是直接使用 IK。
 不要只删除目录中的一个密钥文件；身份材料不完整时 Example 会拒绝启动，避免混用新旧密钥。
 
-## 5. 切换 Driver 模式
+## 6. 切换 Driver 模式
 
 ```powershell
 cargo run -p smalux-protocol --example noise_shared_port_server -- --mode driver
@@ -105,7 +156,7 @@ cargo run -p smalux-protocol --example noise_shared_port_client -- --mode driver
 Example 当前只接受 `--mode manual|driver`；未传参数时默认使用 `manual`。其他地址、数据目录和
 TLS 配置通过环境变量传入；注册 Token 不通过环境变量传递，始终由 Client 控制台输入。
 
-## 6. 判断运行是否正确
+## 7. 判断运行是否正确
 
 首次注册的关键日志顺序应包含：
 

@@ -5,13 +5,15 @@ description: 当前 Server 骨架、数据库依赖和部署前必须补齐的�
 
 # Server 安装边界
 
-`smalux-server` 当前提供 Axum、Tower、SeaORM 和 Protocol 依赖构成的服务端骨架。它不是已经完成的
-监控平台发行物，正式 Agent 注册表、Job 管理 API、指标存储和 Web 管理端仍需要继续实现。
+`smalux-server` 当前提供由 Axum、Tower、SeaORM 和 Protocol 组成的可运行服务端控制面。Agent
+注册、Job 目录、状态对账、报告/事件入库和本地管理 CLI 已经接通；管理 HTTP API、指标查询、
+告警和 Web 管理端仍属于后续产品能力。
 
 :::warning 当前运行状态
 
-正式 Server 默认监听 `127.0.0.1:8080`，启动时会读取数据库环境变量并执行 SeaORM migration，随后
-装配前端健康检查和 Agent 路由。监听成功仍不等于 Agent 注册、授权和 Job 业务已经完成。
+正式 Server 默认监听 `127.0.0.1:12345`，启动时会读取数据库环境变量并执行 SeaORM migration，随后
+装配健康检查和 Agent 路由。监听成功只表示进程已启动，Agent 仍需通过注册/授权握手后才能
+进入业务会话。
 
 :::
 
@@ -65,7 +67,7 @@ cargo build -p smalux-server --release --features frontend-embed
 
 只有在前端静态资源构建和嵌入逻辑完成后，该 feature 才能形成完整的单文件部署体验。
 
-## 运行当前骨架
+## 运行当前 Server
 
 ```powershell
 cargo run -p smalux-server
@@ -74,11 +76,11 @@ cargo run -p smalux-server
 成功时会通过 tracing 输出类似：
 
 ```text
-server listening listen_address=127.0.0.1:8080
+server listening listen_address=127.0.0.1:12345
 ```
 
-端口已被占用时会返回操作系统 bind 错误。监听地址和端口目前仍由 `ServerConfig` 默认值提供，
-CLI 覆盖入口尚未实现。
+端口已被占用时会返回操作系统 bind 错误。监听地址和端口可由 `ServerConfig` 默认值、环境变量
+或 `run` 子命令的 CLI 参数覆盖，优先级为 CLI > 环境变量 > 默认值。
 
 ## 数据库配置
 
@@ -134,7 +136,8 @@ Server Noise 密钥只从数据库的 `server_keyrings` 表恢复；首次启动
 2. 注册 Token 的生成、TTL、单次消费、审计和限流。
 3. Agent 公钥、吊销状态、租户和业务权限模型。
 4. Server Noise 密钥的安全存储、轮换和多实例同步。
-5. TaskReport 的幂等、确认水位、保留时间和批量写入。
+5. TaskReport 的保留时间和批量写入；如果未来要求跨 Agent 进程重启不丢报告，再增加业务 ACK
+   和持久化 outbox。
 6. REST、WebSocket 和 gRPC 的公开路径及反向代理规则。
 7. 日志、指标、追踪、健康检查和优雅关闭。
 
@@ -146,18 +149,17 @@ Protocol Example 的固定 Token、目录注册表和控制台命令只用于展
 可以复用的是协议调用顺序：`accept_incoming` 分类 XXpsk3/IK，业务层完成验证和落库后，再调用
 `prepare`、`complete` 或 `authorize`。
 
-## 从空 Router 到正式 Server
+## 当前能力与后续边界
 
-推荐按以下顺序增加能力：
+当前最小闭环已经包含以下能力：
 
-1. 配置解析、日志和关闭信号；
-2. `/health/live` 与 `/health/ready`，分别表达进程存活和依赖就绪；
-3. 数据库连接、迁移和 repository；
-4. Agent 注册 Token 与公钥授权；
-5. Tonic `AgentTransport` 路由和 Session registry；
-6. Job 管理 API、TaskReport ingest 和幂等存储；
-7. WebSocket/REST 管理接口；
-8. 身份认证、租户授权、限流、审计和管理端。
+1. 配置解析、日志、数据库迁移和优雅关闭；
+2. `/api/v1/health` 与 `/api/v1/grpc` 路由；
+3. Agent 注册 Token、公钥授权和 Noise Session；
+4. Job 目录下发、能力/策略/插件摘要对账；
+5. TaskReport/JobEvent 幂等入库和本地 IPC 管理。
+
+后续再增加管理 REST、用户授权、租户、审计、指标查询和 Web 管理端。
 
 每一步应先有独立健康状态和测试，再对外开放路由。数据库已连接不等于迁移完成，HTTP 能监听也不等于
 Agent 会话已经就绪。

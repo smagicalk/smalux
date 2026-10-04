@@ -11,6 +11,12 @@ use tracing::{debug, trace, warn};
 
 use super::NoiseError;
 
+/// Noise 内层明文的最大字节数。
+///
+/// 该值略小于 Server 默认的 1 MiB gRPC 消息上限，为外层 Protobuf 字段和 AEAD
+/// 标签预留空间；所有动态 payload 都必须经过这个上限检查。
+pub const MAX_NOISE_PLAINTEXT_BYTES: usize = 1024 * 1024 - 4096;
+
 /// 完成握手后的双向加密状态。该类型独占 nonce，不应被多个任务并发操作。
 pub struct SecureSession {
     /// `snow` 持有的双向 AEAD key 和严格递增 nonce。
@@ -38,6 +44,14 @@ impl SecureSession {
     pub fn encrypt(&mut self, message: &SecureMessage) -> Result<ProtocolFrame, NoiseError> {
         // 先得到确定的 Protobuf 明文字节，再为 ChaChaPoly 的认证标签预留 16 字节。
         let plaintext = message.encode_to_vec();
+        if plaintext.len() > MAX_NOISE_PLAINTEXT_BYTES {
+            warn!(
+                plaintext_len = plaintext.len(),
+                maximum = MAX_NOISE_PLAINTEXT_BYTES,
+                "refusing to encrypt an oversized Noise message"
+            );
+            return Err(NoiseError::MessageTooLarge);
+        }
         let mut ciphertext = vec![0; plaintext.len() + 16];
         let written = self.transport.write_message(&plaintext, &mut ciphertext)?;
         ciphertext.truncate(written);
@@ -64,7 +78,15 @@ impl SecureSession {
             warn!("received a non-ciphertext frame in Noise transport mode");
             return Err(NoiseError::InvalidFrame);
         };
-        let mut plaintext = vec![0; 65_535];
+        if ciphertext.len() > MAX_NOISE_PLAINTEXT_BYTES + 16 {
+            warn!(
+                ciphertext_len = ciphertext.len(),
+                maximum = MAX_NOISE_PLAINTEXT_BYTES + 16,
+                "refusing to decrypt an oversized Noise message"
+            );
+            return Err(NoiseError::MessageTooLarge);
+        }
+        let mut plaintext = vec![0; MAX_NOISE_PLAINTEXT_BYTES];
         let read = self
             .transport
             .read_message(&ciphertext, &mut plaintext)

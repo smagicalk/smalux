@@ -7,11 +7,13 @@ package smalux.agent.v1;
 import "smalux/agent/v1/errors.proto";
 import "smalux/agent/v1/capability.proto";
 import "smalux/agent/v1/job/command.proto";
+import "smalux/agent/v1/job/event.proto";
 import "smalux/agent/v1/job/policy.proto";
 import "smalux/agent/v1/diagnostic.proto";
 import "smalux/agent/v1/key_rotation.proto";
 import "smalux/agent/v1/plugin.proto";
 import "smalux/agent/v1/registration.proto";
+import "smalux/agent/v1/reconciliation.proto";
 import "smalux/agent/v1/session_control.proto";
 import "smalux/agent/v1/task/common.proto";
 
@@ -126,5 +128,11 @@ message SecureMessage {
 
     // Plus 插件清单、会话内运行时快照与应用确认。
     AgentPluginSync agent_plugin = 11;
+
+    // Agent Scheduler 的异常和状态变化事件；成功业务结果仍使用 TaskReport。
+    JobEvent job_event = 12;
+
+    // Agent 认证连接建立后发送的目录/runtime 对账摘要。
+    AgentReconcileSummary reconcile_summary = 13;
   }
 }

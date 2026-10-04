@@ -323,6 +323,9 @@ impl SchedulerActor {
             } => {
                 let _ = response.send(self.delete_job(job_id, expected_version, true));
             }
+            Command::Reconcile { plan, response } => {
+                let _ = response.send(self.reconcile_jobs(plan));
+            }
             Command::GetConfig { response } => {
                 let _ = response.send(Ok(SchedulerConfigSnapshot {
                     revision: self.config_revision,

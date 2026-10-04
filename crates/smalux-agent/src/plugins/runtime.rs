@@ -26,7 +26,23 @@ impl PluginRuntimeState {
         self.applied_revision
     }
 
-    /// 先执行版本门控；Worker 成功初始化后调用 [`confirm_applied`](Self::confirm_applied)。
+    /// 返回连接重连对账所需的 revision 和规范化摘要。
+    ///
+    /// Agent 重启后没有已确认快照，因此返回 `(0, 空摘要)`；Server 会据此发送完整
+    /// runtime。快照确认后摘要只由已成功启用的配置计算，不包含运行时 Secret 的额外副本。
+    pub fn reconcile_state(&self) -> (u64, Vec<u8>) {
+        self.applied_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    self.applied_revision,
+                    smalux_protocol::reconciliation::runtime_digest(snapshot).to_vec(),
+                )
+            })
+            .unwrap_or_else(|| (0, Vec::new()))
+    }
+
+    /// 先执行版本门控；Worker 成功初始化后调用 [`confirm_snapshot`](Self::confirm_snapshot)。
     pub fn validate_snapshot(
         &self,
         snapshot: &PluginRuntimeSnapshot,

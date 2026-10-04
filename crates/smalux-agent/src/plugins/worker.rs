@@ -46,6 +46,8 @@ pub enum PluginWorkerError {
     InvalidHandshake { plugin_id: String },
     #[error("Plus Worker request was cancelled")]
     Cancelled,
+    #[error("Plus Worker rejected task configuration: {0}")]
+    InvalidTaskConfig(String),
     #[error("Plus Worker request channel closed")]
     Closed,
     #[error("Plus Worker task failed: {0}")]
@@ -59,6 +61,7 @@ pub enum PluginWorkerError {
 pub(super) struct WorkerStartOptions {
     pub config_revision: u64,
     pub runtime_config: Vec<u8>,
+    pub runtime_config_version: u32,
     pub max_concurrency: u32,
     pub agent_context: smalux_plus_core::protocol::AgentContextMessage,
     pub task_timeout: std::time::Duration,
@@ -113,13 +116,14 @@ impl PluginWorkerClient {
         .map_err(Into::into)
     }
     /// 启动 Worker，并在公开为可执行前完成 Hello 和 Initialize 两次确认。
-    pub(super) async fn start(
+    pub(super) async fn spawn_and_initialize(
         plugin: &InstalledPlugin,
         options: WorkerStartOptions,
     ) -> Result<Self, PluginWorkerError> {
         let WorkerStartOptions {
             config_revision,
             runtime_config,
+            runtime_config_version,
             max_concurrency,
             agent_context,
             task_timeout,
@@ -184,6 +188,7 @@ impl PluginWorkerClient {
                         protocol_version: protocol::WORKER_PROTOCOL_VERSION,
                         plugin_id: plugin.manifest.plugin_id.clone(),
                         config_revision,
+                        runtime_config_version,
                         runtime_config,
                         max_concurrency,
                         agent_context: Some(agent_context),
@@ -239,7 +244,15 @@ impl PluginWorkerClient {
         let reader_closed = Arc::new(AtomicBool::new(false));
         let reader_closed_flag = Arc::clone(&reader_closed);
         let reader_task = tokio::spawn(async move {
-            while let Ok(Some(frame)) = read_frame(&mut reader).await {
+            loop {
+                let frame = match read_frame(&mut reader).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Plus Worker response stream failed");
+                        break;
+                    }
+                };
                 let Some(worker_frame::Body::Response(WorkerResponse { body })) = frame.body else {
                     continue;
                 };
@@ -255,6 +268,14 @@ impl PluginWorkerClient {
                                     .collect(),
                                 payload: result.payload,
                             }),
+                            Ok(protocol::TaskStatus::Cancelled) => {
+                                Err(PluginWorkerError::Cancelled)
+                            }
+                            Ok(protocol::TaskStatus::InvalidConfig) => Err(
+                                PluginWorkerError::InvalidTaskConfig(result.error.unwrap_or_else(
+                                    || "Worker rejected task configuration".to_owned(),
+                                )),
+                            ),
                             _ => {
                                 Err(PluginWorkerError::TaskFailed(result.error.unwrap_or_else(
                                     || "Worker task did not succeed".to_owned(),
@@ -335,7 +356,7 @@ impl PluginWorkerClient {
             ));
         }
         let request_id = Uuid::new_v4().to_string();
-        let (sender, receiver) = oneshot::channel();
+        let (sender, mut receiver) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), sender);
         let write_result = match timeout(self.task_timeout, async {
             let mut writer = self.writer.lock().await;
@@ -372,31 +393,64 @@ impl PluginWorkerClient {
             return Err(error.into());
         }
         tokio::select! {
-            result = receiver => result.map_err(|_| PluginWorkerError::Closed)?,
+            result = &mut receiver => result.map_err(|_| PluginWorkerError::Closed)?,
             () = cancellation.cancelled() => {
-                self.pending.lock().await.remove(&request_id);
-                let _ = self.write_request(
-                    worker_request::Body::Cancel(CancelTask {
-                        request_id,
-                        reason: "Agent Scheduler cancelled the Task".to_owned(),
-                    }),
-                    self.task_timeout,
+                self.cancel_and_wait(
+                    &request_id,
+                    "Agent Scheduler cancelled the Task",
+                    &mut receiver,
                 )
-                .await;
-                Err(PluginWorkerError::Cancelled)
+                .await
             }
             _ = tokio::time::sleep(self.task_timeout) => {
-                self.pending.lock().await.remove(&request_id);
-                let _ = self.write_request(
-                    worker_request::Body::Cancel(CancelTask {
-                        request_id,
-                        reason: "Agent Worker task deadline exceeded".to_owned(),
-                    }),
-                    self.task_timeout,
-                )
-                .await;
-                self.terminate().await;
-                Err(PluginWorkerError::Timeout { phase: "Execute" })
+                let cancel_result = self
+                    .cancel_and_wait(
+                        &request_id,
+                        "Agent Worker task deadline exceeded",
+                        &mut receiver,
+                    )
+                    .await;
+                if matches!(cancel_result, Err(PluginWorkerError::Timeout { .. })) {
+                    self.terminate().await;
+                    Err(PluginWorkerError::Timeout { phase: "Execute" })
+                } else {
+                    // 原始执行 deadline 已到；即使 Worker 回了取消确认，也应向 Scheduler
+                    // 报告超时，而不是把“取消成功”误认为任务正常结束。
+                    Err(PluginWorkerError::Timeout { phase: "Execute" })
+                }
+            }
+        }
+    }
+
+    /// 发送取消请求并等待 Worker 的 `Cancelled`/结果确认。
+    ///
+    /// pending 项必须保留到确认或超时之后，否则 reader 无法把确认关联回调用方，
+    /// 也无法区分“Worker 已停止”与“Agent 只写出了 Cancel 帧”。
+    async fn cancel_and_wait(
+        &self,
+        request_id: &str,
+        reason: &str,
+        receiver: &mut oneshot::Receiver<Result<WorkerTaskOutput, PluginWorkerError>>,
+    ) -> Result<WorkerTaskOutput, PluginWorkerError> {
+        if let Err(error) = self
+            .write_request(
+                worker_request::Body::Cancel(CancelTask {
+                    request_id: request_id.to_owned(),
+                    reason: reason.to_owned(),
+                }),
+                self.shutdown_timeout,
+            )
+            .await
+        {
+            self.pending.lock().await.remove(request_id);
+            return Err(error);
+        }
+        match timeout(self.shutdown_timeout, receiver).await {
+            Ok(Ok(_)) => Err(PluginWorkerError::Cancelled),
+            Ok(Err(_)) => Err(PluginWorkerError::Closed),
+            Err(_) => {
+                self.pending.lock().await.remove(request_id);
+                Err(PluginWorkerError::Timeout { phase: "Cancel" })
             }
         }
     }

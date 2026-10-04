@@ -72,6 +72,20 @@ pub enum CliCommand {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// 管理指定 Agent 的权威远程 Job 目录。
+    Job {
+        #[command(subcommand)]
+        command: ServerJobCommand,
+    },
+    /// 管理 Agent 已安装 Plus Worker 的共享运行时配置。
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// 查询已永久保存的成功 TaskReport。
+    Report(ReportListArgs),
+    /// 查询已永久保存的 Scheduler JobEvent。
+    Event(EventListArgs),
     /// 查看或断开当前进程中的 Agent Session。
     Session {
         /// 具体 Session 管理操作。
@@ -421,6 +435,98 @@ pub enum AgentStatusFilter {
     Active,
     /// 已禁止后续授权。
     Revoked,
+}
+
+/// 单 Agent 权威 Job 目录命令。
+#[derive(Subcommand)]
+pub enum ServerJobCommand {
+    /// 用多个编码后的 JobDefinition 文件替换该 Agent 的完整远程目录。
+    Replace(JobReplaceArgs),
+    /// 查询当前权威目录的 revision 和 Job 数量。
+    List {
+        agent_id: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// 清空该 Agent 的全部远程 Job；在线 Agent 会立即接收空 ReplaceAllJobs。
+    Clear {
+        agent_id: String,
+        /// 期望的当前目录 revision；提供后启用 CAS。
+        #[arg(long, value_name = "REVISION")]
+        expected_revision: Option<u64>,
+        #[command(flatten)]
+        confirmation: ConfirmationArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+/// 目录替换输入；每个文件是单条 JobDefinition 的 Protobuf 二进制。
+#[derive(Args)]
+pub struct JobReplaceArgs {
+    pub agent_id: String,
+    #[arg(long = "definition", value_name = "PATH", required = true)]
+    pub definitions: Vec<PathBuf>,
+    /// 期望的当前目录 revision；提供后启用 CAS，冲突时不会覆盖新目录。
+    #[arg(long, value_name = "REVISION")]
+    pub expected_revision: Option<u64>,
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+/// Plus 管理命令；插件本体不安装到 Server，只管理已安装 Agent 的运行时参数。
+#[derive(Subcommand)]
+pub enum PluginCommand {
+    /// 从 JSON 文件替换一个 Agent 的完整插件 runtime 快照。
+    RuntimeReplace {
+        agent_id: String,
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// 期望的当前 runtime revision；提供后启用 CAS。
+        #[arg(long, value_name = "REVISION")]
+        expected_revision: Option<u64>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// 查询一个 Agent 当前保存的 runtime 快照。
+    RuntimeList {
+        agent_id: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// 清空一个 Agent 的所有 runtime；在线 Agent 会先停止相应 Worker，再等待后续目录同步。
+    RuntimeClear {
+        agent_id: String,
+        /// 期望的当前 runtime revision；提供后启用 CAS。
+        #[arg(long, value_name = "REVISION")]
+        expected_revision: Option<u64>,
+        #[command(flatten)]
+        confirmation: ConfirmationArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+/// TaskReport 查询参数。
+#[derive(Args)]
+pub struct ReportListArgs {
+    #[arg(long)]
+    pub agent_id: Option<String>,
+    #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+    pub limit: u32,
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+/// JobEvent 查询参数。
+#[derive(Args)]
+pub struct EventListArgs {
+    #[arg(long)]
+    pub agent_id: Option<String>,
+    #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+    pub limit: u32,
+    #[command(flatten)]
+    pub output: OutputArgs,
 }
 
 /// 当前进程 Session 的查询与定向断开命令。

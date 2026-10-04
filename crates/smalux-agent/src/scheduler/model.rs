@@ -358,6 +358,56 @@ pub(crate) struct JobPatch {
     pub reschedule: RescheduleMode,
 }
 
+/// Scheduler Actor 一次性对账远程 Job 所需的新增、更新和删除计划。
+///
+/// 计划在 Actor 内先完成所有版本、容量和 Trigger 校验，再执行实际变更，避免
+/// `ReplaceAllJobs` 在多个异步命令之间被其他调用插入。
+pub(crate) struct SchedulerReconcilePlan {
+    /// 需要使用 expected version 更新的现有 Job。
+    pub(crate) updates: Vec<SchedulerReconcileUpdate>,
+    /// 需要按指定 ID 安装的全新 Job。
+    pub(crate) additions: Vec<SchedulerReconcileAddition>,
+    /// 需要删除的远程 Job 及其 expected version。
+    pub(crate) deletions: Vec<(JobId, u64)>,
+}
+
+/// 批量对账中的 Job 更新项。
+pub(crate) struct SchedulerReconcileUpdate {
+    /// 稳定 Job ID。
+    pub(crate) job_id: JobId,
+    /// 更新前的 Scheduler generation。
+    pub(crate) expected_version: u64,
+    /// 已由 Agent 编译和校验的完整配置 Patch。
+    pub(crate) patch: JobPatch,
+    /// 更新后应处于启用还是停用状态。
+    pub(crate) enabled: bool,
+}
+
+/// 批量对账中的新 Job 安装项。
+pub(crate) struct SchedulerReconcileAddition {
+    /// Server 分配的稳定 Job ID。
+    pub(crate) job_id: JobId,
+    /// 是否立即启用。
+    pub(crate) enabled: bool,
+    /// 已校验的 Trigger。
+    pub(crate) trigger: Trigger,
+    /// 已绑定的 Task 和输出适配器。
+    pub(crate) task: TaskBinding,
+    /// 已校验的 Job 运行策略。
+    pub(crate) options: JobOptions,
+}
+
+impl SchedulerReconcilePlan {
+    /// 创建空的批量对账计划。
+    pub(crate) fn new() -> Self {
+        Self {
+            updates: Vec::new(),
+            additions: Vec::new(),
+            deletions: Vec::new(),
+        }
+    }
+}
+
 impl JobPatch {
     /// 创建所有字段均为“保持当前值”的空 Patch。
     ///

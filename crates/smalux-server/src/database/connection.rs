@@ -1,6 +1,9 @@
 //! Server 数据库连接池和启动迁移生命周期。
 
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sea_orm::{
+    AccessMode, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, IsolationLevel,
+    TransactionTrait,
+};
 use sea_orm_migration::MigratorTrait;
 
 use super::{DatabaseError, migration::Migrator};
@@ -58,6 +61,22 @@ impl ServerDatabase {
         &self.connection
     }
 
+    /// 多条 SELECT 共用同一快照，避免目录版本与明细来自不同提交。
+    /// SQLite 的事务在首次读取时固定快照；PG/MySQL 不能依赖默认 ReadCommitted。
+    pub(crate) async fn begin_snapshot_read(&self) -> Result<DatabaseTransaction, DatabaseError> {
+        Ok(match self.backend {
+            DatabaseBackend::Sqlite => self.connection.begin().await?,
+            DatabaseBackend::Postgres | DatabaseBackend::MySql => {
+                self.connection
+                    .begin_with_config(
+                        Some(IsolationLevel::RepeatableRead),
+                        Some(AccessMode::ReadOnly),
+                    )
+                    .await?
+            }
+        })
+    }
+
     /// 获取当前连接的脱敏后端类型。
     pub fn backend(&self) -> DatabaseBackend {
         self.backend
@@ -67,4 +86,45 @@ impl ServerDatabase {
     pub fn backend_label(&self) -> &'static str {
         self.backend.label()
     }
+}
+
+/// 并发回归使用文件数据库，避免 SQLite shared-cache 内存库的表级锁升级死锁。
+#[cfg(test)]
+pub(crate) async fn snapshot_test_database() -> (ServerDatabase, std::path::PathBuf) {
+    use super::entity::agent;
+    use sea_orm::{EntityTrait, Set};
+
+    let directory = std::env::var_os("PI_SCRATCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("smalux-snapshot-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("snapshot.db");
+    let mut url = url::Url::parse("sqlite:///").unwrap();
+    url.set_path(
+        &path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('%', "%25"),
+    );
+    url.set_query(Some("mode=rwc"));
+    let url = url.to_string();
+    #[cfg(windows)]
+    let url = url.replacen("sqlite:///", "sqlite:", 1);
+    let database = ServerDatabase::connect(DatabaseConfig::new(url))
+        .await
+        .unwrap();
+    agent::Entity::insert(agent::ActiveModel {
+        agent_id: Set("agent-a".to_owned()),
+        name: Set("Agent A".to_owned()),
+        public_key: Set(vec![1; 32]),
+        status: Set("active".to_owned()),
+        created_at: Set(1),
+        updated_at: Set(1),
+        revoked_at: Set(None),
+    })
+    .exec(database.connection())
+    .await
+    .unwrap();
+    (database, directory)
 }

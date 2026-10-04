@@ -4,6 +4,7 @@
 //! Server。危险操作在请求发出前统一确认，避免不同命令产生不一致的脚本行为。
 
 use std::{
+    fs,
     fs::OpenOptions,
     io::{IsTerminal, Write},
     path::Path,
@@ -12,8 +13,8 @@ use std::{
 
 use crate::{
     cli::{
-        AgentCommand, Cli, CliCommand, ConfigCommand, KeyringCommand, OutputFormat,
-        RegistrationTokenCommand, SessionCommand,
+        AgentCommand, Cli, CliCommand, ConfigCommand, KeyringCommand, OutputFormat, PluginCommand,
+        RegistrationTokenCommand, ServerJobCommand, SessionCommand,
     },
     management::{ControlRequest, ControlResponse},
 };
@@ -157,6 +158,134 @@ async fn execute_remote(
                 )
             }
         },
+        CliCommand::Job { command } => match command {
+            ServerJobCommand::Replace(args) => {
+                let definitions = args
+                    .definitions
+                    .iter()
+                    .map(|path| {
+                        let bytes = fs::read(path).map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to read JobDefinition {}: {error}",
+                                path.display()
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            bytes.len() <= 1024 * 1024,
+                            "JobDefinition file exceeds 1 MiB"
+                        );
+                        Ok(bytes)
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                (
+                    ControlRequest::ReplaceAgentJobCatalog {
+                        agent_id: args.agent_id,
+                        definitions,
+                        expected_revision: args.expected_revision,
+                    },
+                    args.output.output,
+                    None,
+                )
+            }
+            ServerJobCommand::List { agent_id, output } => (
+                ControlRequest::GetAgentJobCatalog { agent_id },
+                output.output,
+                None,
+            ),
+            ServerJobCommand::Clear {
+                agent_id,
+                expected_revision,
+                confirmation,
+                output,
+            } => {
+                if !confirm_dangerous(
+                    confirmation.yes,
+                    &format!("clear all remote Jobs for Agent {agent_id}"),
+                )? {
+                    println!("operation cancelled");
+                    return Ok(());
+                }
+                (
+                    ControlRequest::ReplaceAgentJobCatalog {
+                        agent_id,
+                        definitions: Vec::new(),
+                        expected_revision,
+                    },
+                    output.output,
+                    None,
+                )
+            }
+        },
+        CliCommand::Plugin { command } => match command {
+            PluginCommand::RuntimeReplace {
+                agent_id,
+                file,
+                expected_revision,
+                output,
+            } => {
+                let bytes = fs::read(&file).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to read plugin runtime JSON {}: {error}",
+                        file.display()
+                    )
+                })?;
+                let runtimes = serde_json::from_slice(&bytes)
+                    .map_err(|error| anyhow::anyhow!("plugin runtime JSON is invalid: {error}"))?;
+                (
+                    ControlRequest::ReplaceAgentPluginRuntime {
+                        agent_id,
+                        runtimes,
+                        expected_revision,
+                    },
+                    output.output,
+                    None,
+                )
+            }
+            PluginCommand::RuntimeList { agent_id, output } => (
+                ControlRequest::GetAgentPluginRuntime { agent_id },
+                output.output,
+                None,
+            ),
+            PluginCommand::RuntimeClear {
+                agent_id,
+                expected_revision,
+                confirmation,
+                output,
+            } => {
+                if !confirm_dangerous(
+                    confirmation.yes,
+                    &format!("clear Plus runtime for Agent {agent_id}"),
+                )? {
+                    println!("operation cancelled");
+                    return Ok(());
+                }
+                (
+                    ControlRequest::ReplaceAgentPluginRuntime {
+                        agent_id,
+                        runtimes: Vec::new(),
+                        expected_revision,
+                    },
+                    output.output,
+                    None,
+                )
+            }
+        },
+        CliCommand::Report(args) => (
+            ControlRequest::ListTaskReports {
+                agent_id: args.agent_id,
+                limit: args.limit,
+            },
+            args.output.output,
+            None,
+        ),
+        CliCommand::Event(args) => (
+            ControlRequest::ListJobEvents {
+                agent_id: args.agent_id,
+                limit: args.limit,
+            },
+            args.output.output,
+            None,
+        ),
         CliCommand::Session { command } => match command {
             SessionCommand::List(args) => (
                 ControlRequest::ListSessions {
@@ -407,6 +536,46 @@ fn print_response(response: &ControlResponse, output: OutputFormat) -> anyhow::R
         } => {
             print_agent(agent);
             println!("disconnected_sessions={disconnected_sessions}");
+        }
+        ControlResponse::AgentJobCatalog(Some(value)) => println!(
+            "agent_id={} catalog_revision={} jobs={}",
+            value.agent_id,
+            value.catalog_revision,
+            value.definitions.len()
+        ),
+        ControlResponse::AgentJobCatalog(None) => println!("Agent Job catalog not found"),
+        ControlResponse::AgentPluginRuntimeUpdated { agent_id, revision } => {
+            println!("agent_id={agent_id} plugin_runtime_revision={revision}")
+        }
+        ControlResponse::AgentPluginRuntime(Some(value)) => println!(
+            "agent_id={} plugin_runtime_revision={} plugins={}",
+            value.agent_id,
+            value.revision,
+            value.runtimes.len()
+        ),
+        ControlResponse::AgentPluginRuntime(None) => println!("Agent plugin runtime not found"),
+        ControlResponse::TaskReports(values) => {
+            for value in values {
+                println!(
+                    "report_id={} agent_id={} result_kind={} received_at={}",
+                    value.report_id,
+                    value.agent_id,
+                    value.result_kind,
+                    value.received_at_unix_micros
+                );
+            }
+        }
+        ControlResponse::JobEvents(values) => {
+            for value in values {
+                println!(
+                    "event_id={} agent_id={} kind={} sequence={} emitted_at={}",
+                    value.event_id,
+                    value.agent_id,
+                    value.kind,
+                    value.sequence,
+                    value.emitted_at_unix_micros
+                );
+            }
         }
         ControlResponse::Sessions(values) => {
             for value in values {

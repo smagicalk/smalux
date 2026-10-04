@@ -29,7 +29,8 @@ use uuid::Uuid;
 use crate::plugins::PluginManager;
 use crate::scheduler::{
     JobId, JobOptions, JobPatch, JobSnapshot, JobState, PatchValue, RescheduleMode, Scheduler,
-    TaskBinding, TaskReportSink, Trigger,
+    SchedulerReconcileAddition, SchedulerReconcilePlan, SchedulerReconcileUpdate, TaskBinding,
+    TaskReportSink, Trigger,
 };
 
 mod compiler;
@@ -50,6 +51,8 @@ pub struct RemoteJobPolicyApplication {
 
 #[derive(Debug, Clone)]
 struct ManagedJob {
+    /// 最近成功应用的完整 Job 定义，用于判断权威快照是否真正发生变化。
+    definition: proto::JobDefinition,
     /// 最近成功应用的 Server 业务版本。
     revision: u64,
     /// Scheduler 当前 generation，用于乐观并发更新和删除。
@@ -65,7 +68,7 @@ struct ManagedJob {
 struct ControllerState {
     /// 最近成功应用的远程 Job 集合版本。
     catalog_revision: u64,
-    /// 仅包含本控制器安装的远程 Job，因此 [`RemoteJobController::clear`] 不会误删本地 Job。
+    /// 仅包含本控制器安装的远程 Job，因此 [`RemoteJobController::clear_remote_jobs`] 不会误删本地 Job。
     remote_jobs: HashMap<JobId, ManagedJob>,
     /// 按 `command_id` 保存首次执行结果，用于处理重发和断线重连。
     cached_results: HashMap<Uuid, proto::JobCommandResult>,
@@ -148,6 +151,29 @@ impl RemoteJobController {
     /// 返回当前启动实例采用的脱敏策略快照。
     pub async fn policy(&self) -> RemoteJobPolicySnapshot {
         self.policy.snapshot().await
+    }
+
+    /// 返回当前 Agent 已应用远程 Job 目录的 revision 和规范化摘要。
+    ///
+    /// 目录只保存在当前进程的控制器状态中；进程重启后 revision 为零，Server 会重新
+    /// 下发完整 ReplaceAll。摘要使用已应用定义重新计算，增量命令也能保持一致。
+    pub async fn catalog_reconcile_state(&self) -> (u64, Vec<u8>) {
+        let state = self.state.lock().await;
+        if state.catalog_revision == 0 {
+            return (0, Vec::new());
+        }
+        let catalog = proto::ReplaceAllJobs {
+            catalog_revision: state.catalog_revision,
+            jobs: state
+                .remote_jobs
+                .values()
+                .map(|managed| managed.definition.clone())
+                .collect(),
+        };
+        (
+            state.catalog_revision,
+            smalux_protocol::reconciliation::catalog_digest(&catalog).to_vec(),
+        )
     }
 
     /// 持久化本地策略变化，并立即停用新策略禁止的现有远程 Job。
@@ -274,7 +300,7 @@ impl RemoteJobController {
     }
 
     /// 删除全部远程所有权 Job；本地 Job 不在控制器索引中，因此不会受影响。
-    pub async fn clear(&self) -> anyhow::Result<()> {
+    pub async fn clear_remote_jobs(&self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         tracing::info!(
             remote_jobs = state.remote_jobs.len(),
@@ -491,6 +517,7 @@ impl RemoteJobController {
         state.remote_jobs.insert(
             compiled.id,
             ManagedJob {
+                definition: compiled.definition,
                 revision: compiled.revision,
                 generation: snapshot.version,
                 task_kind: compiled.task_kind,
@@ -569,6 +596,7 @@ impl RemoteJobController {
         state.remote_jobs.insert(
             id,
             ManagedJob {
+                definition: current.definition,
                 revision: current.revision,
                 generation: snapshot.version,
                 task_kind: current.task_kind,
@@ -660,33 +688,92 @@ impl RemoteJobController {
             ));
         }
 
-        let (existing_jobs, new_jobs): (Vec<_>, Vec<_>) = compiled_jobs
-            .into_iter()
-            .partition(|compiled| state.remote_jobs.contains_key(&compiled.id));
-        // 已有 Job 的原子更新不改变总容量，先完成它们。
-        for compiled in existing_jobs {
-            self.upsert_compiled(state, compiled, false).await?;
+        let mut plan = SchedulerReconcilePlan::new();
+        for compiled in &compiled_jobs {
+            if let Some(current) = state.remote_jobs.get(&compiled.id) {
+                if compiled.revision < current.revision {
+                    return Err(ControlError::rejected(
+                        proto::JobCommandErrorCode::RevisionConflict,
+                        anyhow::anyhow!("job revision must not move backwards"),
+                    ));
+                }
+                if compiled.revision == current.revision
+                    && compiled.definition != current.definition
+                {
+                    return Err(ControlError::rejected(
+                        proto::JobCommandErrorCode::RevisionConflict,
+                        anyhow::anyhow!("same job revision contains different definition"),
+                    ));
+                }
+                if compiled.definition != current.definition {
+                    plan.updates.push(SchedulerReconcileUpdate {
+                        job_id: compiled.id,
+                        expected_version: current.generation,
+                        patch: full_patch(
+                            compiled.trigger.clone(),
+                            compiled.task.clone(),
+                            compiled.options.clone(),
+                        ),
+                        enabled: compiled.enabled,
+                    });
+                }
+            } else {
+                plan.additions.push(SchedulerReconcileAddition {
+                    job_id: compiled.id,
+                    enabled: compiled.enabled,
+                    trigger: compiled.trigger.clone(),
+                    task: compiled.task.clone(),
+                    options: compiled.options.clone(),
+                });
+            }
         }
         // 删除快照中不存在的旧远程 Job，为后续新增项释放容量。
-        let stale = state
+        for id in state
             .remote_jobs
             .keys()
             .filter(|id| !ids.contains(id))
             .copied()
-            .collect::<Vec<_>>();
-        for id in stale {
-            let managed = state.remote_jobs[&id].clone();
-            self.scheduler
-                .delete(id, managed.generation)
-                .await
-                .map_err(scheduler_error)?;
-            state.remote_jobs.remove(&id);
+        {
+            plan.deletions.push((id, state.remote_jobs[&id].generation));
         }
-        // 所有配置和最终容量都已预检，此阶段只安装快照中的新增 Job。
-        for compiled in new_jobs {
-            self.upsert_compiled(state, compiled, false).await?;
+
+        // 所有配置、所有权、版本和容量都已经完成预检；Scheduler Actor 会在同一轮
+        // 命令中应用该计划，外部本地 Scheduler 命令不能插入半个 ReplaceAll。
+        let applied = self
+            .scheduler
+            .reconcile(plan)
+            .await
+            .map_err(scheduler_error)?;
+        let applied_versions = applied
+            .into_iter()
+            .map(|snapshot| (snapshot.id, snapshot.version))
+            .collect::<HashMap<_, _>>();
+        let mut remote_jobs = HashMap::with_capacity(compiled_jobs.len());
+        for compiled in compiled_jobs {
+            let generation = state
+                .remote_jobs
+                .get(&compiled.id)
+                .filter(|current| current.definition == compiled.definition)
+                .map(|current| current.generation)
+                .or_else(|| applied_versions.get(&compiled.id).copied())
+                .ok_or_else(|| {
+                    ControlError::rejected(
+                        proto::JobCommandErrorCode::SchedulerUnavailable,
+                        anyhow::anyhow!("reconciled Job is missing from Scheduler result"),
+                    )
+                })?;
+            remote_jobs.insert(
+                compiled.id,
+                ManagedJob {
+                    definition: compiled.definition,
+                    revision: compiled.revision,
+                    generation,
+                    task_kind: compiled.task_kind,
+                    plugin: compiled.plugin,
+                },
+            );
         }
-        // 所有新增、更新和删除都成功后，ReplaceAll 才算应用完成。
+        state.remote_jobs = remote_jobs;
         state.catalog_revision = command.catalog_revision;
         Ok(None)
     }
@@ -1005,7 +1092,7 @@ mod tests {
         assert_eq!(first, repeated);
         assert!(scheduler.get(job_id).await.unwrap().is_some());
 
-        controller.clear().await.unwrap();
+        controller.clear_remote_jobs().await.unwrap();
         assert!(scheduler.get(job_id).await.unwrap().is_none());
         runtime.shutdown().await.unwrap();
     }

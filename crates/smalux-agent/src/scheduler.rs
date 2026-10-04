@@ -17,7 +17,8 @@ pub use event::{SchedulerEvent, SchedulerEventKind};
 pub(crate) use model::{
     CapacityPolicy, ExecutionRetryPolicy, FailurePolicy, JobId, JobOptions, JobPatch, JobPriority,
     JobSnapshot, JobState, MisfirePolicy, PatchValue, RescheduleMode, RetryCondition, RunId,
-    Schedule, Trigger, TriggerCoalescing,
+    Schedule, SchedulerReconcileAddition, SchedulerReconcilePlan, SchedulerReconcileUpdate,
+    Trigger, TriggerCoalescing,
 };
 pub use runtime::{Scheduler, SchedulerRuntime};
 pub(crate) use task::TaskBinding;

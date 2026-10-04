@@ -46,6 +46,24 @@ pub struct PluginSchemaBundle {
     pub descriptor_set: Vec<u8>,
     #[prost(message, repeated, tag = "5")]
     pub tasks: Vec<PluginTaskSchema>,
+    /// 插件 Worker 启动前接收的共享运行时参数描述。
+    #[prost(message, optional, tag = "6")]
+    pub runtime: Option<PluginRuntimeSchema>,
+}
+
+/// 一个插件版本的共享 Worker 运行时配置入口。
+#[derive(Clone, PartialEq, Message)]
+pub struct PluginRuntimeSchema {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub config_message: String,
+    #[prost(string, tag = "3")]
+    pub display_name: String,
+    #[prost(string, tag = "4")]
+    pub description: String,
+    #[prost(message, repeated, tag = "5")]
+    pub fields: Vec<PluginFieldSchema>,
 }
 
 /// 一个可执行 Task 的配置和结果消息入口。
@@ -160,10 +178,10 @@ impl PluginSchemaBundle {
                 "unsupported schema format version".to_owned(),
             ));
         }
-        if self.plugin_id.is_empty()
-            || self.plugin_id.len() > 256
+        if !is_safe_component(&self.plugin_id)
             || self.plugin_version.is_empty()
             || self.plugin_version.len() > 64
+            || has_control_character(&self.plugin_version)
         {
             return Err(PluginSchemaError::Invalid(
                 "plugin identity and version are required".to_owned(),
@@ -189,6 +207,22 @@ impl PluginSchemaBundle {
                 "descriptor set contains too many messages".to_owned(),
             ));
         }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| PluginSchemaError::Invalid("runtime schema is required".to_owned()))?;
+        if runtime.schema_version == 0
+            || runtime.config_message.is_empty()
+            || runtime.config_message.len() > 512
+            || has_control_character(&runtime.config_message)
+            || runtime.display_name.len() > 256
+            || runtime.description.len() > 4096
+            || !messages.contains_key(runtime.config_message.trim_start_matches('.'))
+        {
+            return Err(PluginSchemaError::Invalid(
+                "runtime schema identity is incomplete".to_owned(),
+            ));
+        }
         if self.tasks.is_empty()
             || self.tasks.len() > MAX_TASKS
             || self
@@ -203,10 +237,13 @@ impl PluginSchemaBundle {
         for task in &self.tasks {
             if task.task_kind.is_empty()
                 || task.task_kind.len() > 256
+                || !is_safe_component(&task.task_kind)
                 || task.schema_version == 0
                 || task.config_message.is_empty()
                 || task.config_message.len() > 512
+                || has_control_character(&task.config_message)
                 || task.result_message.len() > 512
+                || has_control_character(&task.result_message)
                 || task.display_name.len() > 256
                 || task.description.len() > 4096
             {
@@ -243,6 +280,8 @@ impl PluginSchemaBundle {
                     || field.path.len() > 256
                     || field.label.is_empty()
                     || field.label.len() > 256
+                    || has_control_character(&field.path)
+                    || has_control_character(&field.label)
                     || field.description.len() > 4096
                     || field.unit.len() > 64
                 {
@@ -314,10 +353,12 @@ impl PluginSchemaBundle {
                     .options
                     .windows(2)
                     .any(|pair| pair[0].value >= pair[1].value)
-                    || field
-                        .options
-                        .iter()
-                        .any(|option| option.value.is_empty() || option.label.is_empty())
+                    || field.options.iter().any(|option| {
+                        option.value.is_empty()
+                            || option.label.is_empty()
+                            || has_control_character(&option.value)
+                            || has_control_character(&option.label)
+                    })
                 {
                     return Err(PluginSchemaError::Invalid(format!(
                         "field {} has invalid options",
@@ -346,6 +387,19 @@ impl PluginSchemaBundle {
         normalized.descriptor_set = descriptors.encode_to_vec();
         Ok(normalized)
     }
+}
+
+/// Schema 身份和任务名会进入目录、日志或管理端查询，只允许稳定的 ASCII 组件。
+fn is_safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn has_control_character(value: &str) -> bool {
+    value.chars().any(char::is_control)
 }
 
 fn validate_control_type(
@@ -538,15 +592,21 @@ mod tests {
         descriptor_set.file.push(prost_types::FileDescriptorProto {
             name: Some("echo.proto".to_owned()),
             package: Some("smalux.plus.echo.v1".to_owned()),
-            message_type: vec![prost_types::DescriptorProto {
-                name: Some("EchoTaskConfig".to_owned()),
-                field: vec![prost_types::FieldDescriptorProto {
-                    name: Some("delay_millis".to_owned()),
-                    r#type: Some(field_descriptor_proto::Type::Uint64 as i32),
+            message_type: vec![
+                prost_types::DescriptorProto {
+                    name: Some("EchoTaskConfig".to_owned()),
+                    field: vec![prost_types::FieldDescriptorProto {
+                        name: Some("delay_millis".to_owned()),
+                        r#type: Some(field_descriptor_proto::Type::Uint64 as i32),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            }],
+                },
+                prost_types::DescriptorProto {
+                    name: Some("EchoRuntimeConfig".to_owned()),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         });
         PluginSchemaBundle {
@@ -560,6 +620,11 @@ mod tests {
                 config_message: "smalux.plus.echo.v1.EchoTaskConfig".to_owned(),
                 ..Default::default()
             }],
+            runtime: Some(PluginRuntimeSchema {
+                schema_version: 1,
+                config_message: "smalux.plus.echo.v1.EchoRuntimeConfig".to_owned(),
+                ..Default::default()
+            }),
         }
     }
 
@@ -673,5 +738,21 @@ mod tests {
         });
         with_locations.descriptor_set = descriptors.encode_to_vec();
         assert_eq!(original.hash().unwrap(), with_locations.hash().unwrap());
+    }
+
+    #[test]
+    fn rejects_unsafe_identity_and_ui_control_text() {
+        let mut invalid = bundle();
+        invalid.plugin_id = "../outside".to_owned();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = bundle();
+        invalid.tasks[0].task_kind = "smalux.plus.echo\n.v1".to_owned();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid =
+            bundle_with_field(field_descriptor_proto::Type::String, FieldControl::Text);
+        invalid.tasks[0].fields[0].label = "Value\n".to_owned();
+        assert!(invalid.validate().is_err());
     }
 }

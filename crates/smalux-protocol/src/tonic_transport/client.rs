@@ -42,9 +42,10 @@ impl AgentTransportRpcClient {
     ///
     /// `endpoint` 只能包含 scheme、host 与 port，例如 `https://agent.example.com`；
     /// 路径前缀应单独通过 `grpc_prefix` 传入，避免 Tonic 覆盖 endpoint URL 的 path。
-    pub async fn connect(
+    pub async fn connect_channel(
         endpoint: &str,
         grpc_prefix: Option<&str>,
+        timeout_limit: Duration,
     ) -> Result<Self, TransportError> {
         let endpoint_label = endpoint_log_label(endpoint);
         let grpc_prefix_label = grpc_prefix_log_label(grpc_prefix);
@@ -53,7 +54,7 @@ impl AgentTransportRpcClient {
             grpc_prefix = %grpc_prefix_label,
             "connecting Agent gRPC client"
         );
-        let channel = connect_channel(endpoint).await?;
+        let channel = open_channel(endpoint, timeout_limit).await?;
         debug!(endpoint = %endpoint_label, "Agent gRPC channel connected");
         Ok(Self::new(channel, grpc_prefix))
     }
@@ -300,8 +301,12 @@ impl AgentProtocolClient {
     /// 健康检查只验证 HTTP/2 路由和 Server 进程是否可达，不建立 Noise 会话，也不代表
     /// Agent 已经完成身份认证。注册和重连仍必须使用下面的 XXpsk3/IK 方法。
     pub async fn health_check(&self) -> Result<HealthResponse, TransportError> {
-        let mut client =
-            AgentTransportRpcClient::connect(&self.endpoint, self.grpc_prefix.as_deref()).await?;
+        let mut client = AgentTransportRpcClient::connect_channel(
+            &self.endpoint,
+            self.grpc_prefix.as_deref(),
+            self.handshake_timeout,
+        )
+        .await?;
         Ok(client
             .health_check(HealthRequest::default())
             .await?
@@ -470,7 +475,7 @@ impl AgentProtocolClient {
     }
 
     /// 已注册连接：使用 Agent 身份和固定 Server 公钥执行两消息 IK。
-    pub async fn connect(
+    pub async fn connect_ik(
         &self,
         identity: &NoiseIdentity,
         server_key: NoisePublicKey,
@@ -490,20 +495,20 @@ impl AgentProtocolClient {
         ))
     }
 
-    /// 按给定 Server 公钥顺序逐一尝试 IK，首个成功结果立即返回。
+    /// 按给定 Server 公钥顺序逐一尝试 IK，返回首个成功会话和实际使用的公钥。
     ///
     /// 适用于 Server 换钥窗口；全部失败时返回最后一次握手错误。
     pub async fn connect_with_candidates(
         &self,
         identity: &NoiseIdentity,
         candidates: &[NoisePublicKey],
-    ) -> Result<TonicNoiseSession, TransportError> {
+    ) -> Result<(TonicNoiseSession, NoisePublicKey), TransportError> {
         // 轮换窗口通常依次尝试 pending/current/previous；每次尝试都创建独立 RPC。
         let mut last = None;
         for key in candidates {
             debug!(server_key_id = ?key.key_id(), "trying Agent IK key candidate");
-            match self.connect(identity, *key).await {
-                Ok(session) => return Ok(session),
+            match self.connect_ik(identity, *key).await {
+                Ok(session) => return Ok((session, *key)),
                 Err(error) => {
                     warn!(server_key_id = ?key.key_id(), error = %error, "Agent IK key candidate failed");
                     last = Some(error);
@@ -532,8 +537,12 @@ impl AgentProtocolClient {
             .await
             .map_err(|_| TransportError::Closed)?;
         // 由路径感知 Client 显式保留 Axum nest 或反向代理前缀。
-        let mut client =
-            AgentTransportRpcClient::connect(&self.endpoint, self.grpc_prefix.as_deref()).await?;
+        let mut client = AgentTransportRpcClient::connect_channel(
+            &self.endpoint,
+            self.grpc_prefix.as_deref(),
+            self.handshake_timeout,
+        )
+        .await?;
         let response = timeout(
             self.handshake_timeout,
             client.open_session(ReceiverStream::new(receiver)),
@@ -546,7 +555,7 @@ impl AgentProtocolClient {
 }
 
 /// 根据 endpoint scheme 创建 Tonic channel。
-async fn connect_channel(endpoint: &str) -> Result<Channel, TransportError> {
+async fn open_channel(endpoint: &str, timeout_limit: Duration) -> Result<Channel, TransportError> {
     let endpoint_label = endpoint_log_label(endpoint);
     debug!(
         endpoint = %endpoint_label,
@@ -560,7 +569,10 @@ async fn connect_channel(endpoint: &str) -> Result<Channel, TransportError> {
     } else {
         builder
     };
-    Ok(builder.connect().await?)
+    tokio::time::timeout(timeout_limit, builder.connect())
+        .await
+        .map_err(|_| TransportError::Timeout("connecting gRPC channel"))?
+        .map_err(TransportError::Transport)
 }
 
 /// 生成用于日志的 endpoint 摘要，只保留 scheme、host 和 port。
@@ -625,10 +637,12 @@ fn handshake_frame(handshake: crate::agent::v1::NoiseHandshake) -> ProtocolFrame
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tonic::transport::Endpoint;
 
     use super::{
-        AgentTransportRpcClient, endpoint_log_label, grpc_prefix_log_label,
+        AgentTransportRpcClient, endpoint_log_label, grpc_prefix_log_label, open_channel,
         registration_token_id_from_credential,
     };
 
@@ -652,6 +666,18 @@ mod tests {
             client.rpc_path("HealthCheck").unwrap().as_str(),
             "/smalux.agent.v1.AgentTransport/HealthCheck"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_connection_honors_the_configured_timeout() {
+        let error = open_channel("http://127.0.0.1:1", Duration::ZERO)
+            .await
+            .expect_err("zero timeout must reject the connection attempt");
+
+        assert!(matches!(
+            error,
+            crate::tonic_transport::TransportError::Timeout("connecting gRPC channel")
+        ));
     }
 
     #[test]

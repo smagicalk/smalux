@@ -58,6 +58,7 @@ pub trait PlusTask: Send + Sync + 'static {
         &self,
         _agent: &AgentContext,
         _runtime_config: &[u8],
+        _runtime_config_version: u32,
     ) -> Result<(), PlusTaskError> {
         Ok(())
     }

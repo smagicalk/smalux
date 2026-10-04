@@ -15,6 +15,27 @@ pub struct JobResultBufferStats {
     dropped: AtomicU64,
 }
 
+/// JobEvent 内存队列的轻量运行统计；只保存计数，不保存事件内容。
+#[derive(Default)]
+pub struct JobEventBufferStats {
+    pending: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+impl JobEventBufferStats {
+    pub fn update(&self, pending: usize, dropped: u64) {
+        self.pending.store(pending, Ordering::Relaxed);
+        self.dropped.store(dropped, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> (usize, u64) {
+        (
+            self.pending.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
+}
+
 impl JobResultBufferStats {
     pub fn update(&self, pending: usize, dropped: u64) {
         self.pending.store(pending, Ordering::Relaxed);
@@ -163,6 +184,8 @@ pub struct StatusSnapshot {
     pub pending_runs: usize,
     pub pending_job_results: usize,
     pub dropped_job_results: u64,
+    pub pending_job_events: usize,
+    pub dropped_job_events: u64,
     pub heartbeat_sent: Option<u64>,
     pub heartbeat_received: Option<u64>,
     pub heartbeat_rtt_ms: Option<u64>,

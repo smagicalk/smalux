@@ -7,7 +7,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use smalux_protocol::{
     agent::v1::{HealthResponse, SecureErrorCode},
-    noise::NoiseIdentity,
+    noise::{NoiseError, NoiseIdentity},
     tonic_transport::{
         AgentProtocolClient, RunningSession, SessionDriver, SessionEvent, TonicNoiseSession,
         TransportError, parse_registration_credential,
@@ -87,8 +87,9 @@ impl<'a> ConnectionCoordinator<'a> {
                 // 只有明确未授权时才再次使用 Token 恢复 XX 注册事务。
                 match self.connect_registered(&state).await {
                     Ok(mut connection) => {
-                        let registered = PersistedAgentState::registered_from_pending(&state)
-                            .map_err(SmaluxClientError::state_store)?;
+                        let registered =
+                            PersistedAgentState::registered_from_pending(&connection.state)
+                                .map_err(SmaluxClientError::state_store)?;
                         self.store
                             .save(&registered)
                             .await
@@ -109,13 +110,32 @@ impl<'a> ConnectionCoordinator<'a> {
         &self,
         state: &PersistedAgentState,
     ) -> Result<ActiveConnection, SmaluxClientError> {
-        let session = self
+        let candidates = state.server_key_candidates();
+        let (session, connected_key) = self
             .protocol
-            .connect_with_candidates(state.identity(), state.server_public_keys())
+            .connect_with_candidates(state.identity(), &candidates)
             .await?;
+        // 先完成业务授权，再提升 pending key；仅完成 Noise IK 不足以证明该连接可用。
         let (running, buffered_events) = self.verify_authorized_session(session).await?;
+        let state = if state
+            .server_key_snapshot()
+            .is_some_and(|snapshot| snapshot.pending.is_some_and(|key| key == connected_key))
+        {
+            let rotation_id = state
+                .server_key_snapshot()
+                .and_then(|snapshot| snapshot.rotation_id)
+                .ok_or(SmaluxClientError::Noise(NoiseError::NoPendingRotation))?;
+            let promoted = state.promote_server_key(rotation_id)?;
+            self.store
+                .save(&promoted)
+                .await
+                .map_err(SmaluxClientError::state_store)?;
+            promoted
+        } else {
+            state.clone()
+        };
         Ok(ActiveConnection {
-            state: state.clone(),
+            state,
             running,
             mode: AuthenticationMode::ReconnectIk,
             buffered_events,
@@ -179,6 +199,7 @@ impl<'a> ConnectionCoordinator<'a> {
     fn start_driver(&self, mut session: TonicNoiseSession) -> RunningSession {
         session.set_heartbeat_policy(self.config.heartbeat);
         session.set_rekey_policy(self.config.rekey);
+        session.set_rekey_timeout(self.config.handshake_timeout);
         SessionDriver::spawn(session, self.config.driver)
     }
 
@@ -238,7 +259,7 @@ fn verify_same_pending(
 ) -> Result<(), SmaluxClientError> {
     let same = previous.agent_id() == current.agent_id()
         && previous.identity().public_key() == current.identity().public_key()
-        && previous.server_public_keys() == current.server_public_keys()
+        && previous.server_key_snapshot() == current.server_key_snapshot()
         && previous.registration_id() == current.registration_id();
     if !same {
         return Err(SmaluxClientError::InconsistentPendingRegistration);

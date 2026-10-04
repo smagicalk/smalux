@@ -6,7 +6,7 @@
 use prost::Message;
 
 /// Worker 协议主版本。
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WorkerFrame {
@@ -29,7 +29,7 @@ pub mod worker_frame {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WorkerRequest {
-    #[prost(oneof = "worker_request::Body", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "worker_request::Body", tags = "1, 2, 3, 4, 5")]
     pub body: Option<worker_request::Body>,
 }
 
@@ -48,15 +48,13 @@ pub mod worker_request {
         #[prost(message, tag = "4")]
         Cancel(CancelTask),
         #[prost(message, tag = "5")]
-        Ping(super::Ping),
-        #[prost(message, tag = "6")]
         Shutdown(super::Shutdown),
     }
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WorkerResponse {
-    #[prost(oneof = "worker_response::Body", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "worker_response::Body", tags = "1, 2, 3, 4")]
     pub body: Option<worker_response::Body>,
 }
 
@@ -69,17 +67,11 @@ pub mod worker_response {
         #[prost(message, tag = "1")]
         Ready(WorkerReady),
         #[prost(message, tag = "2")]
-        Started(super::TaskStarted),
-        #[prost(message, tag = "3")]
         Result(TaskResult),
-        #[prost(message, tag = "4")]
+        #[prost(message, tag = "3")]
         Error(ErrorResponse),
-        #[prost(message, tag = "5")]
-        Pong(super::Pong),
-        #[prost(message, tag = "6")]
+        #[prost(message, tag = "4")]
         Stopped(super::Stopped),
-        #[prost(message, tag = "7")]
-        Cancelled(super::TaskCancelled),
     }
 }
 
@@ -99,6 +91,9 @@ pub struct InitializeWorker {
     pub plugin_id: String,
     #[prost(uint64, tag = "3")]
     pub config_revision: u64,
+    /// 共享 runtime_config 的插件自定义格式版本。
+    #[prost(uint32, tag = "7")]
+    pub runtime_config_version: u32,
     #[prost(bytes = "bytes", tag = "4")]
     pub runtime_config: Vec<u8>,
     #[prost(uint32, tag = "5")]
@@ -159,12 +154,6 @@ pub struct ExecuteTask {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct TaskStarted {
-    #[prost(string, tag = "1")]
-    pub request_id: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
 pub struct TaskResult {
     #[prost(string, tag = "1")]
     pub request_id: String,
@@ -189,6 +178,8 @@ pub enum TaskStatus {
     Succeeded = 1,
     Failed = 2,
     Cancelled = 3,
+    /// Task 参数无法解码或违反插件约束；相同配置不应重试。
+    InvalidConfig = 4,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -208,18 +199,6 @@ pub struct CancelTask {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct Ping {
-    #[prost(uint64, tag = "1")]
-    pub nonce: u64,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct Pong {
-    #[prost(uint64, tag = "1")]
-    pub nonce: u64,
-}
-
-#[derive(Clone, PartialEq, Message)]
 pub struct Shutdown {
     #[prost(string, tag = "1")]
     pub reason: String,
@@ -229,12 +208,6 @@ pub struct Shutdown {
 pub struct Stopped {
     #[prost(string, tag = "1")]
     pub reason: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct TaskCancelled {
-    #[prost(string, tag = "1")]
-    pub request_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

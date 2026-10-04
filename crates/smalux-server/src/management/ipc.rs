@@ -152,24 +152,49 @@ mod platform {
         service: Arc<AdminService>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
-        let mut server = create_server(&endpoint)?;
-        tracing::info!(endpoint = %endpoint.display(), "Server local management pipe listening");
-        loop {
-            tokio::select! { result = server.connect() => result?, _ = shutdown.cancelled() => return Ok(()) }
-            if let Err(error) = serve_stream(&mut server, &service).await {
-                tracing::warn!(error = %error, "Server local management request failed");
-            }
-            server.disconnect()?;
-        }
+        let handler_shutdown = shutdown.clone();
+        serve_pipe(&endpoint, shutdown, move |mut connected| {
+            let service = Arc::clone(&service);
+            let shutdown = handler_shutdown.clone();
+            Box::pin(async move {
+                if let Err(error) = serve_stream(&mut connected, &service).await {
+                    tracing::warn!(error = %error, "Server local management request failed");
+                }
+                tokio::select! {
+                    _ = tokio::time::timeout(IO_TIMEOUT, connected.read_u8()) => { let _ = connected.disconnect(); },
+                    _ = shutdown.cancelled() => {},
+                }
+            })
+        }).await
     }
 
-    /// 创建只接受本机客户端的首个命名管道实例，并附加受限 DACL。
+    pub(super) async fn serve_pipe<F>(
+        endpoint: &Path,
+        shutdown: CancellationToken,
+        mut handle: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(
+            tokio::net::windows::named_pipe::NamedPipeServer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    {
+        let mut listener = create_server(endpoint, true)?;
+        tracing::info!(endpoint = %endpoint.display(), "Server local management pipe listening");
+        loop {
+            tokio::select! { result = listener.connect() => result?, _ = shutdown.cancelled() => return Ok(()) }
+            let next_listener = create_server(endpoint, false)?;
+            handle(listener).await;
+            listener = next_listener;
+        }
+    }
+    /// 创建命名管道实例并附加受限 DACL。
     fn create_server(
         endpoint: &Path,
+        first: bool,
     ) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
         let security = PipeSecurity::new()?;
         let options = ServerOptions::new()
-            .first_pipe_instance(true)
+            .first_pipe_instance(first)
             .reject_remote_clients(true)
             .to_owned();
         let server = unsafe {
@@ -310,5 +335,59 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(envelope.protocol_version, CONTROL_PROTOCOL_VERSION);
         assert!(matches!(envelope.request, ControlRequest::Status));
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_handles_sequential_large_responses() {
+        let endpoint = PathBuf::from(format!(r"\\.\pipe\smalux-ipc-{}", uuid::Uuid::new_v4()));
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            platform::serve_pipe(&server_endpoint, server_shutdown, |mut pipe| {
+                Box::pin(async move {
+                    let _request: RequestEnvelope = match read_json_frame(&mut pipe).await {
+                        Ok(request) => request,
+                        Err(_) => return,
+                    };
+                    let response = ResponseEnvelope {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        response: ControlResponse::Error {
+                            code: "test".into(),
+                            message: "x".repeat(128 * 1024),
+                        },
+                    };
+                    write_json_frame(&mut pipe, &response).await.unwrap();
+                    let _ = tokio::time::timeout(IO_TIMEOUT, pipe.read_u8()).await;
+                })
+            })
+            .await
+            .unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if platform::request(&endpoint, ControlRequest::Status)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "named pipe listener did not become ready"
+            );
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..8 {
+            let response = platform::request(&endpoint, ControlRequest::Status)
+                .await
+                .unwrap();
+            match response {
+                ControlResponse::Error { message, .. } => assert_eq!(message.len(), 128 * 1024),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        shutdown.cancel();
+        server.await.unwrap();
     }
 }

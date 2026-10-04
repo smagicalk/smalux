@@ -1,6 +1,12 @@
 //! Agent 长期认证状态模型及其阶段转换不变量。
 
-use smalux_protocol::noise::{NoiseIdentity, NoisePublicKey};
+use smalux_protocol::{
+    agent::v1::ServerKeyAnnouncement,
+    noise::{
+        NoiseError, NoiseIdentity, NoisePublicKey, PinnedServerKeys, PinnedServerKeysSnapshot,
+        RotationId,
+    },
+};
 
 /// 本地认证状态所处的持久化阶段。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,13 +25,13 @@ pub enum PersistedAgentState {
     RegistrationPending {
         agent_id: String,
         identity: NoiseIdentity,
-        server_public_keys: Vec<NoisePublicKey>,
+        server_keys: PinnedServerKeysSnapshot,
         registration_id: [u8; 16],
     },
     Registered {
         agent_id: String,
         identity: NoiseIdentity,
-        server_public_keys: Vec<NoisePublicKey>,
+        server_keys: PinnedServerKeysSnapshot,
         registration_id: [u8; 16],
     },
 }
@@ -41,10 +47,11 @@ impl PersistedAgentState {
         server_public_key: NoisePublicKey,
         registration_id: [u8; 16],
     ) -> Self {
+        let server_keys = PinnedServerKeys::new(server_public_key).snapshot();
         Self::RegistrationPending {
             agent_id,
             identity,
-            server_public_keys: vec![server_public_key],
+            server_keys,
             registration_id,
         }
     }
@@ -53,7 +60,7 @@ impl PersistedAgentState {
         let Self::RegistrationPending {
             agent_id,
             identity,
-            server_public_keys,
+            server_keys,
             registration_id,
         } = state
         else {
@@ -62,7 +69,7 @@ impl PersistedAgentState {
         Ok(Self::Registered {
             agent_id: agent_id.clone(),
             identity: identity.clone(),
-            server_public_keys: server_public_keys.clone(),
+            server_keys: server_keys.clone(),
             registration_id: *registration_id,
         })
     }
@@ -92,15 +99,12 @@ impl PersistedAgentState {
         }
     }
 
-    pub fn server_public_keys(&self) -> &[NoisePublicKey] {
+    /// 返回当前、pending 和 previous Server 公钥，按连接优先级排列。
+    pub fn server_key_candidates(&self) -> Vec<NoisePublicKey> {
         match self {
-            Self::IdentityPrepared { .. } => &[],
-            Self::RegistrationPending {
-                server_public_keys, ..
-            }
-            | Self::Registered {
-                server_public_keys, ..
-            } => server_public_keys,
+            Self::IdentityPrepared { .. } => Vec::new(),
+            Self::RegistrationPending { server_keys, .. }
+            | Self::Registered { server_keys, .. } => server_key_candidates(server_keys),
         }
     }
 
@@ -116,65 +120,110 @@ impl PersistedAgentState {
         }
     }
 
-    /// 把已通过当前加密会话认证的 Server 新公钥加入后续 IK 候选。
+    /// 返回当前持久化的 Server 公钥轮换快照；身份尚未注册时返回 `None`。
+    pub fn server_key_snapshot(&self) -> Option<&PinnedServerKeysSnapshot> {
+        match self {
+            Self::IdentityPrepared { .. } => None,
+            Self::RegistrationPending { server_keys, .. }
+            | Self::Registered { server_keys, .. } => Some(server_keys),
+        }
+    }
+
+    /// 校验当前会话收到的 Server 公钥公告，并写入 pending 状态。
     ///
-    /// 新公钥放在最前面，使下一次连接优先尝试轮换后的 key；重复公告保持幂等。
-    pub fn with_server_public_key(&self, key: NoisePublicKey) -> anyhow::Result<Self> {
-        let (agent_id, identity, server_public_keys, registration_id, pending) = match self {
+    /// 调用方必须在发送 acknowledgement 前持久化返回的新状态。
+    pub fn stage_server_key(
+        &self,
+        announcement: &ServerKeyAnnouncement,
+    ) -> Result<Self, NoiseError> {
+        let (agent_id, identity, server_keys, registration_id, pending) = match self {
             Self::IdentityPrepared { .. } => {
-                anyhow::bail!("Server key rotation requires a pending or registered Agent state")
+                return Err(NoiseError::NoPendingRotation);
             }
             Self::RegistrationPending {
                 agent_id,
                 identity,
-                server_public_keys,
+                server_keys,
                 registration_id,
-            } => (
-                agent_id,
-                identity,
-                server_public_keys,
-                registration_id,
-                true,
-            ),
+            } => (agent_id, identity, server_keys, registration_id, true),
             Self::Registered {
                 agent_id,
                 identity,
-                server_public_keys,
+                server_keys,
                 registration_id,
-            } => (
-                agent_id,
-                identity,
-                server_public_keys,
-                registration_id,
-                false,
-            ),
+            } => (agent_id, identity, server_keys, registration_id, false),
         };
-        let mut keys = server_public_keys.clone();
-        if let Some(index) = keys.iter().position(|candidate| *candidate == key) {
-            keys.remove(index);
-        }
-        keys.insert(0, key);
+        let mut pinned = PinnedServerKeys::from_snapshot(server_keys.clone())?;
+        pinned.stage(announcement)?;
+        let server_keys = pinned.snapshot();
         Ok(if pending {
             Self::RegistrationPending {
                 agent_id: agent_id.clone(),
                 identity: identity.clone(),
-                server_public_keys: keys,
+                server_keys,
                 registration_id: *registration_id,
             }
         } else {
             Self::Registered {
                 agent_id: agent_id.clone(),
                 identity: identity.clone(),
-                server_public_keys: keys,
+                server_keys,
+                registration_id: *registration_id,
+            }
+        })
+    }
+
+    /// 在使用 pending Server 公钥成功建立 IK 后提升它为 current。
+    pub fn promote_server_key(&self, rotation_id: RotationId) -> Result<Self, NoiseError> {
+        let (agent_id, identity, server_keys, registration_id, pending) = match self {
+            Self::IdentityPrepared { .. } => return Err(NoiseError::NoPendingRotation),
+            Self::RegistrationPending {
+                agent_id,
+                identity,
+                server_keys,
+                registration_id,
+            } => (agent_id, identity, server_keys, registration_id, true),
+            Self::Registered {
+                agent_id,
+                identity,
+                server_keys,
+                registration_id,
+            } => (agent_id, identity, server_keys, registration_id, false),
+        };
+        let mut pinned = PinnedServerKeys::from_snapshot(server_keys.clone())?;
+        pinned.promote_pending(rotation_id)?;
+        let server_keys = pinned.snapshot();
+        Ok(if pending {
+            Self::RegistrationPending {
+                agent_id: agent_id.clone(),
+                identity: identity.clone(),
+                server_keys,
+                registration_id: *registration_id,
+            }
+        } else {
+            Self::Registered {
+                agent_id: agent_id.clone(),
+                identity: identity.clone(),
+                server_keys,
                 registration_id: *registration_id,
             }
         })
     }
 }
 
+fn server_key_candidates(snapshot: &PinnedServerKeysSnapshot) -> Vec<NoisePublicKey> {
+    snapshot
+        .pending
+        .iter()
+        .copied()
+        .chain(std::iter::once(snapshot.current))
+        .chain(snapshot.previous.iter().copied())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use smalux_protocol::noise::NoiseIdentity;
+    use smalux_protocol::noise::{NoiseIdentity, PinnedServerKeys};
 
     use super::PersistedAgentState;
 
@@ -191,16 +240,25 @@ mod tests {
         );
         let registered = PersistedAgentState::registered_from_pending(&pending).unwrap();
 
-        let rotated = registered
-            .with_server_public_key(new_server.public_key())
-            .unwrap();
-        let replayed = rotated
-            .with_server_public_key(new_server.public_key())
-            .unwrap();
+        let prepared = PinnedServerKeys::new(old_server.public_key()).snapshot();
+        let announcement = smalux_protocol::agent::v1::ServerKeyAnnouncement {
+            rotation_id: [3; 16].to_vec(),
+            new_public_key: new_server.public_key().as_bytes().to_vec(),
+            new_key_id: new_server.key_id().as_bytes().to_vec(),
+        };
+        let pending = PersistedAgentState::Registered {
+            agent_id: "agent-1".to_owned(),
+            identity: registered.identity().clone(),
+            server_keys: prepared,
+            registration_id: [9; 16],
+        }
+        .stage_server_key(&announcement)
+        .unwrap();
+        let replayed = pending.stage_server_key(&announcement).unwrap();
 
         assert_eq!(
-            replayed.server_public_keys(),
-            &[new_server.public_key(), old_server.public_key()]
+            replayed.server_key_candidates(),
+            vec![new_server.public_key(), old_server.public_key()]
         );
     }
 }

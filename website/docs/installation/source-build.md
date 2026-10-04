@@ -55,8 +55,9 @@ cargo build --workspace
 cargo build --workspace --release
 ```
 
-产物写入 `target/release/`。当前仓库尚未提供跨平台打包、签名、压缩归档或自动升级流程，发布时还需
-自行处理配置文件、服务管理、目录权限和平台依赖。
+仓库已提供跨平台归档构建：`.github/workflows/release.yml` 只能由 GitHub Actions 页面手动 `workflow_dispatch`，校验
+Tag 与两个 crate 版本后构建 Windows、Linux glibc/musl 和 macOS Intel/Apple Silicon 产物，并创建 Draft Release。
+它仍不包含代码签名、安装器、服务管理或自动升级；公开 Draft 前需要人工检查，生产环境还需自行处理这些边界。
 
 ## 单独构建 crate
 
@@ -105,5 +106,5 @@ Agent 和 Server 含 Tokio、Reqwest、Tonic、SeaORM 等依赖，首次构建�
 
 ### 端口 8080 被占用
 
-协议 Example 与正式 Server 默认都可能使用 `127.0.0.1:8080`。先确认占用进程身份，再通过
+协议 Example 默认使用 `127.0.0.1:8080`；正式 Server 默认使用 `127.0.0.1:12345`，但可通过 `--listen-port` 或 `SMALUX_SERVER_LISTEN_PORT` 覆盖。先确认占用进程身份，再通过
 `SMALUX_EXAMPLE_ADDR` 为 Example 选择其他端口；不要直接停止与 Smalux 无关的本机服务。

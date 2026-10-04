@@ -95,6 +95,39 @@ pub enum ControlRequest {
         /// 目标 Agent 的稳定 ID。
         agent_id: String,
     },
+    /// 用完整定义替换一个 Agent 的全部远程 Job；每项是编码后的 JobDefinition。
+    ReplaceAgentJobCatalog {
+        agent_id: String,
+        definitions: Vec<Vec<u8>>,
+        /// 可选的乐观锁版本；省略时保持兼容的无条件替换行为。
+        #[serde(default)]
+        expected_revision: Option<u64>,
+    },
+    /// 查询一个 Agent 当前权威 Job 目录；定义保持 Protobuf 二进制，适合导出或再次提交。
+    GetAgentJobCatalog {
+        agent_id: String,
+    },
+    /// 替换一个 Agent 的 Plus Worker runtime；参数使用插件 Schema 定义的 Protobuf JSON。
+    ReplaceAgentPluginRuntime {
+        agent_id: String,
+        runtimes: Vec<PluginRuntimeDraft>,
+        /// 可选的 runtime 乐观锁版本；首次创建使用 `Some(0)`。
+        #[serde(default)]
+        expected_revision: Option<u64>,
+    },
+    GetAgentPluginRuntime {
+        agent_id: String,
+    },
+    /// 按可选 Agent 过滤查询已持久化的成功 TaskReport。
+    ListTaskReports {
+        agent_id: Option<String>,
+        limit: u32,
+    },
+    /// 按可选 Agent 过滤查询已持久化的 Scheduler 异常与状态事件。
+    ListJobEvents {
+        agent_id: Option<String>,
+        limit: u32,
+    },
     /// 查询仅存在于当前进程内的实时 Session。
     ListSessions {
         /// 可选的稳定 Agent ID 过滤器。
@@ -150,6 +183,16 @@ pub enum ControlResponse {
         /// 找到并取消的当前进程 Session 数量。
         disconnected_sessions: usize,
     },
+    /// 成功替换后的权威 Job 目录。
+    AgentJobCatalog(Option<AgentJobCatalogView>),
+    /// 成功替换后的 Plus runtime snapshot revision。
+    AgentPluginRuntimeUpdated {
+        agent_id: String,
+        revision: u64,
+    },
+    AgentPluginRuntime(Option<AgentPluginRuntimeView>),
+    TaskReports(Vec<TaskReportView>),
+    JobEvents(Vec<JobEventView>),
     /// 当前进程内的 Session 列表。
     Sessions(Vec<SessionView>),
     /// Session 信息；`None` 表示它不存在或已经结束。
@@ -273,6 +316,82 @@ pub struct AgentView {
     pub updated_at_unix_micros: i64,
     /// 吊销时间，Unix epoch 微秒；活动 Agent 为 `None`。
     pub revoked_at_unix_micros: Option<i64>,
+}
+
+/// 一个 Agent 的权威远程 Job 目录视图。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentJobCatalogView {
+    pub agent_id: String,
+    pub catalog_revision: u64,
+    /// 每项是 JobDefinition 的 Protobuf 二进制；管理端按 Proto 进行导入、导出或编辑。
+    pub definitions: Vec<Vec<u8>>,
+}
+
+/// 管理端提交的一项插件 Worker 共享配置。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginRuntimeDraft {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    /// `schema.pb` 规范化编码的 SHA-256 小写十六进制文本。
+    pub schema_hash: String,
+    /// 符合插件 runtime config_message 的标准 Protobuf JSON。
+    pub config: serde_json::Value,
+    pub requested_concurrency: u32,
+}
+
+/// 已保存的插件 runtime 查询视图；config 是插件私有 Protobuf bytes。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentPluginRuntimeView {
+    pub agent_id: String,
+    pub revision: u64,
+    pub runtimes: Vec<StoredPluginRuntimeView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredPluginRuntimeView {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub schema_hash: Vec<u8>,
+    pub schema_version: u32,
+    pub config: Vec<u8>,
+    pub requested_concurrency: u32,
+}
+
+/// 成功 TaskReport 的管理查询视图；payload 保持原始 Protobuf 以支持导出。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskReportView {
+    pub report_id: String,
+    pub agent_id: String,
+    pub job_id: Vec<u8>,
+    pub job_revision: i64,
+    pub run_id: Vec<u8>,
+    pub attempt: i32,
+    pub scheduled_at_unix_micros: Option<i64>,
+    pub started_at_unix_micros: Option<i64>,
+    pub result_kind: String,
+    pub payload: Vec<u8>,
+    pub received_at_unix_micros: i64,
+}
+
+/// Scheduler JobEvent 的管理查询视图；payload 保持原始 Protobuf 以支持导出。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JobEventView {
+    pub event_id: String,
+    pub agent_id: String,
+    /// Agent 进程实例 UUID，用于按进程区分 sequence。
+    pub instance_id: Vec<u8>,
+    pub sequence: i64,
+    pub kind: i32,
+    pub job_id: Vec<u8>,
+    pub revision: i64,
+    pub run_id: Vec<u8>,
+    pub attempt: i32,
+    pub emitted_at_unix_micros: i64,
+    pub message: String,
+    pub will_retry: bool,
+    /// Server 接收时是否检测到该实例的事件序号缺口。
+    pub gap_detected: bool,
+    pub payload: Vec<u8>,
 }
 
 /// 一个正在运行的 gRPC Session 的非持久化诊断视图。

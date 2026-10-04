@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod outbox;
 
+use chrono::{DateTime, Utc};
 use std::{
     future::Future,
     io::{IsTerminal, Write},
@@ -13,24 +14,28 @@ use std::{
 };
 
 use smalux_agent::client::{
-    AgentStateStore, FileAgentStateStore, SmaluxClient, SmaluxClientEvent, SmaluxClientHandle,
+    AgentStateStore, FileAgentStateStore, SmaluxClient, SmaluxClientError, SmaluxClientEvent,
+    SmaluxClientHandle,
 };
-use smalux_agent::management::JobResultBufferStats;
 use smalux_agent::management::{EffectiveConfigSnapshot, ManagementState};
+use smalux_agent::management::{JobEventBufferStats, JobResultBufferStats};
 use smalux_agent::plugins::{
     PluginCatalog, PluginManager, PluginRuntimeLimits, PluginRuntimeState, RuntimeSnapshotResult,
 };
 use smalux_agent::remote_jobs::{self, RemoteJobPolicyManager};
-use smalux_agent::scheduler::{CallbackError, SchedulerRuntime, TaskReportSink};
+use smalux_agent::scheduler::{
+    CallbackError, SchedulerEvent, SchedulerEventKind, SchedulerRuntime, TaskReportSink,
+};
 use smalux_plus_core::AgentContext;
 use smalux_protocol::{
     agent::v1::{
-        AgentCapabilitySync, AgentPluginSync, agent_capability_sync, agent_job_policy_sync,
-        agent_plugin_sync,
+        AgentCapabilitySync, AgentPluginSync, AgentReconcileSummary, JobEvent, JobEventKind,
+        agent_capability_sync, agent_job_policy_sync, agent_plugin_sync,
     },
     tonic_transport::SessionEvent,
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 const JOB_RESULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const OUTBOX_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -58,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
 /// 组装 Agent 的长期状态、连接层和调度层，并负责进程级优雅关闭。
 async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
     let process_shutdown = CancellationToken::new();
+    // 该 ID 只标识当前 Agent 进程实例，不写入磁盘；重连复用，重启后重新生成。
+    let process_instance_id = *Uuid::new_v4().as_bytes();
     let signal_task = spawn_shutdown_signal_listener(process_shutdown.clone());
     let state_store = Arc::new(FileAgentStateStore::new(&configuration.state_file));
     let policy = Arc::new(load_job_policy(&configuration.policy_file).await?);
@@ -99,6 +106,7 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
     let shared_store: Arc<dyn AgentStateStore> = state_store;
     let mut client = SmaluxClient::new(configuration.client.clone(), Arc::clone(&shared_store));
     let job_result_stats = Arc::new(JobResultBufferStats::default());
+    let job_event_stats = Arc::new(JobEventBufferStats::default());
     let management = Arc::new(ManagementState::new(
         Arc::clone(&shared_store),
         client.subscribe_connection_status(),
@@ -146,6 +154,7 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
         Arc::clone(&policy),
         Arc::clone(&plugins),
         Arc::clone(&job_result_stats),
+        Arc::clone(&job_event_stats),
     ));
     let control_shutdown = CancellationToken::new();
     let mut control_task = tokio::spawn(smalux_agent::management::run_server(
@@ -207,6 +216,10 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
     let pending_task_reports = Arc::new(tokio::sync::Mutex::new(outbox::TaskReportOutbox::new(
         configuration.task_report_buffer_capacity,
     )?));
+    let pending_job_events = Arc::new(tokio::sync::Mutex::new(outbox::JobEventOutbox::new(
+        configuration.task_report_buffer_capacity,
+        Arc::clone(&job_event_stats),
+    )?));
     let pending_job_results = tokio::sync::Mutex::new(outbox::JobResultOutbox::new(
         configuration.job_result_buffer_capacity,
         Arc::clone(&job_result_stats),
@@ -232,6 +245,8 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
             Arc::clone(&plugins),
         ),
     );
+    let mut scheduler_events = scheduler_runtime.scheduler().subscribe_events();
+    let mut job_event_emitter = JobEventEmitter::new(process_instance_id);
     management
         .attach_runtime(
             scheduler_runtime.scheduler(),
@@ -247,9 +262,13 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
             remote_jobs: &remote_jobs,
             management: &management,
             pending_task_reports: &pending_task_reports,
+            pending_job_events: &pending_job_events,
             pending_job_results: &pending_job_results,
             plugins: &plugins,
+            scheduler_events: &mut scheduler_events,
+            job_event_emitter: &mut job_event_emitter,
             plugin_runtime: &mut PluginRuntimeState::default(),
+            process_instance_id,
             process_shutdown: &process_shutdown,
             offline_job_timeout: configuration.offline_job_timeout,
         },
@@ -258,10 +277,13 @@ async fn run_agent(configuration: cli::RunConfiguration) -> anyhow::Result<()> {
 
     // 先停止 Scheduler，保证没有新 TaskReport 进入 Client，再关闭协议会话。
     let scheduler_result = scheduler_runtime.shutdown().await;
+    // Scheduler 已经停止接收新执行后，再回收 Plus Worker，避免退出时遗留插件子进程。
+    plugins.shutdown_all().await;
     drain_outboxes(
         &client_handle,
         &pending_job_results,
         &pending_task_reports,
+        &pending_job_events,
         configuration.shutdown_drain_timeout,
     )
     .await;
@@ -285,9 +307,15 @@ struct EventLoopContext<'a> {
     remote_jobs: &'a Arc<remote_jobs::RemoteJobController>,
     management: &'a ManagementState,
     pending_task_reports: &'a tokio::sync::Mutex<outbox::TaskReportOutbox>,
+    pending_job_events: &'a tokio::sync::Mutex<outbox::JobEventOutbox>,
     pending_job_results: &'a tokio::sync::Mutex<outbox::JobResultOutbox>,
     plugins: &'a Arc<PluginManager>,
+    scheduler_events: &'a mut tokio::sync::broadcast::Receiver<Arc<SchedulerEvent>>,
+    /// 为实际发送到 Server 的事件分配 Agent 进程内连续序号。
+    job_event_emitter: &'a mut JobEventEmitter,
     plugin_runtime: &'a mut PluginRuntimeState,
+    /// 当前 Agent 进程实例 UUID，用于重连摘要和后续事件去重。
+    process_instance_id: [u8; 16],
     process_shutdown: &'a CancellationToken,
     offline_job_timeout: Duration,
 }
@@ -308,6 +336,21 @@ async fn run_event_loop(
                 tracing::info!("Agent shutdown signal received");
                 return Ok(());
             }
+            scheduler_event = context.scheduler_events.recv() => {
+                match scheduler_event {
+                    Ok(event) => {
+                        if let Some(event) = context.job_event_emitter.emit(&event) {
+                            context.pending_job_events.lock().await.submit(context.client_handle, event).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(count, "Agent Job event subscriber lagged; skipped local events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("Agent Scheduler event stream closed");
+                    }
+                }
+            }
             event = client.next_event() => {
                 let Some(event) = event? else {
                     anyhow::bail!("Agent Client event channel closed unexpectedly");
@@ -318,15 +361,45 @@ async fn run_event_loop(
                         context.plugins.reset_pause_notice_delivery().await;
                         context.management.record_connected(mode).await;
                         tracing::info!(?mode, "Agent authenticated session is ready");
-                        context.client_handle
-                            .send_agent_job_policy(context.remote_jobs.policy().await.to_protocol_message())
-                            .await?;
-                        context.client_handle
-                            .send_agent_capability(agent_capability_message())
-                            .await?;
-                        context.client_handle
-                            .send_agent_plugin(agent_plugin_inventory_message(context.plugins.catalog()))
-                            .await?;
+                        // 先发送对账摘要，让 Server 在收到 capability/inventory 后即可决定是否
+                        // 需要下发完整 runtime 和 Job catalog，避免重连时重复传输相同快照。
+                        let (catalog_revision, catalog_digest) =
+                            context.remote_jobs.catalog_reconcile_state().await;
+                        let (runtime_revision, runtime_digest) =
+                            context.plugin_runtime.reconcile_state();
+                        send_or_defer(
+                            context.client_handle.send_reconcile_summary(AgentReconcileSummary {
+                                instance_id: context.process_instance_id.to_vec(),
+                                catalog_revision,
+                                catalog_digest,
+                                runtime_revision,
+                                runtime_digest,
+                            }).await,
+                            "Agent reconcile summary",
+                        ).await?;
+                        send_or_defer(
+                            context.client_handle
+                                .send_agent_job_policy(context.remote_jobs.policy().await.to_protocol_message())
+                                .await,
+                            "Agent Job policy",
+                        )
+                        .await?;
+                        send_or_defer(
+                            context
+                                .client_handle
+                                .send_agent_capability(agent_capability_message())
+                                .await,
+                            "Agent capability",
+                        )
+                        .await?;
+                        send_or_defer(
+                            context
+                                .client_handle
+                                .send_agent_plugin(agent_plugin_inventory_message(context.plugins.catalog()))
+                                .await,
+                            "Agent plugin inventory",
+                        )
+                        .await?;
                         send_pending_plugin_pauses(
                             context.client_handle,
                             context.remote_jobs,
@@ -335,6 +408,7 @@ async fn run_event_loop(
                         .await?;
                         context.pending_job_results.lock().await.flush(context.client_handle).await?;
                         context.pending_task_reports.lock().await.flush(context.client_handle).await?;
+                        context.pending_job_events.lock().await.flush(context.client_handle).await?;
                     }
                     SmaluxClientEvent::Disconnected { reason, retry_in } => {
                         context.plugins.reset_pause_notice_delivery().await;
@@ -347,7 +421,7 @@ async fn run_event_loop(
                                 timeout_ms = duration_millis(offline_job_timeout),
                                 "Agent offline Job deadline expired; clearing remote Jobs until Server resynchronizes"
                             );
-                            if let Err(error) = remote_jobs.clear().await {
+                            if let Err(error) = remote_jobs.clear_remote_jobs().await {
                                 tracing::error!(%error, "failed to clear remote Jobs after offline timeout");
                             }
                         });
@@ -360,9 +434,14 @@ async fn run_event_loop(
                     SmaluxClientEvent::Session(SessionEvent::AgentJobPolicy(message)) => {
                         match message.body {
                             Some(agent_job_policy_sync::Body::Query(_)) => {
-                                context.client_handle
-                                    .send_agent_job_policy(context.remote_jobs.policy().await.to_protocol_message())
-                                    .await?;
+                                send_or_defer(
+                                    context
+                                        .client_handle
+                                        .send_agent_job_policy(context.remote_jobs.policy().await.to_protocol_message())
+                                        .await,
+                                    "Agent Job policy response",
+                                )
+                                .await?;
                             }
                             Some(agent_job_policy_sync::Body::Acknowledgement(ack)) => {
                                 context.management.record_policy_acknowledgement(ack.revision).await;
@@ -373,9 +452,14 @@ async fn run_event_loop(
                     SmaluxClientEvent::Session(SessionEvent::AgentCapability(message)) => {
                         match message.body {
                             Some(agent_capability_sync::Body::Query(_)) => {
-                                context.client_handle
-                                    .send_agent_capability(agent_capability_message())
-                                    .await?;
+                                send_or_defer(
+                                    context
+                                        .client_handle
+                                        .send_agent_capability(agent_capability_message())
+                                        .await,
+                                    "Agent capability response",
+                                )
+                                .await?;
                             }
                             _ => tracing::warn!("Agent received an invalid capability message from Server"),
                         }
@@ -383,9 +467,14 @@ async fn run_event_loop(
                     SmaluxClientEvent::Session(SessionEvent::AgentPlugin(message)) => {
                         match message.body {
                             Some(agent_plugin_sync::Body::Query(_)) => {
-                                context.client_handle
-                                    .send_agent_plugin(agent_plugin_inventory_message(context.plugins.catalog()))
-                                    .await?;
+                                send_or_defer(
+                                    context
+                                        .client_handle
+                                        .send_agent_plugin(agent_plugin_inventory_message(context.plugins.catalog()))
+                                        .await,
+                                    "Agent plugin inventory response",
+                                )
+                                .await?;
                             }
                             Some(agent_plugin_sync::Body::Snapshot(snapshot)) => {
                                 let acknowledgement = match context.plugin_runtime.validate_snapshot(&snapshot) {
@@ -416,11 +505,11 @@ async fn run_event_loop(
                                     }
                                     Err(error) => context.plugin_runtime.reject(snapshot.revision, error),
                                 };
-                                context.client_handle
+                                send_or_defer(context.client_handle
                                     .send_agent_plugin(AgentPluginSync {
                                         body: Some(agent_plugin_sync::Body::Acknowledgement(acknowledgement)),
                                     })
-                                    .await?;
+                                    .await, "Agent plugin runtime acknowledgement").await?;
                             }
                             Some(agent_plugin_sync::Body::SchemaQuery(query)) => {
                                 for schema_hash in query.schema_hashes {
@@ -429,7 +518,7 @@ async fn run_event_loop(
                                             "Server requested a Plus schema that is not present in the current inventory"
                                         ));
                                     };
-                                    context.client_handle
+                                    send_or_defer(context.client_handle
                                         .send_agent_plugin(AgentPluginSync {
                                             body: Some(agent_plugin_sync::Body::SchemaResponse(
                                                 smalux_protocol::agent::v1::PluginSchemaResponse {
@@ -438,7 +527,7 @@ async fn run_event_loop(
                                                 },
                                             )),
                                         })
-                                        .await?;
+                                        .await, "Agent plugin schema response").await?;
                                 }
                             }
                             Some(agent_plugin_sync::Body::PauseAcknowledgement(ack)) => {
@@ -478,6 +567,11 @@ async fn run_event_loop(
                 if !reports.is_empty() {
                     reports.flush(context.client_handle).await?;
                 }
+                drop(reports);
+                let mut events = context.pending_job_events.lock().await;
+                if !events.is_empty() {
+                    events.flush(context.client_handle).await?;
+                }
             }
         }
     }
@@ -499,10 +593,7 @@ async fn send_pending_plugin_pauses(
             })
             .await;
         if let Err(error) = result {
-            if matches!(
-                error,
-                smalux_agent::client::SmaluxClientError::TemporarilyUnavailable
-            ) {
+            if error.is_retryable() {
                 return Ok(());
             }
             return Err(error.into());
@@ -510,6 +601,21 @@ async fn send_pending_plugin_pauses(
     }
     plugins.mark_pause_notices_sent(&notices).await;
     Ok(())
+}
+
+/// 连接短暂断开时，控制消息交给监督器在重连后重新同步；认证或协议错误仍终止事件循环。
+async fn send_or_defer(
+    result: Result<(), SmaluxClientError>,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_retryable() => {
+            tracing::debug!(message = label, error = %error, "deferred Agent control message until reconnect");
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// 管理从首次断线开始计算的单个远程 Job 过期计时器。
@@ -567,6 +673,143 @@ fn agent_capability_message() -> AgentCapabilitySync {
     }
 }
 
+/// 为当前 Agent 进程发出的 JobEvent 分配实例 ID 和连续序号。
+///
+/// Scheduler 自身会为所有内部事件编号，但 Agent 只上报其中的诊断事件，直接复用
+/// Scheduler 序号会因为被过滤的成功事件产生“假缺口”。这个发射器只给实际发出的
+/// 事件编号，Server 才能区分真正丢失的事件和正常过滤。
+struct JobEventEmitter {
+    instance_id: [u8; 16],
+    next_sequence: u64,
+}
+
+impl JobEventEmitter {
+    /// 创建从序号 1 开始的新进程事件流。
+    fn new(instance_id: [u8; 16]) -> Self {
+        Self {
+            instance_id,
+            next_sequence: 0,
+        }
+    }
+
+    /// 过滤并包装一条 Scheduler 事件；不需要上报的成功事件返回 `None`。
+    fn emit(&mut self, event: &SchedulerEvent) -> Option<JobEvent> {
+        let mut value = scheduler_event_message(event)?;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        value.sequence = self.next_sequence;
+        value.instance_id = self.instance_id.to_vec();
+        Some(value)
+    }
+}
+
+/// 只把 Server 需要诊断的异常或状态变化映射为协议事件；成功采样由 TaskReport 表达。
+fn scheduler_event_message(event: &SchedulerEvent) -> Option<JobEvent> {
+    let mut value = JobEvent {
+        sequence: event.sequence,
+        emitted_at: Some(timestamp(event.emitted_at)),
+        ..Default::default()
+    };
+    match &event.kind {
+        SchedulerEventKind::ExecutionFailed {
+            job_id,
+            version,
+            run_id,
+            attempt,
+            error,
+            will_retry,
+        } => {
+            value.kind = JobEventKind::ExecutionFailed as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+            value.attempt = *attempt;
+            value.message = error.clone();
+            value.will_retry = *will_retry;
+        }
+        SchedulerEventKind::ExecutionTimedOut {
+            job_id,
+            version,
+            run_id,
+            attempt,
+        } => {
+            value.kind = JobEventKind::ExecutionTimedOut as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+            value.attempt = *attempt;
+        }
+        SchedulerEventKind::ExecutionPanicked {
+            job_id,
+            version,
+            run_id,
+            attempt,
+            message,
+        } => {
+            value.kind = JobEventKind::ExecutionPanicked as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+            value.attempt = *attempt;
+            value.message = message.clone();
+        }
+        SchedulerEventKind::ExecutionCancelled {
+            job_id,
+            version,
+            run_id,
+        } => {
+            value.kind = JobEventKind::ExecutionCancelled as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+        }
+        SchedulerEventKind::RetryScheduled {
+            job_id,
+            version,
+            run_id,
+            attempt,
+            run_at,
+        } => {
+            value.kind = JobEventKind::RetryScheduled as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+            value.attempt = *attempt;
+            value.run_at = Some(timestamp(*run_at));
+        }
+        SchedulerEventKind::JobDisabled {
+            job_id,
+            version,
+            reason,
+        } => {
+            value.kind = JobEventKind::JobDisabled as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.message = reason.clone();
+        }
+        SchedulerEventKind::CallbackFailed {
+            job_id,
+            version,
+            run_id,
+            error,
+        } => {
+            value.kind = JobEventKind::ReportDeliveryFailed as i32;
+            value.job_id = job_id.as_bytes().to_vec();
+            value.revision = *version;
+            value.run_id = run_id.as_bytes().to_vec();
+            value.message = error.clone();
+        }
+        _ => return None,
+    }
+    Some(value)
+}
+
+fn timestamp(value: DateTime<Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: value.timestamp(),
+        nanos: value.timestamp_subsec_nanos() as i32,
+    }
+}
+
 /// 把已校验的本地 Manifest 转成仅含公开能力的会话清单。
 fn agent_plugin_inventory_message(plugins: &PluginCatalog) -> AgentPluginSync {
     AgentPluginSync {
@@ -579,6 +822,7 @@ async fn drain_outboxes(
     client: &SmaluxClientHandle,
     job_results: &tokio::sync::Mutex<outbox::JobResultOutbox>,
     task_reports: &tokio::sync::Mutex<outbox::TaskReportOutbox>,
+    job_events: &tokio::sync::Mutex<outbox::JobEventOutbox>,
     timeout: Duration,
 ) {
     let drain = async {
@@ -593,7 +837,12 @@ async fn drain_outboxes(
             let reports_empty = reports.is_empty();
             drop(reports);
 
-            if results_empty && reports_empty {
+            let mut events = job_events.lock().await;
+            events.flush(client).await?;
+            let events_empty = events.is_empty();
+            drop(events);
+
+            if results_empty && reports_empty && events_empty {
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(OUTBOX_RETRY_INTERVAL).await;
@@ -607,11 +856,14 @@ async fn drain_outboxes(
             let pending_job_results = job_results.lock().await.pending_len();
             let dropped_job_results = job_results.lock().await.dropped_count();
             let reports = task_reports.lock().await;
+            let events = job_events.lock().await;
             tracing::warn!(
                 pending_job_results,
                 dropped_job_results,
                 pending_task_reports = reports.pending_len(),
                 dropped_task_reports = reports.dropped_count(),
+                pending_job_events = events.pending_len(),
+                dropped_job_events = events.dropped_count(),
                 timeout_ms = duration_millis(timeout),
                 "Agent shutdown outbox drain timed out"
             );
@@ -686,9 +938,11 @@ async fn load_job_policy(path: &Path) -> anyhow::Result<RemoteJobPolicyManager> 
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use chrono::Utc;
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
-    use super::OfflineJobExpiry;
+    use super::{JobEventEmitter, OfflineJobExpiry, scheduler_event_message};
 
     #[tokio::test]
     async fn offline_job_expiry_runs_after_the_configured_deadline() {
@@ -717,5 +971,69 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         assert!(!*expired.lock().await);
+    }
+
+    #[test]
+    fn scheduler_failure_event_becomes_job_event_without_success_payload() {
+        let event = smalux_agent::scheduler::SchedulerEvent {
+            sequence: 7,
+            emitted_at: Utc::now(),
+            kind: smalux_agent::scheduler::SchedulerEventKind::ExecutionFailed {
+                job_id: Uuid::new_v4(),
+                version: 3,
+                run_id: Uuid::new_v4(),
+                attempt: 2,
+                error: "timeout".to_owned(),
+                will_retry: true,
+            },
+        };
+        let message = scheduler_event_message(&event).expect("failure should be reported");
+        assert_eq!(message.sequence, 7);
+        assert_eq!(message.revision, 3);
+        assert_eq!(message.attempt, 2);
+        assert!(message.will_retry);
+    }
+
+    #[test]
+    fn scheduler_success_event_is_not_duplicated_as_job_event() {
+        let event = smalux_agent::scheduler::SchedulerEvent {
+            sequence: 8,
+            emitted_at: Utc::now(),
+            kind: smalux_agent::scheduler::SchedulerEventKind::ExecutionSucceeded {
+                job_id: Uuid::new_v4(),
+                version: 1,
+                run_id: Uuid::new_v4(),
+                attempt: 1,
+                duration_ms: 4,
+            },
+        };
+        assert!(scheduler_event_message(&event).is_none());
+    }
+
+    #[test]
+    fn job_event_emitter_assigns_contiguous_sequences_and_instance_id() {
+        let mut emitter = JobEventEmitter::new([4; 16]);
+        let first = smalux_agent::scheduler::SchedulerEvent {
+            sequence: 100,
+            emitted_at: Utc::now(),
+            kind: smalux_agent::scheduler::SchedulerEventKind::ExecutionFailed {
+                job_id: Uuid::new_v4(),
+                version: 1,
+                run_id: Uuid::new_v4(),
+                attempt: 1,
+                error: "one".to_owned(),
+                will_retry: false,
+            },
+        };
+        let second = smalux_agent::scheduler::SchedulerEvent {
+            sequence: 900,
+            ..first.clone()
+        };
+        let first = emitter.emit(&first).unwrap();
+        let second = emitter.emit(&second).unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(first.instance_id, vec![4; 16]);
+        assert_eq!(second.instance_id, vec![4; 16]);
     }
 }

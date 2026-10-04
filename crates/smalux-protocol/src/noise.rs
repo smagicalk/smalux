@@ -21,7 +21,7 @@ pub use rotation::{
     ServerKeyRingSnapshot, ServerRotationPrepared,
 };
 pub use server::{ServerIkHandshake, ServerXxAwaitMessage3, ServerXxHandshake};
-pub use session::SecureSession;
+pub use session::{MAX_NOISE_PLAINTEXT_BYTES, SecureSession};
 
 use crate::agent::v1::{NoiseHandshake, noise_handshake::HandshakeType};
 use tracing::{trace, warn};
@@ -102,7 +102,8 @@ fn validate_handshake(frame: &NoiseHandshake, expected: HandshakeType) -> Result
 #[cfg(test)]
 mod tests {
     use crate::agent::v1::{
-        RegistrationMessage, RegistrationRequest, SecureMessage, registration_message,
+        DiagnosticMessage, DiagnosticRequest, RegistrationMessage, RegistrationRequest,
+        SecureMessage, diagnostic_message, diagnostic_request, registration_message,
         secure_message,
     };
 
@@ -157,6 +158,30 @@ mod tests {
     }
 
     #[test]
+    fn secure_session_rejects_messages_above_the_transport_limit() {
+        let client = NoiseIdentity::generate().unwrap();
+        let server = NoiseIdentity::generate().unwrap();
+        let psk = [7; 32];
+        let (mut established, _) = establish_xx(&client, &server, &psk, &psk).unwrap();
+        let message = SecureMessage {
+            body: Some(secure_message::Body::Diagnostic(DiagnosticMessage {
+                body: Some(diagnostic_message::Body::Request(DiagnosticRequest {
+                    sequence: 1,
+                    payload: Some(diagnostic_request::Payload::BytesPayload(vec![
+                        0;
+                        super::MAX_NOISE_PLAINTEXT_BYTES
+                    ])),
+                })),
+            })),
+        };
+
+        assert!(matches!(
+            established.session.encrypt(&message),
+            Err(NoiseError::MessageTooLarge)
+        ));
+    }
+
+    #[test]
     fn ik_authenticates_both_static_keys() {
         let client = NoiseIdentity::generate().unwrap();
         let server = NoiseIdentity::generate().unwrap();
@@ -200,6 +225,8 @@ mod tests {
 
         ring.promote_next(prepared.rotation_id).unwrap();
         pinned.promote_pending(prepared.rotation_id).unwrap();
+        pinned.stage(&prepared.announcement).unwrap();
+        assert_eq!(pinned.snapshot().pending, None);
         assert_eq!(ring.active_keys().len(), 2);
         assert_eq!(pinned.connection_candidates().len(), 2);
         ring.retire_previous().unwrap();

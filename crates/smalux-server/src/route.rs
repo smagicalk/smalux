@@ -46,7 +46,17 @@ mod tests {
         AgentStateStore, AuthenticationMode, FileAgentStateStore, PersistedAgentState,
         RegistrationToken, SmaluxClient, SmaluxClientConfig, SmaluxClientEvent,
     };
+    use smalux_agent::plugins::PluginRuntimeState;
+    use smalux_agent::remote_jobs::RemoteJobController;
+    use smalux_agent::scheduler::{SchedulerConfig, SchedulerRuntime, TaskReportSink};
+    use smalux_protocol::agent::v1::{
+        AgentCapabilitySync, AgentJobPolicySync, AgentPluginInventory, AgentPluginSync,
+        AgentReconcileSummary, JobDefinition, TaskDefinition, agent_capability_sync,
+        agent_job_policy_sync, agent_plugin_sync, task_definition,
+    };
+    use smalux_protocol::tonic_transport::SessionEvent;
     use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -227,6 +237,276 @@ mod tests {
             .await
             .expect("reconnected Client should disconnect");
 
+        server.abort();
+        let _ = server.await;
+        store.clear().await.expect("test state should clear");
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_agent_executes_server_job_and_persists_report() {
+        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .expect("test database should connect");
+        let app_state = AppState::build(test_config(), database)
+            .await
+            .expect("test app state should build");
+        let database = Arc::clone(&app_state.database);
+        let control_plane = Arc::clone(&app_state.agent.control_plane);
+        let issued = app_state
+            .agent
+            .agent_registry
+            .create_registration_token(
+                Some("agent-job-e2e".to_owned()),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .expect("test registration Token should be issued");
+        let credential = issued.expose_credential().to_owned();
+        let router = build_app_router(app_state).expect("server router should build");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test Server should run");
+        });
+
+        let directory = std::env::temp_dir().join(format!("smalux-job-e2e-{}", Uuid::new_v4()));
+        let store = Arc::new(FileAgentStateStore::new(directory.join("identity.json")));
+        let mut client_config = SmaluxClientConfig::new(format!("http://{address}"))
+            .expect("Client config should be valid");
+        client_config.set_registration_token(Some(
+            RegistrationToken::new(credential).expect("issued Token should be valid"),
+        ));
+        let mut client = SmaluxClient::new(client_config, store.clone());
+        tokio::time::timeout(Duration::from_secs(10), client.connect())
+            .await
+            .expect("registration should not time out")
+            .expect("registration should succeed");
+        let client_handle = client
+            .handle()
+            .expect("connected Client should expose a handle");
+        let agent_id = store
+            .load()
+            .await
+            .expect("saved state should load")
+            .and_then(|state| state.agent_id().map(str::to_owned))
+            .expect("registration should save Agent ID");
+
+        let scheduler_runtime = SchedulerRuntime::start(SchedulerConfig::default())
+            .expect("test Scheduler should start");
+        let (report_sender, mut report_receiver) = mpsc::channel(8);
+        let report_sink: Arc<dyn TaskReportSink> = Arc::new(move |report| {
+            let report_sender = report_sender.clone();
+            async move {
+                report_sender.send(report).await.map_err(|_| {
+                    smalux_agent::scheduler::CallbackError::Transient(anyhow::anyhow!(
+                        "test report receiver closed"
+                    ))
+                })
+            }
+        });
+        let remote_jobs = RemoteJobController::new(scheduler_runtime.scheduler(), report_sink);
+        let mut plugin_runtime = PluginRuntimeState::default();
+        let process_instance_id = [7; 16];
+        let job_id = Uuid::new_v4();
+        let job = JobDefinition {
+            job_id: job_id.as_bytes().to_vec(),
+            revision: 1,
+            enabled: true,
+            trigger: Some(smalux_protocol::agent::v1::JobTrigger {
+                timeout: None,
+                misfire: Some(smalux_protocol::agent::v1::MisfirePolicy {
+                    behavior: smalux_protocol::agent::v1::MisfireBehavior::Skip as i32,
+                    max_runs: 0,
+                }),
+                schedule: Some(smalux_protocol::agent::v1::job_trigger::Schedule::Interval(
+                    smalux_protocol::agent::v1::IntervalSchedule {
+                        every: Some(prost_types::Duration {
+                            seconds: 0,
+                            nanos: 100_000_000,
+                        }),
+                        start_at: None,
+                    },
+                )),
+            }),
+            task: Some(TaskDefinition {
+                task: Some(task_definition::Task::Cpu(Default::default())),
+            }),
+            ..Default::default()
+        };
+        let mut sent_agent_snapshots = false;
+        let mut job_command_received = false;
+        let mut report = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline && report.is_none() {
+            tokio::select! {
+                event = tokio::time::timeout(Duration::from_secs(10), client.next_event()) => {
+                    let event = event
+                        .expect("Agent event should arrive before the test step timeout")
+                        .expect("Agent Client event should be readable")
+                        .expect("Agent Client event stream should remain open");
+                    match event {
+                        SmaluxClientEvent::Connected { .. } if !sent_agent_snapshots => {
+                            sent_agent_snapshots = true;
+                            client_handle
+                                .send_reconcile_summary(AgentReconcileSummary {
+                                    instance_id: process_instance_id.to_vec(),
+                                    ..Default::default()
+                                })
+                                .await
+                                .expect("reconcile summary should be sent");
+                            client_handle
+                                .send_agent_job_policy(AgentJobPolicySync {
+                                    body: Some(agent_job_policy_sync::Body::Snapshot(
+                                        smalux_agent::remote_jobs::RemoteJobPolicy::default()
+                                            .snapshot()
+                                            .to_protocol_message()
+                                            .body
+                                            .and_then(|body| match body {
+                                                agent_job_policy_sync::Body::Snapshot(snapshot) => Some(snapshot),
+                                                _ => None,
+                                            })
+                                            .expect("policy snapshot should exist"),
+                                    )),
+                                })
+                                .await
+                                .expect("policy snapshot should be sent");
+                            client_handle
+                                .send_agent_capability(AgentCapabilitySync {
+                                    body: Some(agent_capability_sync::Body::Snapshot(
+                                        smalux_agent::tasks::agent_capability_snapshot(),
+                                    )),
+                                })
+                                .await
+                                .expect("capability snapshot should be sent");
+                            client_handle
+                                .send_agent_plugin(AgentPluginSync {
+                                    body: Some(agent_plugin_sync::Body::Inventory(
+                                        AgentPluginInventory {
+                                            revision: 1,
+                                            plugins: Vec::new(),
+                                        },
+                                    )),
+                                })
+                                .await
+                                .expect("plugin inventory should be sent");
+                            control_plane
+                                .replace_catalog(&agent_id, vec![job.clone()])
+                                .await
+                                .expect("server Job catalog should be committed");
+                        }
+                        SmaluxClientEvent::Session(SessionEvent::AgentJobPolicy(message)) => {
+                            if matches!(message.body, Some(agent_job_policy_sync::Body::Query(_))) {
+                                client_handle
+                                    .send_agent_job_policy(AgentJobPolicySync {
+                                        body: Some(agent_job_policy_sync::Body::Snapshot(
+                                            smalux_agent::remote_jobs::RemoteJobPolicy::default()
+                                                .snapshot()
+                                                .to_protocol_message()
+                                                .body
+                                                .and_then(|body| match body {
+                                                    agent_job_policy_sync::Body::Snapshot(snapshot) => Some(snapshot),
+                                                    _ => None,
+                                                })
+                                                .expect("policy snapshot should exist"),
+                                        )),
+                                    })
+                                    .await
+                                    .expect("policy query response should be sent");
+                            }
+                        }
+                        SmaluxClientEvent::Session(SessionEvent::AgentCapability(message)) => {
+                            if matches!(message.body, Some(agent_capability_sync::Body::Query(_))) {
+                                client_handle
+                                    .send_agent_capability(AgentCapabilitySync {
+                                        body: Some(agent_capability_sync::Body::Snapshot(
+                                            smalux_agent::tasks::agent_capability_snapshot(),
+                                        )),
+                                    })
+                                    .await
+                                    .expect("capability query response should be sent");
+                            }
+                        }
+                        SmaluxClientEvent::Session(SessionEvent::AgentPlugin(message)) => {
+                            if let Some(agent_plugin_sync::Body::Query(_)) = message.body {
+                                client_handle
+                                    .send_agent_plugin(AgentPluginSync {
+                                        body: Some(agent_plugin_sync::Body::Inventory(
+                                            AgentPluginInventory {
+                                                revision: 1,
+                                                plugins: Vec::new(),
+                                            },
+                                        )),
+                                    })
+                                    .await
+                                    .expect("plugin query response should be sent");
+                            } else if let Some(agent_plugin_sync::Body::Snapshot(snapshot)) = message.body {
+                                let ack = plugin_runtime.confirm_snapshot(&snapshot);
+                                client_handle
+                                    .send_agent_plugin(AgentPluginSync {
+                                        body: Some(agent_plugin_sync::Body::Acknowledgement(ack)),
+                                    })
+                                    .await
+                                    .expect("plugin runtime acknowledgement should be sent");
+                            }
+                        }
+                        SmaluxClientEvent::Session(SessionEvent::JobCommand(command)) => {
+                            job_command_received = true;
+                            let result = remote_jobs.apply_command(command).await;
+                            client_handle
+                                .send_job_command_result(result)
+                                .await
+                                .expect("Job command result should be sent");
+                        }
+                        SmaluxClientEvent::Disconnected { reason, .. } => {
+                            panic!("Agent disconnected during Job execution: {reason}");
+                        }
+                        SmaluxClientEvent::Fatal(error) => panic!("Agent Client failed: {error}"),
+                        _ => {}
+                    }
+                }
+                next_report = report_receiver.recv() => {
+                    report = next_report;
+                }
+            }
+        }
+        assert!(
+            job_command_received,
+            "Server should send the committed Job catalog"
+        );
+        let report = report.expect("Agent Scheduler should produce a TaskReport");
+        assert_eq!(report.job_id, job_id.as_bytes());
+        assert_eq!(report.job_revision, 1);
+        client_handle
+            .send_task_report(report)
+            .await
+            .expect("TaskReport should be sent to Server");
+
+        let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let reports = database
+                    .list_task_reports(Some(&agent_id), 10)
+                    .await
+                    .expect("TaskReport query should succeed");
+                if !reports.is_empty() {
+                    return reports;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Server should persist the TaskReport");
+        assert_eq!(persisted.len(), 1);
+
+        client.disconnect().await.expect("Client should disconnect");
+        scheduler_runtime
+            .shutdown()
+            .await
+            .expect("test Scheduler should shut down");
         server.abort();
         let _ = server.await;
         store.clear().await.expect("test state should clear");

@@ -18,6 +18,8 @@ prost-types = "0.14.4"
 sha2 = "0.10.9"
 # Worker SDK 的异步任务和 stdin/stdout 运行时。
 async-trait = "0.1.89"
+# 捕获插件 Task panic，转换为 Worker 可上报的失败结果。
+futures-util = "0.3.32"
 tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 thiserror = "2.0.18"

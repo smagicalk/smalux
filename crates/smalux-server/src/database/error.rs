@@ -42,6 +42,34 @@ pub enum DatabaseError {
     /// 插件参数 Schema 与其内容地址或身份不一致。
     #[error("invalid persisted Plugin schema: {0}")]
     InvalidPluginSchema(String),
+    /// 权威 Agent Job 目录、定义或存储内容无效。
+    #[error("invalid persisted Agent Job catalog: {0}")]
+    InvalidJobCatalog(String),
+    /// 控制面提交的目录版本已经落后于数据库当前版本。
+    #[error("{resource} revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict {
+        /// 发生冲突的权威资源名称，例如 `Agent Job catalog`。
+        resource: &'static str,
+        /// 调用方声明的期望版本。
+        expected: i64,
+        /// 数据库当前版本。
+        actual: i64,
+    },
+    /// Agent 上报的成功 TaskReport 缺少执行身份或结果。
+    #[error("invalid Agent Task report: {0}")]
+    InvalidTaskReport(String),
+    /// 下发命令与 Agent 返回结果的关联不一致。
+    #[error("invalid Agent Job command: {0}")]
+    InvalidJobCommand(String),
+    /// Agent Scheduler 事件的实例、序号或 Job 归属不一致。
+    #[error("invalid Agent Job event: {0}")]
+    InvalidJobEvent(String),
+    /// 插件 runtime 的身份、Schema 或并发限制不完整。
+    #[error("invalid Agent plugin runtime: {0}")]
+    InvalidPluginRuntime(String),
+    /// 已认证 Agent 上报的能力或插件清单无法安全持久化。
+    #[error("invalid Agent capability or plugin inventory snapshot: {0}")]
+    InvalidAgentSnapshot(String),
     /// 恢复或校验 Noise 身份时失败。
     #[error("Noise keyring operation failed: {0}")]
     Noise(#[from] smalux_protocol::noise::NoiseError),

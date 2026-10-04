@@ -18,8 +18,8 @@
 - SessionDriver 自动心跳、Pong、会话 rekey 和断线指数退避重连；
 - 安全文件状态存储、能力同步、远程 Job 下发、结果上报和优雅关闭的常驻进程入口。
 
-当前二进制已经接通 Agent 的主链路。Server 端仍在开发中，实际联调要求 Server 已实现
-注册 Token 签发、XX 提交、IK 授权和 JobCommand 下发。
+正式二进制已经接通 Agent 主链路和数据库驱动的 Server 联调：Server 负责注册 Token、XX 提交、IK 授权、权威 Job/runtime
+目录以及 TaskReport/JobEvent 持久化。实际联调仍要求双方使用兼容版本，并由 Server 先保存有效的 Agent 目录。
 
 ## 目录结构
 
@@ -103,6 +103,10 @@ cargo run -p smalux-agent -- run `
 ### 启动参数
 
 配置优先级固定为 `CLI > 环境变量 > 默认值`：
+
+完整的 JSONC 参数参考（包含启动参数、管理命令、Job 调度字段、全部内置 Task、Probe
+协议和 Plus Task）见 [`AGENT_PARAMETERS.jsonc`](./AGENT_PARAMETERS.jsonc)。该文件仅供阅读，
+不参与 Agent 运行时加载；其中的 Token、私钥和 payload 均为占位符。
 
 | CLI | 环境变量 | 默认值/作用 |
 | --- | --- | --- |
@@ -212,6 +216,10 @@ Agent 每秒检查 Worker 子进程和 stdout reader。异常退出会在本地�
 退避重启；正常配置替换或主动关闭不会计入失败。默认在 `10m` 内第 `3` 次失败后进入
 `paused`，停止该插件 Worker，并通过加密会话发送 `PluginPauseNotice`。
 
+Plus Task 的 panic 会在 Worker 内转换为当前 request 的失败结果；Worker 输入 EOF 会先取消活动
+Task、等待其退出并调用插件 shutdown。结果帧写失败时 Worker 会尽量返回小型错误帧，避免 Agent
+只能等待本地执行超时。
+
 Server 按 `agent_id + plugin_id + version` 保存暂停状态，并从该 Agent 的远程 Job 快照中移除
 对应插件任务；其他 Agent 不受影响。暂停通知收到确认后不会重复发送，断线重连会重发未确认通知。
 只有 Server 下发更高的 `PluginRuntimeSnapshot.revision` 才能清除暂停并尝试启动新 Worker；
@@ -300,10 +308,33 @@ Ping/Pong 验证授权；只有 Server 明确返回 `AgentNotAuthorized` 才恢�
 Pong。Server 公告新静态公钥时，Client 会验证 key ID，先把新旧公钥候选原子保存，再发送确认，
 确保轮换窗口内的后续 IK 可以尝试两把 key。
 
-JobCommandResult 在短暂断线时会保存在进程内 FIFO；TaskReport 使用可配置的有界 FIFO，满载时
-丢弃最旧报告并累计告警。重连后两者按原顺序补发。收到 Ctrl+C 或 Unix SIGTERM 后，Agent 先停止
-Scheduler，再在总超时内补发队列，随后关闭 Noise Session 和本地 IPC。这些队列不跨进程恢复，且
-TaskReport 当前没有 Server 业务 ACK；需要承受断电或崩溃时仍应加入持久化 outbox。
+JobCommandResult、TaskReport 与异常 JobEvent 在短暂断线时都会保存在进程内 FIFO；满载时丢弃
+最旧记录并累计告警。TaskReport 只承载成功业务结果；失败、超时、panic、取消、重试和报告投递失败
+由 JobEvent 上报。重连后三类消息按各自 FIFO 顺序补发。收到 Ctrl+C 或 Unix SIGTERM 后，Agent 先
+停止 Scheduler，再在总超时内补发队列，随后关闭 Noise Session 和本地 IPC。这些队列不跨进程恢复，且
+TaskReport/JobEvent 当前没有额外的 Server 业务 ACK；Server 会按执行身份或事件实例序号
+幂等保存，重复发送相同 payload 不会产生重复历史。JobEvent 的 `instance_id` 在 Agent 进程内
+固定，`sequence` 只给实际发出的诊断事件编号；Server 发现跳号会记录事件缺口。需要承受断电
+或崩溃时仍应加入持久化 outbox。
+
+### 重连对账摘要
+
+每次认证成功后，Agent 会在策略、能力和插件清单之前发送一条 `AgentReconcileSummary`：
+
+```rust,ignore
+let (catalog_revision, catalog_digest) = remote_jobs.catalog_reconcile_state().await;
+let (runtime_revision, runtime_digest) = plugin_runtime.reconcile_state();
+client_handle.send_reconcile_summary(AgentReconcileSummary {
+    instance_id: process_instance_id.to_vec(),
+    catalog_revision,
+    catalog_digest,
+    runtime_revision,
+    runtime_digest,
+}).await?;
+```
+
+Server 只在摘要不匹配时发送完整目录或 runtime；首次连接、摘要非法和 Agent 进程重启都会
+触发完整同步。该摘要不包含任务参数、结果或 Secret，也不能替代 Noise 身份认证。
 
 ## Scheduler
 

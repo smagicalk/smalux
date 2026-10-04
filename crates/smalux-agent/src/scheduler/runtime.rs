@@ -328,6 +328,15 @@ impl Scheduler {
         .await
     }
 
+    /// 在 Scheduler Actor 内一次性应用已完成预检的远程 Job 对账计划。
+    pub(crate) async fn reconcile(
+        &self,
+        plan: SchedulerReconcilePlan,
+    ) -> Result<Vec<JobSnapshot>, SchedulerError> {
+        self.request(|response| Command::Reconcile { plan, response })
+            .await
+    }
+
     /// 使用 expected_version 原子更新 Job，并返回更新后快照。
     ///
     /// Patch 校验失败不会修改原 Job；版本冲突时调用方应重新 get 后决定是否重试。
@@ -507,6 +516,11 @@ enum Command {
         expected_version: u64,
         response: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// 在同一 Actor 轮次内批量对账 Job。
+    Reconcile {
+        plan: SchedulerReconcilePlan,
+        response: oneshot::Sender<Result<Vec<JobSnapshot>, SchedulerError>>,
+    },
     /// 查询动态配置。
     GetConfig {
         response: oneshot::Sender<Result<SchedulerConfigSnapshot, SchedulerError>>,
@@ -534,6 +548,7 @@ impl Command {
             Self::Enable { .. } => "enable",
             Self::Disable { .. } => "disable",
             Self::Delete { .. } => "delete",
+            Self::Reconcile { .. } => "reconcile",
             Self::GetConfig { .. } => "get_config",
             Self::UpdateConfig { .. } => "update_config",
             Self::Shutdown { .. } => "shutdown",

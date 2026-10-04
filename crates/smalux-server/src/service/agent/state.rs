@@ -16,9 +16,10 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_registry::AgentRegistry;
+use super::control_plane::AgentControlPlane;
 use super::job_catalog::{
-    AgentJobCatalogProvider, AgentPluginRuntimeProvider, EmptyAgentJobCatalogProvider,
-    EmptyAgentPluginRuntimeProvider,
+    AgentJobCatalogProvider, AgentPluginRuntimeProvider, DatabaseAgentJobCatalogProvider,
+    DatabaseAgentPluginRuntimeProvider,
 };
 use super::keyring_manager::ServerKeyRingManager;
 use super::plugin_schema_registry::PluginSchemaRegistry;
@@ -27,12 +28,16 @@ use super::session_registry::SessionRegistry;
 /// Agent 协议服务使用的共享依赖。
 #[derive(Clone)]
 pub struct AgentState {
+    /// 认证会话收到的 JobEvent 直接写入该共享数据库句柄。
+    pub(crate) database: Arc<ServerDatabase>,
     /// 脱敏数据库后端标签，仅用于会话诊断日志。
     pub(crate) database_backend: &'static str,
     /// Server Noise 密钥环管理器；所有握手和轮换都通过它取得一致句柄。
     pub(crate) keyring_manager: Arc<ServerKeyRingManager>,
     /// Agent 注册中心；负责 Token、注册事务、Agent 激活、授权和吊销查询。
     pub(crate) agent_registry: Arc<AgentRegistry>,
+    /// 管理入口提交远程 Job 后触发在线 Session 重新对账的唯一入口。
+    pub(crate) control_plane: Arc<AgentControlPlane>,
     /// 已认证后按本地策略读取该 Agent 的权威远程 Job 目录。
     pub(crate) job_catalog: Arc<dyn AgentJobCatalogProvider>,
     /// 根据 Agent inventory 生成当前会话有效的 Plus Worker 运行时快照。
@@ -68,17 +73,28 @@ impl AgentState {
         let database_backend = database.backend_label();
         let agent_registry = Arc::new(AgentRegistry::new(Arc::clone(&database)));
         let plugin_schemas = Arc::new(PluginSchemaRegistry::new(Arc::clone(&database)));
+        let job_catalog = Arc::new(DatabaseAgentJobCatalogProvider::new(Arc::clone(&database)));
+        let plugin_runtime = Arc::new(DatabaseAgentPluginRuntimeProvider::new(Arc::clone(
+            &database,
+        )));
+        let sessions = SessionRegistry::default();
+        let control_plane = Arc::new(AgentControlPlane::new(
+            Arc::clone(&database),
+            sessions.clone(),
+        ));
         Self {
+            database,
             database_backend,
             keyring_manager,
             agent_registry,
-            job_catalog: Arc::new(EmptyAgentJobCatalogProvider),
-            plugin_runtime: Arc::new(EmptyAgentPluginRuntimeProvider),
+            control_plane,
+            job_catalog,
+            plugin_runtime,
             plugin_schemas,
             plugin_pauses: Arc::new(PluginPauseRegistry::default()),
             session_slots: Arc::new(Semaphore::new(runtime_config.max_agent_sessions)),
             registration_slots: Arc::new(Semaphore::new(runtime_config.max_registration_sessions)),
-            sessions: SessionRegistry::default(),
+            sessions,
             max_grpc_message_bytes: runtime_config.max_grpc_message_bytes,
             shutdown,
         }

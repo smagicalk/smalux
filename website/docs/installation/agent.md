@@ -5,8 +5,8 @@ description: 当前 Agent 的构建、权限和运行准备事项。
 
 # Agent 安装边界
 
-`smalux-agent` 是部署在被观测主机上的探针。目前仓库提供源码和可执行 crate，尚未提供正式安装包、
-systemd unit、Windows Service 包装或自动升级器。
+`smalux-agent` 是部署在被观测主机上的探针。仓库提供源码和可执行 crate，Release workflow 也会手动生成 Draft
+跨平台归档；但归档不是安装器，仍未提供 systemd unit、Windows Service 包装或自动升级器。
 
 :::note 当前运行状态
 
@@ -101,28 +101,26 @@ target/release/smalux-agent.exe run --server-endpoint http://127.0.0.1:12345 --t
 
 ### 长期状态
 
-生产 Agent 至少需要持久化：
+Agent 的本地持久化不只包含身份，且不同状态使用独立文件或目录：
 
-- Agent Noise 静态私钥与公钥；
-- 首次注册学到的 Server Noise 公钥；
-- `agent_id`、`registration_id` 和 committed 状态；
-- 已安装的远程 Job 目录及 revision；
-- 需要可靠上报时的本地 TaskReport 队列；
-- 密钥轮换的 pending/current/previous snapshot。
+| 状态组 | 默认位置 | 内容与边界 |
+| --- | --- | --- |
+| 身份 | `<data_dir>/agent/connection-state.json` | Agent Noise 密钥、Server 公钥候选、`agent_id`、注册事务和 committed 状态。 |
+| 远程 Job policy | `<data_dir>/agent/job-policy.json` | 只由 Agent 本地 IPC/CLI 修改的 `deny_all` 与逐项 Task 拒绝；每次认证以会话快照上报 Server，不是 Server 持久化的策略副本。 |
+| Plus 业务数据 | `<data_dir>/plus/<plugin_id>/<plugin_version>/` | 插件可自行持久化业务幂等数据；Agent 只管理 Worker 生命周期、超时、并发和结果上报。 |
+| Agent 运行态 | 仅当前进程 | 当前远程 Job 目录、Scheduler 执行/队列、TaskReport、JobEvent 和 JobCommandResult outbox。 |
+
+Server 数据库持久化 Agent 的权威 Job/runtime 目录、能力与插件 inventory、成功 TaskReport 和 JobEvent；
+Agent 重启后生成新的进程实例标识并上报摘要，Server 再从权威目录按当前策略和能力过滤后下发。运行态
+和 outbox 不跨 Agent 进程恢复，不承诺跨重启的报告重放。
 
 正式 Agent 文件存储在 Unix 使用 `0600`，在 Windows 使用仅 SYSTEM、Administrators 和当前所有者
 可访问的保护 ACL；读取已有文件时也会检查并警告不安全权限。更高安全等级仍可通过
 `AgentStateStore` 接入系统密钥库、TPM、HSM 或加密数据库。
 
-建议把状态分成三个事务边界：
-
-| 状态组 | 内容 | 更新要求 |
-| --- | --- | --- |
-| 身份 | Agent 私钥、Server 公钥、注册事务 | commit 前先原子保存 pending。 |
-| Job catalog | Proto `JobDefinition` 和 catalog revision | Scheduler 应用成功后才推进版本。 |
-| 上报队列 | TaskReport、重试次数、过期时间 | 当前只有有界内存队列；持久化与 ACK 尚未实现。 |
-
-不要把三组状态写进一个不断整体覆盖的大 JSON 文件；高频上报会放大写入，身份和 Job 也更难独立恢复。
+不要把身份、策略和高频运行态写进一个不断整体覆盖的大 JSON 文件；独立事务边界可以减少写放大，
+也便于在策略损坏时单独备份并使用 `jobs policy repair --reset` 修复。
+修复前必须停止 Agent，否则命令会拒绝离线修改。
 
 ## 断网行为
 
@@ -132,8 +130,8 @@ Agent 在短暂网络抖动期间继续运行已有远程 Job。从首次断线�
 则由 Agent 上报策略和能力，Server 重新下发权威 `ReplaceAllJobs` 快照。
 
 TaskReport 当前使用可配置容量的内存队列，临时断线不会让 Scheduler 重跑已完成 Task，满载时丢弃
-最旧报告并告警；重连和优雅关闭时按 FIFO 补发。它没有跨重启持久化或 Server 业务 ACK。要求不丢
-数据时仍需实现磁盘队列、过期时间、磁盘上限、幂等键和确认水位。
+最旧报告并告警；重连和优雅关闭时按 FIFO 补发。它没有跨重启持久化或 Server 业务 ACK，这是当前
+轻量 Agent 的明确边界。未来若要求不丢数据，再增加磁盘队列、过期时间、磁盘上限、幂等键和确认水位。
 
 ## 后续正式安装应包含
 

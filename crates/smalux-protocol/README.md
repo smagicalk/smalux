@@ -115,6 +115,11 @@ Server 或本地存储生成 JobDefinition
 启动的旧执行，两者不能混用。`ReplaceAllJobs` 只替换远程所有权 Job，不应删除 Agent
 本地 Job。相同 `command_id` 必须返回缓存结果，尤其不能重复执行 `RunJobNow`。
 
+Server 保存 TaskReport 时会再次校验 `agent_id + job_id + job_revision` 是否属于该 Agent 的
+历史 Job 定义；目录更新或删除不会立即丢失历史 revision。相同执行身份重复上报且 payload
+相同是幂等成功，payload 不同则视为协议错误。JobEvent 还带有 Agent 进程 `instance_id`
+和进程内连续 `sequence`，Server 以二者做去重，并把序号跳跃标记为事件缺口。
+
 ### RemoteJobController 方法
 
 | 方法 | 输入 | 行为 |
@@ -163,6 +168,30 @@ Scheduler 故障，连接层应读取返回错误并用新的完整目录重新�
 连接断开不会自动删除 Scheduler 中已经安装的 Job，因此短时网络波动期间仍会继续采集。
 连接层可以把 `TaskReportSink` 实现为本地缓冲，再在会话恢复后上报；缓冲上限、过期策略
 和重连退避不属于协议 crate 或 Scheduler 的职责。
+
+### 重连状态摘要
+
+Agent 在每次认证连接建立后发送 `AgentReconcileSummary`。它只包含当前进程实例 ID、远程
+Job catalog revision/digest 和 Plus runtime revision/digest，不包含 Job 参数、Task 结果或
+Secret。摘要的作用是让 Server 跳过已经同步的完整快照：
+
+```rust,ignore
+// Agent 进程启动时生成一次；同一进程重连继续使用，重启后换一个 UUID。
+let instance_id = Uuid::new_v4();
+let (catalog_revision, catalog_digest) = remote_jobs.catalog_reconcile_state().await;
+let (runtime_revision, runtime_digest) = plugin_runtime.reconcile_state();
+handle.send_reconcile_summary(AgentReconcileSummary {
+    instance_id: instance_id.as_bytes().to_vec(),
+    catalog_revision,
+    catalog_digest,
+    runtime_revision,
+    runtime_digest,
+}).await?;
+```
+
+两端使用排序后的 Protobuf 编码计算 BLAKE2s-256。Server 比较 revision 和 digest：两者都
+相同就跳过对应同步；任一不一致就只重新发送对应快照；摘要缺失、非法或进程实例变化时
+执行完整同步。摘要是性能优化提示，不是授权或完整性认证材料。
 
 ## 扩展固定 Task 与 Plus 模块
 
@@ -336,7 +365,10 @@ ServerSessionAcceptor
 | `KeyRotationMessage` | Agent/Server 长期静态密钥轮换。 |
 | `JobCommand` / `JobCommandResult` | Server Job 控制及 Agent 执行结果。 |
 | `TaskReport` | Agent 强类型采集结果上报。 |
+| `JobEvent` | Agent Scheduler 的失败、超时、重试、取消和报告投递异常。 |
 | `AgentJobPolicySync` | Agent 本地 Job 策略的 Query、Snapshot 和 ACK。 |
+| `AgentPluginSync` | Agent 插件 inventory、Schema、runtime 快照和 ACK。 |
+| `AgentReconcileSummary` | Agent 重连时的目录/runtime 状态摘要。 |
 
 ## 身份与标识方法
 
@@ -550,7 +582,7 @@ use smalux_protocol::{
 // 普通连接不再读取注册 Token，只依赖双方已经保存的静态身份。
 let client = AgentProtocolClient::new("https://agent.example.com");
 // connect 发送 IK message 1、验证 message 2，并返回长期双向加密流。
-let mut session = client.connect(&identity, server_key).await?;
+let mut session = client.connect_ik(&identity, server_key).await?;
 
 // 所有业务消息都必须交给 session.send，由它维护严格递增的 Noise nonce。
 session

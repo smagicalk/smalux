@@ -349,7 +349,7 @@ async fn registration_session_handles_business_then_ik_reconnects() {
     drop(registration.session);
 
     let mut session = client
-        .connect(&identity, registration.server_public_key)
+        .connect_ik(&identity, registration.server_public_key)
         .await
         .unwrap();
     // rekey 不新建 gRPC 流；双方同步更新 Noise cipher state 后继续复用当前会话。

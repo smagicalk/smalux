@@ -26,6 +26,7 @@ pub struct ManagementState {
     policy: Arc<RemoteJobPolicyManager>,
     plugins: Arc<PluginManager>,
     job_result_stats: Arc<JobResultBufferStats>,
+    job_event_stats: Arc<super::JobEventBufferStats>,
     acknowledged_policy_revision: RwLock<Option<u64>>,
 }
 
@@ -43,6 +44,7 @@ impl ManagementState {
         policy: Arc<RemoteJobPolicyManager>,
         plugins: Arc<PluginManager>,
         job_result_stats: Arc<JobResultBufferStats>,
+        job_event_stats: Arc<super::JobEventBufferStats>,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -55,6 +57,7 @@ impl ManagementState {
             policy,
             plugins,
             job_result_stats,
+            job_event_stats,
             acknowledged_policy_revision: RwLock::new(None),
         }
     }
@@ -240,6 +243,7 @@ impl ManagementState {
         let running_jobs = jobs.iter().filter(|job| job.running_count > 0).count();
         let pending_runs = jobs.iter().map(|job| job.pending_count as usize).sum();
         let (pending_job_results, dropped_job_results) = self.job_result_stats.snapshot();
+        let (pending_job_events, dropped_job_events) = self.job_event_stats.snapshot();
         Ok(StatusSnapshot {
             uptime_ms: millis(self.started_at.elapsed()),
             connection_status: connection_status(current_connection_status),
@@ -256,6 +260,8 @@ impl ManagementState {
             pending_runs,
             pending_job_results,
             dropped_job_results,
+            pending_job_events,
+            dropped_job_events,
             heartbeat_sent: heartbeat.as_ref().map(|stats| stats.sent_count),
             heartbeat_received: heartbeat.as_ref().map(|stats| stats.received_count),
             heartbeat_rtt_ms: heartbeat

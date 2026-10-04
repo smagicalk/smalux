@@ -5,9 +5,9 @@ package smalux.agent.v1;
 import "google/protobuf/timestamp.proto";
 
 // Scheduler 生命周期事件。按 kind 解释其余可选元数据字段。
-// 当前 v1 仅预留 schema，尚未加入 SecureMessage 或正式 Agent/Server 传输流程。
+// 事件通过 SecureMessage.job_event 进入 Agent/Server 正式业务流。
 message JobEvent {
-  // Agent 进程内单调递增序号，用于发现事件缺口；重启后可重新开始。
+  // Agent 自己发出的事件序号，在同一进程实例内单调递增；重启后由 instance_id 区分。
   uint64 sequence = 1;
   // Agent 生成事件的 UTC 时间。
   google.protobuf.Timestamp emitted_at = 2;
@@ -33,6 +33,8 @@ message JobEvent {
   bool will_retry = 12;
   // 事件发生后的 Job Pending 数量。
   uint32 pending_count = 13;
+  // Agent 进程实例 UUID，固定 16 字节；用于跨重连去重和区分重启前后的序号。
+  bytes instance_id = 14;
 }
 
 // Scheduler、Job、Trigger、执行和结果交付的生命周期事件。

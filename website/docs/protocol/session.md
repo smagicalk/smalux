@@ -90,7 +90,7 @@ accept_incoming
 首次连接断开后，Agent 恢复自己的长期 identity 和固定的 Server 公钥：
 
 ```rust
-let session = client.connect(&agent_identity, server_public_key).await?;
+let session = client.connect_ik(&agent_identity, server_public_key).await?;
 ```
 
 IK 使用两条消息完成双方静态密钥认证，不再发送注册 Token。Server 收到
@@ -102,6 +102,37 @@ let session = authentication.authorize();
 ```
 
 Noise 证明对端持有对应私钥，不证明该 Agent 当前仍有业务权限。
+
+## 重连后的状态对账
+
+认证成功后 Agent 会先发送 `AgentReconcileSummary`，然后再发送策略、能力和插件清单。摘要只
+包含当前进程实例 ID、远程 Job catalog/runtime 的 revision 和 BLAKE2s-256 digest：
+
+```rust,ignore
+let (catalog_revision, catalog_digest) = remote_jobs.catalog_reconcile_state().await;
+let (runtime_revision, runtime_digest) = plugin_runtime.reconcile_state();
+client_handle.send_reconcile_summary(AgentReconcileSummary {
+    instance_id: process_instance_id.to_vec(),
+    catalog_revision,
+    catalog_digest,
+    runtime_revision,
+    runtime_digest,
+}).await?;
+```
+
+Server 比较 revision 和 digest。相同则跳过对应完整快照，只有目录或 runtime 不一致时才重新
+发送；摘要缺失、非法或进程实例变化会回退到完整同步。进程实例 ID 不写入磁盘，所以 Agent
+重启后一定会完整同步一次，但同一进程的短暂断线重连不会重复发送相同配置。
+
+## 上报幂等与归属
+
+Server 接收 `TaskReport` 时按 `agent_id + job_id + job_revision + run_id + attempt` 做幂等键，
+并从 Job 历史版本确认该 revision 确实属于这个 Agent。目录更新或删除后，迟到的旧 revision
+仍可保存；同一执行身份但 payload 不同会被拒绝。
+
+`JobEvent` 带有进程 `instance_id` 和只对实际发出事件编号的 `sequence`。Server 按
+`agent_id + instance_id + sequence` 去重，并把跳号记录为事件缺口。该机制只保证 Server 端
+重复投递不重复入库；Agent 当前的上报队列仍是有界内存队列，进程崩溃前未发送的数据不会恢复。
 
 ## Driver 模式
 
@@ -191,7 +222,7 @@ let registered = pending
 store.save_committed(&registered)?;
 
 // 后续连接：只读取本地 identity 和已保存的 Server 公钥。
-let session = client.connect(&identity, server_public_key).await?;
+let session = client.connect_ik(&identity, server_public_key).await?;
 ```
 
 实际调用顺序是：
@@ -254,9 +285,8 @@ IncomingSession::Registration
   -> run_business_session
        -> Server 发送 AgentJobPolicyQuery
        -> Agent 上报 AgentJobPolicySnapshot
-       -> Server ACK revision 后才允许主动下发 Job
+       -> Server ACK 当前会话的策略 revision 后才允许主动下发 Job
 ```
-
 四个协议阶段的含义不同：
 
 | 阶段 | Server 持久化状态 | Agent 可以做什么 |
@@ -294,12 +324,13 @@ IncomingSession::Authentication
 ## Agent Job 策略同步
 
 进入业务循环后，Server 立即发送 `AgentJobPolicyQuery`，Agent 同时主动上报当前完整
-`AgentJobPolicySnapshot`。重复快照按持久化 revision 幂等确认；Server 在当前会话接受策略前
-不会主动下发 Job。黑名单只保存在 Agent 本地，Server 断线后不保留副本。
+`AgentJobPolicySnapshot`。重复快照按当前会话已接受的 revision 幂等确认；Server 在当前会话接受策略前
+不会主动下发 Job。黑名单只保存在 Agent 本地，Server 断线后不保留策略副本。
 
 Agent 本地增加规则时立即停用匹配 Job；解除规则只上报新快照，等待 Server 的 Job Provider
-重新发送权威 `ReplaceAllJobs`。因此 `AgentJobPolicyAck` 只确认策略同步，不代表
-Job 已恢复。具体 CLI 和停用行为见 [Job 与 Task](../usage/job-task.md#动态远程-job-黑名单)。
+重新发送权威 `ReplaceAllJobs`。CLI 返回 `server_sync=pending` 表示本地策略已生效但尚未收到 ACK；
+`AgentJobPolicyAck` 只确认 Server 收到当前会话快照，不代表过滤后的 Job 已重新下发或执行。
+具体 CLI 和停用行为见 [Job 与 Task](../usage/job-task.md#动态远程-job-黑名单)。
 
 ## Driver 的调用和所有权
 

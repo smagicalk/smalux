@@ -339,7 +339,7 @@ cargo run -p smalux-protocol --example noise_shared_port_client
    `send_registration_prepared`、`receive_registration_commit`、注册表 `commit` 和协议
    `send_registration_committed`；失败通过 `send_rejection` 返回加密 `SecureError`。
 6. 首次注册和后续 IK 最终都调用 `run_messages`。只有已有身份或断线重连时才由
-   `open_ik_session` 调用 `AgentProtocolClient::connect`；成功后双方通过
+   `open_ik_session` 调用 `AgentProtocolClient::connect_ik`；成功后双方通过
    manual 模式使用 `TonicNoiseSession` 小方法，driver 模式使用 `SessionHandle/SessionEventReceiver`。
 7. `receive_event` 和 Driver 自动处理 Ping/Pong 与 rekey。手动循环也可定期调用
    `maintenance_status/perform_maintenance`；

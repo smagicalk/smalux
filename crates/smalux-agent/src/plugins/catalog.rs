@@ -168,7 +168,13 @@ impl PluginCatalog {
                         message,
                     }
                 })?;
-                let schema_path = directory.join(&manifest.schema_file);
+                let schema_path =
+                    canonical_plugin_file(&directory, &manifest.schema_file, "Schema").map_err(
+                        |message| PluginCatalogError::InvalidSchema {
+                            path: directory.join(&manifest.schema_file),
+                            message,
+                        },
+                    )?;
                 let schema_bytes =
                     fs::read(&schema_path).map_err(|source| PluginCatalogError::ReadSchema {
                         path: schema_path.clone(),
@@ -272,18 +278,28 @@ fn validate_worker_manifest(directory: &Path, manifest: &PluginManifest) -> Resu
     }
     let directory = fs::canonicalize(directory)
         .map_err(|error| format!("failed to canonicalize plugin directory: {error}"))?;
-    let entrypoint = directory.join(&manifest.entrypoint);
-    let metadata = fs::metadata(&entrypoint)
-        .map_err(|error| format!("failed to read Worker entrypoint: {error}"))?;
-    if !metadata.is_file() {
-        return Err("Worker entrypoint must be a regular file".to_owned());
-    }
-    let entrypoint = fs::canonicalize(&entrypoint)
-        .map_err(|error| format!("failed to canonicalize Worker entrypoint: {error}"))?;
-    if !entrypoint.starts_with(&directory) {
-        return Err("Worker entrypoint resolves outside its plugin version directory".to_owned());
-    }
+    let _ = canonical_plugin_file(&directory, &manifest.entrypoint, "Worker entrypoint")?;
     Ok(())
+}
+
+/// 解析并校验版本目录内的普通文件，拒绝指向目录外的符号链接。
+fn canonical_plugin_file(directory: &Path, relative: &str, label: &str) -> Result<PathBuf, String> {
+    let canonical_directory = fs::canonicalize(directory)
+        .map_err(|error| format!("failed to canonicalize plugin directory: {error}"))?;
+    let path = directory.join(relative);
+    let metadata =
+        fs::metadata(&path).map_err(|error| format!("failed to read {label}: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| format!("failed to canonicalize {label}: {error}"))?;
+    if !canonical.starts_with(&canonical_directory) {
+        return Err(format!(
+            "{label} resolves outside its plugin version directory"
+        ));
+    }
+    Ok(canonical)
 }
 
 fn current_platform() -> PluginPlatform {
@@ -307,7 +323,8 @@ mod tests {
     use prost::Message;
     use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
     use smalux_plus_core::{
-        PluginPlatform, PluginSchemaBundle, PluginTaskSchema, SCHEMA_FORMAT_VERSION,
+        PluginPlatform, PluginRuntimeSchema, PluginSchemaBundle, PluginTaskSchema,
+        SCHEMA_FORMAT_VERSION,
     };
     use std::fs;
 
@@ -315,10 +332,16 @@ mod tests {
         let descriptor_set = FileDescriptorSet {
             file: vec![FileDescriptorProto {
                 name: Some("plugin.proto".to_owned()),
-                message_type: vec![DescriptorProto {
-                    name: Some("Config".to_owned()),
-                    ..Default::default()
-                }],
+                message_type: vec![
+                    DescriptorProto {
+                        name: Some("Config".to_owned()),
+                        ..Default::default()
+                    },
+                    DescriptorProto {
+                        name: Some("RuntimeConfig".to_owned()),
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             }],
         }
@@ -334,6 +357,11 @@ mod tests {
                 config_message: "Config".to_owned(),
                 ..Default::default()
             }],
+            runtime: Some(PluginRuntimeSchema {
+                schema_version: 1,
+                config_message: "RuntimeConfig".to_owned(),
+                ..Default::default()
+            }),
         }
         .encode_checked()
         .unwrap()
@@ -360,7 +388,7 @@ mod tests {
         fs::write(
             first.join("plugin.json"),
             format!(
-                r#"{{"plugin_id":"z","display_name":"Z","version":{{"major":0,"minor":1,"patch":0}},"abi_version":1,"platform":"{}","entrypoint":"worker.exe","protocol_version":1,"schema_file":"schema.pb","task_types":["smalux.z.v1"]}}"#,
+                r#"{{"plugin_id":"z","display_name":"Z","version":{{"major":0,"minor":1,"patch":0}},"platform":"{}","entrypoint":"worker.exe","protocol_version":2,"schema_file":"schema.pb","task_types":["smalux.z.v1"]}}"#,
                 platform_name()
             ),
         )
@@ -370,7 +398,7 @@ mod tests {
         fs::write(
             second.join("plugin.json"),
             format!(
-                r#"{{"plugin_id":"a","display_name":"A","version":{{"major":0,"minor":2,"patch":0}},"abi_version":1,"platform":"{}","entrypoint":"worker.exe","protocol_version":1,"schema_file":"schema.pb","task_types":["smalux.a.v1"]}}"#,
+                r#"{{"plugin_id":"a","display_name":"A","version":{{"major":0,"minor":2,"patch":0}},"platform":"{}","entrypoint":"worker.exe","protocol_version":2,"schema_file":"schema.pb","task_types":["smalux.a.v1"]}}"#,
                 platform_name()
             ),
         )

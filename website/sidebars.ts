@@ -47,7 +47,11 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: '参考',
-      items: ['reference/commands', 'reference/project-status'],
+      items: [
+        'reference/commands',
+        'reference/agent-server-runtime',
+        'reference/project-status',
+      ],
     },
   ],
 };

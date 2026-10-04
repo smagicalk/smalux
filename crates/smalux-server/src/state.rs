@@ -69,6 +69,7 @@ impl AppState {
             Arc::clone(&agent.agent_registry),
             Arc::clone(&agent.keyring_manager),
             agent.sessions.clone(),
+            Arc::clone(&agent.control_plane),
             runtime_config.clone(),
             shutdown.clone(),
         ));

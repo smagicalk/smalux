@@ -332,12 +332,14 @@ impl ServerSessionAcceptor {
             }
         };
         info!(mode = ?established.mode, peer_key_id = ?established.remote_static_key.key_id(), "Noise handshake established on Server");
+        let mut session = TonicNoiseSession::server(sender, inbound, established.session);
+        session.set_rekey_timeout(self.handshake_timeout);
         Ok(ServerPendingSession {
             mode: established.mode,
             registration_token_id: (established.mode == HandshakeMode::RegistrationXxPsk3)
                 .then_some(registration_token_id),
             peer_public_key: established.remote_static_key,
-            session: TonicNoiseSession::server(sender, inbound, established.session),
+            session,
         })
     }
 

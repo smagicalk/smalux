@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use smalux_protocol::noise::{NoiseIdentity, NoisePublicKey};
+use smalux_protocol::noise::{NoiseIdentity, NoisePublicKey, PinnedServerKeysSnapshot, RotationId};
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -283,6 +283,12 @@ enum StoredAgentState {
         private_key: Vec<u8>,
         public_key: Vec<u8>,
         server_public_keys: Vec<Vec<u8>>,
+        #[serde(default)]
+        server_pending_public_key: Option<Vec<u8>>,
+        #[serde(default)]
+        server_previous_public_key: Option<Vec<u8>>,
+        #[serde(default)]
+        server_rotation_id: Option<Vec<u8>>,
         registration_id: Vec<u8>,
     },
     Registered {
@@ -290,8 +296,30 @@ enum StoredAgentState {
         private_key: Vec<u8>,
         public_key: Vec<u8>,
         server_public_keys: Vec<Vec<u8>>,
+        #[serde(default)]
+        server_pending_public_key: Option<Vec<u8>>,
+        #[serde(default)]
+        server_previous_public_key: Option<Vec<u8>>,
+        #[serde(default)]
+        server_rotation_id: Option<Vec<u8>>,
         registration_id: Vec<u8>,
     },
+}
+
+struct StoredServerKeys {
+    public_keys: Vec<Vec<u8>>,
+    pending_public_key: Option<Vec<u8>>,
+    previous_public_key: Option<Vec<u8>>,
+    rotation_id: Option<Vec<u8>>,
+}
+
+fn stored_server_keys(snapshot: &PinnedServerKeysSnapshot) -> StoredServerKeys {
+    StoredServerKeys {
+        public_keys: vec![snapshot.current.as_bytes().to_vec()],
+        pending_public_key: snapshot.pending.map(|key| key.as_bytes().to_vec()),
+        previous_public_key: snapshot.previous.map(|key| key.as_bytes().to_vec()),
+        rotation_id: snapshot.rotation_id.map(|id| id.as_bytes().to_vec()),
+    }
 }
 
 impl From<&PersistedAgentState> for StoredAgentState {
@@ -313,36 +341,38 @@ impl From<&PersistedAgentState> for StoredAgentState {
             PersistedAgentState::RegistrationPending {
                 agent_id,
                 identity,
-                server_public_keys,
+                server_keys,
                 registration_id,
             } => {
                 let (private_key, public_key) = keys(identity);
+                let stored = stored_server_keys(server_keys);
                 Self::RegistrationPending {
                     agent_id: agent_id.clone(),
                     private_key,
                     public_key,
-                    server_public_keys: server_public_keys
-                        .iter()
-                        .map(|key| key.as_bytes().to_vec())
-                        .collect(),
+                    server_public_keys: stored.public_keys,
+                    server_pending_public_key: stored.pending_public_key,
+                    server_previous_public_key: stored.previous_public_key,
+                    server_rotation_id: stored.rotation_id,
                     registration_id: registration_id.to_vec(),
                 }
             }
             PersistedAgentState::Registered {
                 agent_id,
                 identity,
-                server_public_keys,
+                server_keys,
                 registration_id,
             } => {
                 let (private_key, public_key) = keys(identity);
+                let stored = stored_server_keys(server_keys);
                 Self::Registered {
                     agent_id: agent_id.clone(),
                     private_key,
                     public_key,
-                    server_public_keys: server_public_keys
-                        .iter()
-                        .map(|key| key.as_bytes().to_vec())
-                        .collect(),
+                    server_public_keys: stored.public_keys,
+                    server_pending_public_key: stored.pending_public_key,
+                    server_previous_public_key: stored.previous_public_key,
+                    server_rotation_id: stored.rotation_id,
                     registration_id: registration_id.to_vec(),
                 }
             }
@@ -357,15 +387,41 @@ impl TryFrom<StoredAgentState> for PersistedAgentState {
         let identity = |private_key: Vec<u8>, public_key: Vec<u8>| {
             NoiseIdentity::from_parts(&private_key, &public_key).map_err(anyhow::Error::from)
         };
-        let server_keys = |values: Vec<Vec<u8>>| -> anyhow::Result<Vec<NoisePublicKey>> {
-            let keys = values
-                .into_iter()
+        let server_keys = |values: Vec<Vec<u8>>,
+                           pending: Option<Vec<u8>>,
+                           previous: Option<Vec<u8>>,
+                           rotation_id: Option<Vec<u8>>|
+         -> anyhow::Result<PinnedServerKeysSnapshot> {
+            let current = values
+                .first()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("registered Agent state must contain a Server public key")
+                })
+                .and_then(|value| NoisePublicKey::from_bytes(value).map_err(anyhow::Error::from))?;
+            anyhow::ensure!(
+                values.len() <= 2,
+                "Agent state contains too many Server public keys"
+            );
+            let legacy_previous = values.get(1).cloned();
+            let pending = pending
                 .map(|value| NoisePublicKey::from_bytes(&value).map_err(anyhow::Error::from))
-                .collect::<Result<Vec<_>, _>>()?;
-            if keys.is_empty() {
-                anyhow::bail!("registered Agent state must contain a Server public key");
-            }
-            Ok(keys)
+                .transpose()?;
+            let previous = previous
+                .or(legacy_previous)
+                .map(|value| NoisePublicKey::from_bytes(&value).map_err(anyhow::Error::from))
+                .transpose()?;
+            let rotation_id = rotation_id
+                .map(|value| RotationId::from_bytes(&value).map_err(anyhow::Error::from))
+                .transpose()?;
+            let snapshot = PinnedServerKeysSnapshot {
+                current,
+                pending,
+                previous,
+                rotation_id,
+            };
+            smalux_protocol::noise::PinnedServerKeys::from_snapshot(snapshot.clone())
+                .map_err(anyhow::Error::from)?;
+            Ok(snapshot)
         };
         let registration_id = |value: Vec<u8>| -> anyhow::Result<[u8; 16]> {
             value
@@ -384,11 +440,19 @@ impl TryFrom<StoredAgentState> for PersistedAgentState {
                 private_key,
                 public_key,
                 server_public_keys,
+                server_pending_public_key,
+                server_previous_public_key,
+                server_rotation_id,
                 registration_id: stored_registration_id,
             } => Ok(Self::RegistrationPending {
                 agent_id,
                 identity: identity(private_key, public_key)?,
-                server_public_keys: server_keys(server_public_keys)?,
+                server_keys: server_keys(
+                    server_public_keys,
+                    server_pending_public_key,
+                    server_previous_public_key,
+                    server_rotation_id,
+                )?,
                 registration_id: registration_id(stored_registration_id)?,
             }),
             StoredAgentState::Registered {
@@ -396,11 +460,19 @@ impl TryFrom<StoredAgentState> for PersistedAgentState {
                 private_key,
                 public_key,
                 server_public_keys,
+                server_pending_public_key,
+                server_previous_public_key,
+                server_rotation_id,
                 registration_id: stored_registration_id,
             } => Ok(Self::Registered {
                 agent_id,
                 identity: identity(private_key, public_key)?,
-                server_public_keys: server_keys(server_public_keys)?,
+                server_keys: server_keys(
+                    server_public_keys,
+                    server_pending_public_key,
+                    server_previous_public_key,
+                    server_rotation_id,
+                )?,
                 registration_id: registration_id(stored_registration_id)?,
             }),
         }
@@ -459,7 +531,7 @@ mod tests {
         store.save(&registered).await.unwrap();
         let loaded = store.load().await.unwrap().unwrap();
         assert_eq!(loaded.stage(), RegistrationStage::Registered);
-        assert_eq!(loaded.server_public_keys(), &[server.public_key()]);
+        assert_eq!(loaded.server_key_candidates(), vec![server.public_key()]);
 
         store.clear().await.unwrap();
         assert!(store.load().await.unwrap().is_none());

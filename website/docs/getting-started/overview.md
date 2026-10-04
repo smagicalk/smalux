@@ -40,7 +40,7 @@ TaskReportSink
 Collector 不负责调度，也不决定结果发往哪里。Task 把配置和一次执行封装为稳定单元；Scheduler
 只管理执行时序；Sink 决定输出。这种拆分让同一个 Task 可以用于周期 Job、Cron Job、手动执行或测试。
 
-一次远程任务的职责分配是：Server 负责生成配置与版本，Protocol 负责可靠传递，RemoteJobController 负责
+一次远程任务的职责分配是：Server 负责生成配置与版本，Protocol 负责认证、加密传输和协议状态，RemoteJobController 负责
 校验和安装，Scheduler 负责运行，Task 负责产生结果，Sink/连接层负责上报。每层只确认自己已经完成的
 动作；例如 gRPC 发送成功不等于 Server 已持久化 TaskReport。
 
@@ -52,8 +52,8 @@ Collector 不负责调度，也不决定结果发往哪里。Task 把配置和�
 - **JobDefinition.revision** 是 Server 维护的业务配置版本，不能与 Scheduler generation 混用。
 
 远程 Job 通过 Proto `JobCommand` 安装到 Agent。连接短暂中断不会自动删除已安装 Job，Agent 可以
-继续采集；但当前 Protocol 尚未定义跨连接的 TaskReport 持久化 ACK，因此需要可靠上报时应由 Agent
-先写入本地有界队列。
+继续采集；当前 Agent 只保留有界内存队列，重启后由 Server 根据新的进程实例摘要重新对账并下发
+权威 Job。需要跨重启不丢报告时，再扩展持久化队列和业务 ACK。
 
 ## Protocol 分层
 
@@ -190,7 +190,7 @@ Noise 身份；数据库、密钥环或迁移失败时不会启动半可用监�
 ## 一次业务请求的完整路径
 
 ```text
-AgentProtocolClient::connect / register_agent
+AgentProtocolClient::connect_ik / register_agent
   -> AgentTransportRpcClient::open_session
   -> ProtocolFrame(NoiseHandshake)
   -> AgentTransportService::open_session
@@ -204,11 +204,11 @@ AgentProtocolClient::connect / register_agent
 ```
 
 每一层只能确认自己的动作：gRPC stream 写入成功不代表业务已经持久化，Noise 解密成功不代表
-Agent 已获得业务授权，Task 返回成功也不代表 `TaskReport` 已经送达 Server。需要可靠结果时，
-应在连接层外增加本地有界队列、重放和 ACK，而不是把这些职责塞进 Collector 或 Scheduler。
+Agent 已获得业务授权，Task 返回成功也不代表 `TaskReport` 已经送达 Server。当前最小闭环接受
+短暂断线和进程重启后的重新下发；可靠结果重放属于后续可选扩展。
 
 ## 当前边界如何影响开发
 
 可以直接基于 crate 编写和测试新的 Collector、Task、Job 或 Protocol 行为，也可以运行 Example 验证
-Axum/Tonic/Noise 调用链。但正式 Agent/Server 入口还不是完整产品进程，部署文档中的数据库、重连、
-离线队列和授权要求属于接入正式应用时必须补齐的工程边界。
+Axum/Tonic/Noise 调用链。正式 Agent/Server 入口已经可以完成最小注册、心跳、Job 对账和结果入库；
+管理产品、长期指标、安装升级和生产运维仍是独立的后续边界。

@@ -136,7 +136,9 @@ mod tests {
     use crate::{config::DatabaseConfig, database::ServerDatabase};
     use prost::Message;
     use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
-    use smalux_plus_core::{PluginSchemaBundle, PluginTaskSchema, SCHEMA_FORMAT_VERSION};
+    use smalux_plus_core::{
+        PluginRuntimeSchema, PluginSchemaBundle, PluginTaskSchema, SCHEMA_FORMAT_VERSION,
+    };
     use smalux_protocol::agent::v1::{AgentPluginInventory, PluginInventoryEntry};
     use std::sync::Arc;
 
@@ -149,10 +151,16 @@ mod tests {
                 file: vec![FileDescriptorProto {
                     name: Some("echo.proto".to_owned()),
                     package: Some("smalux.plus.echo.v1".to_owned()),
-                    message_type: vec![DescriptorProto {
-                        name: Some("EchoTaskConfig".to_owned()),
-                        ..Default::default()
-                    }],
+                    message_type: vec![
+                        DescriptorProto {
+                            name: Some("EchoTaskConfig".to_owned()),
+                            ..Default::default()
+                        },
+                        DescriptorProto {
+                            name: Some("EchoRuntimeConfig".to_owned()),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 }],
             }
@@ -163,6 +171,11 @@ mod tests {
                 config_message: "smalux.plus.echo.v1.EchoTaskConfig".to_owned(),
                 ..Default::default()
             }],
+            runtime: Some(PluginRuntimeSchema {
+                schema_version: 1,
+                config_message: "smalux.plus.echo.v1.EchoRuntimeConfig".to_owned(),
+                ..Default::default()
+            }),
         }
     }
 

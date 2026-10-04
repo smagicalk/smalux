@@ -331,7 +331,8 @@ impl DatabaseConfig {
     pub(crate) fn resolve_connection_url(
         &self,
     ) -> Result<(String, DatabaseBackend), DatabaseConfigError> {
-        let mut url = Url::parse(&self.url)
+        let normalized = normalize_sqlite_drive_url(&self.url);
+        let mut url = Url::parse(&normalized)
             .map_err(|error| DatabaseConfigError::InvalidUrl(error.to_string()))?;
         let backend = DatabaseBackend::from_url(&url)?;
 
@@ -621,21 +622,37 @@ pub fn default_database_url() -> Result<String, DatabaseConfigError> {
     sqlite_url_for_path(&path)
 }
 
+/// SQLite 把盘符当作文件路径，而通用 URL 解析器会把 `C:` 当作 authority 并丢掉冒号。
+/// 仅规范化明确的盘符路径；其余 URL 继续走原有的凭证与 options 校验。
+fn normalize_sqlite_drive_url(value: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((scheme, path)) = value.split_once("://") {
+        let bytes = path.as_bytes();
+        if scheme.eq_ignore_ascii_case("sqlite")
+            && bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), Some(b'/' | b'\\'))
+        {
+            return std::borrow::Cow::Owned(format!("sqlite:{path}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(value)
+}
+
 /// 将跨平台文件路径转换为 SQLx 可以识别的 SQLite URL。
 fn sqlite_url_for_path(path: &Path) -> Result<String, DatabaseConfigError> {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let mut url = Url::parse("sqlite:///")
         .map_err(|error| DatabaseConfigError::InvalidDefaultUrl(error.to_string()))?;
     // Url 负责对空格、井号等文件名字符做百分号编码。
-    url.set_path(&normalized);
+    // set_path 会保留已有的 %HH；原始文件名中的百分号必须先转义，避免二次解码改写路径。
+    url.set_path(&normalized.replace('%', "%25"));
     url.set_query(Some("mode=rwc"));
     let value = url.to_string();
 
-    // Windows 绝对路径需要保留 C:/；SQLx 解析时会去掉 sqlite scheme，
-    // 因此把 sqlite:///C:/... 调整为 sqlite://C:/...。
+    // 无 authority 的 sqlite:C:/... 既能被 SQLx 使用，也能安全经过 Url 再次解析。
     #[cfg(windows)]
     if normalized.as_bytes().get(1) == Some(&b':') {
-        return Ok(value.replacen("sqlite:///", "sqlite://", 1));
+        return Ok(value.replacen("sqlite:///", "sqlite:", 1));
     }
 
     Ok(value)
@@ -958,5 +975,63 @@ mod tests {
         Migrator::up(database.connection(), None)
             .await
             .expect("initial migration should re-apply");
+    }
+
+    #[test]
+    fn regression_sqlite_drive_urls_preserve_path_and_query() {
+        for drive in ["C", "d"] {
+            let expected = format!("sqlite:{drive}:/data/a%20b%23%25.db?mode=rwc");
+            for input in [
+                format!("sqlite://{drive}:/data/a%20b%23%25.db?mode=rwc"),
+                expected.clone(),
+            ] {
+                let (resolved, _) = DatabaseConfig::new(input).resolve_connection_url().unwrap();
+                assert_eq!(resolved, expected);
+            }
+        }
+        assert_eq!(
+            DatabaseConfig::new("sqlite::memory:")
+                .resolve_connection_url()
+                .unwrap()
+                .0,
+            "sqlite::memory:"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_sqlite_special_path_connects_to_the_requested_file() {
+        let directory = std::env::var_os("PI_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("smalux-数据库 空格#%20-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("server #%2F.db");
+        let url = super::sqlite_url_for_path(&path).unwrap();
+        let database = ServerDatabase::connect(DatabaseConfig::new(url))
+            .await
+            .unwrap();
+        assert!(path.is_file(), "SQLite must use the exact requested path");
+        agent::Entity::insert(agent::ActiveModel {
+            agent_id: Set("path-test".to_owned()),
+            name: Set("路径测试".to_owned()),
+            public_key: Set(vec![9; 32]),
+            status: Set("active".to_owned()),
+            created_at: Set(1),
+            updated_at: Set(1),
+            revoked_at: Set(None),
+        })
+        .exec(database.connection())
+        .await
+        .unwrap();
+        assert!(
+            agent::Entity::find_by_id("path-test")
+                .one(database.connection())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        database.connection().clone().close().await.unwrap();
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

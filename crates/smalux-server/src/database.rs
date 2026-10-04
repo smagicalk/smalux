@@ -7,12 +7,19 @@
 pub mod entity;
 pub mod migration;
 
+mod agent_job;
 mod agent_registration;
+mod agent_snapshot;
 mod connection;
 mod error;
+mod job_command;
+mod job_event;
 mod keyring;
 mod management;
+mod plugin_runtime;
 mod plugin_schema;
+pub(crate) use plugin_runtime::{AgentPluginRuntimeRecord, StoredPluginRuntime};
+mod task_report;
 
 pub use crate::config::{
     DATABASE_ACQUIRE_TIMEOUT_ENV, DATABASE_CONNECT_TIMEOUT_ENV, DATABASE_IDLE_TIMEOUT_ENV,
@@ -21,11 +28,14 @@ pub use crate::config::{
     DATABASE_URL_ENV, DATABASE_USERNAME_ENV, DatabaseBackend, DatabaseConfig, DatabaseConfigError,
     DatabasePoolConfig, default_database_url,
 };
+pub(crate) use agent_job::AgentJobCatalogRecord;
 pub(crate) use agent_registration::{
     PendingAgentRegistration, PersistedAgentAuthorization, PrepareAgentRegistrationError,
 };
 pub use connection::ServerDatabase;
 pub use error::DatabaseError;
+pub(crate) use job_event::JobEventRecord;
 pub use keyring::ServerKeyRingRecord;
 pub(crate) use management::{AgentRecord, RegistrationTokenRecord, RevokeTokenOutcome};
 pub use plugin_schema::PluginSchemaRecord;
+pub(crate) use task_report::TaskReportRecord;
