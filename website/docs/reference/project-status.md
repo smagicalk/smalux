@@ -39,6 +39,8 @@ description: 区分当前已实现、示例实现和待完成的能力。
 - Agent 优雅关闭：Ctrl+C 与 Unix SIGTERM 停止 Scheduler、限时补发内存队列并关闭会话；
 - Agent 离线窗口：默认断线 30 分钟后清空远程 Job，重连后由 Server 重新同步权威目录；
 - Agent 身份文件权限：Unix `0600` 与 Windows 保护 ACL，读取时检查不安全权限。
+- Web 登录与只读查询（默认关闭）：本地 CLI 首管理员初始化、Argon2id、Cookie 会话、Origin/CSRF/限流、脱敏事件；`meta`、`session.info`、Agent/Job 目录、报告/事件摘要及 CPU/内存 metrics WS。
+- 独立前端真实模式只接入登录与身份/能力状态，尚未接入新建的 Agent/Job/Report/Event 查询；原 Mock 模式保留。Server Web 查询已通过 SQLite 单元/HTTP RPC 回归，浏览器联调与生产反代尚未验收。
 
 ## Example 中实现
 
@@ -63,9 +65,10 @@ schema.pb 动态编码，Server 不安装插件二进制。
 
 - 可选的 TaskReport/JobEvent Agent 本地持久化、跨 Session 业务 ACK 和崩溃后重放（当前轻量设计
   使用有界内存队列，重启后由 Server 对账重新下发）；
-- Job 模板、批量 Agent 分配、管理 HTTP API 与浏览器表单；
+
+- Job 写入/操作状态 Web API、Job 模板、批量 Agent 分配与浏览器业务页面；
 - 跨版本能力兼容策略和生产级结果归档；
-- 管理 REST API、Web 管理端和用户授权；
+- 写操作管理 API 与 Web 业务适配、用户管理/改密、完整资源级授权和完整审计；当前登录与 Agent/Job/Report/Event 查询仅是基础子集。
 - 安装包、系统服务、容器镜像、升级和回滚；
 - `smalux-plus-rustic` 实际业务实现；
 - 多实例部署下的迁移互斥、跨进程实时事件通知和端到端并发验证；

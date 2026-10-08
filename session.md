@@ -1,5 +1,70 @@
 # Smalux 会话交接记录
 
+## 最新进度：后端首批 Web 只读 API
+
+- 用户确认后端优先、前端后适配；首批范围为 Agent/Job/Report/Event 核心闭环及既有 CPU/内存指标。前端 API 可以不同，暂不改前端。新增数据库迁移需另行确认。
+- 本批只增加只读 Web 查询，不新增 DB 表或迁移，复用 AdminService、Job catalog、TaskReport/JobEvent 表和已有 Agent 会话目录。
+- JSON-RPC 新增 `agent.list/get`、`job.list/get`、`report.list`、`event.list`；同源会话认证继续沿用 Cookie/Origin/CSRF 边界。Agent 查询使用真实 ID/展示名称/授权状态/在线状态；Job 只读权威 catalog；Report/Event 仅返回摘要，不暴露原始 Proto payload。
+- Report/Event 查询支持 Agent/Job、毫秒时间窗 `[fromMs,toMs)`、有界限流及稳定复合时间+记录 ID 倒序分页；DB 分页查询保留旧 CLI 入口。Agent ID cursor 为排序键；Report/Event cursor 当前 wire 格式为 `timestampMicros|recordId`，非签名凭据。
+- Interim Web DTO 与 `WEB_API.md` 中完整目标 VO 尚不同：Agent 列表使用 `limit/after`，Job 当前 summary 有 ID/revision/enabled/taskKind，report/event 是摘要分页。Job detail 不向 Web 暴露 Protobuf；写 API、Operation、完整 resource ACL、Job 参数结构编辑和前端接入均未实现。对应边界已在 `WEB_API.md` §5 当前过渡契约中说明。
+- 本次后端验证：`cargo test -p smalux-server --lib --locked --offline -j 1` **132/132 通过**；`cargo fmt --all -- --check`、`cargo clippy -p smalux-server --lib --locked --offline -j 1 -- -D warnings`、Server 正式二进制构建均通过。全工作区测试仍待资源充足时验证，既有 os error 1455 阻塞仍适用。
+- 本批未修改前端、未添加迁移或依赖；原有未提交改动全部保留。工作区原已有 Server/Web 未提交和未跟踪内容，本次编辑叠加在其上；未提交/推送。
+- 下一步：先评审当前 interim API shape 与 scope，再讨论 Job 写 API/持久化 operation 设计；若需要 migration，单独征求批准后再改。之后再由前端按冻结契约接入。
+
+### 下次继续入口
+
+核心 Web handler：`crates/smalux-server/src/web_auth.rs`；Agent/Job 只读回归：`crates/smalux-server/src/web_auth/regression.rs`；稳定 Report/Event 游标 DB 查询与测试：`crates/smalux-server/src/database/task_report.rs`、`job_event.rs`；既有 Agent/Job 查询服务：`crates/smalux-server/src/management/service.rs`；指标与 WS：`crates/smalux-server/src/web_metrics.rs`、`web_auth/ws.rs`。
+
+
+## 上一批进度：R0/R1 真实登录基础子集
+
+- 用户已批准并实现：本地 `auth bootstrap --username` 隐藏交互初始化、Argon2id、独立用户/会话摘要/安全事件/bootstrap claim 迁移；登录、恢复会话、退出、meta 与已认证 `session.info`。
+- Web 默认关闭。生产 HTTPS 同源反代、Server 回环监听；显式开发模式才允许回环 HTTP。精确 Origin、JSON、自定义客户端头、退出 CSRF、Cookie flags、8 KiB 请求限制、30 次/分钟全局限流与 2 并发哈希均已实现。默认会话 absolute=24h、idle=30min，可配置。
+- 后端入口 `crates/smalux-server/src/web_auth.rs`，持久化边界 `web_auth/store.rs`，回归 `web_auth/regression.rs`，边界说明 `web_auth/SPEC.md`。启动参数及反代要求见 `crates/smalux-server/README.md`。
+- 前端新增 `src/shared/auth/`，真实模式只显示登录/服务端身份与能力，不挂载 Mock 业务；Cookie 同源请求，内存会话、不信任 localStorage 假身份，401/到期撤销显示，网络错误不伪造登录/退出成功。旧显式 Mock 模式保留。
+- 最终验证：`cargo test --workspace --locked --offline -j 1` 全通过（336 项，Server 107 项，8 项文档测试忽略）；前端 12 个文件、93/93 项通过，typecheck/build 通过；正式 Server 二进制构建通过。共享启动入口的 Web 安全校验另有回归，CLI 与 library 一致。
+- 新认证回归先复现协议/能力目录缺陷再修复；覆盖 Cookie、CSRF、错误凭据、到期/禁用用户、限流、数据库失败回滚、重复/并发 bootstrap、旧 schema 升级保留数据与文件 SQLite 重开。
+- 已用隔离 SQLite、真实 Server 进程与同源测试反代验证：初始401、错误密码401、登录200、恢复200、session.info、错误CSRF403、退出200、旧Cookie401。账号使用临时测试夹具，不代表 CLI 隐藏输入交互已实测；测试进程已关闭。
+- 环境限制：浏览器工具报告 `browser guest is not available`，预览不支持附加工作区，浏览器交互未验证。生产 HTTPS 反代、PostgreSQL/MySQL 实机、容量/跨平台未验证。构建保留大包/Windows linker 提示；首次并行编译内存不足后以 `-j 1` 成功。
+- 仍未实现：用户管理/改密、完整审计管理、WS/MFA/step-up、Agent/Job/报告 Web API。下一步建议按已批准契约推进 R2 最小只读/任务链路，不把登录基础宣称为全部 R0/R1 完成。
+- 本批及上一批前端修复、两份 session.md 均留在工作区，未提交/推送。基线仍为后端 `e6aeef1`、前端 `2155b94`。
+
+## 上一批进度：联调基础修复完成
+
+本节是较早批次的历史记录；当前实现范围、环境阻塞及验证结果以文件顶部“最新进度”为准。
+
+### 实现前基线提交
+
+- 后端 `dev`：`e6aeef1`，保存 `WEB_API.md` 设计草案。
+- 前端 `vibe-dev`：`2155b94`，保存 `api.md` 接口清单及已有弹窗样式调整。
+- 两次提交均未推送。后续联调基础修复仍在前端工作区，尚未提交；本次纪要更新也未提交。
+
+### 本批已完成
+
+用户批准先修联调基础，未开展登录授权、数据库迁移或真实业务 API。
+
+- 前端 `src/shared/api/http/http-client.ts`：`enableMock=false` 时 GET/POST/PUT/DELETE 的网络异常、非 2xx 响应与 JSON 解析错误直接拒绝，不再进入 Mock 回退；保留 HTTP 状态、原生错误及成功请求语义。
+- 显式 Mock 模式及现有配置默认值不变；失败写操作不会进入模拟后端修改数据。
+- 新增 `src/shared/api/http/http-client.test.ts`，包含 36 项回归；修正 `src/app/config/runtime-config.test.ts` 的默认值期望，并验证显式 `false` 被保留。
+- 新增 `src/shared/api/http/SPEC.md` 记录真实 REST 与 Mock 边界。上述路径均相对 `F:/code/node/smalux_frontend`。
+
+### 已执行验证
+
+- 评估阶段：`cargo test --workspace --locked --offline`，324 通过、0 失败，8 项文档测试忽略；包含加密连接下任务执行与报告持久化测试。本批未修改 Rust 源码。
+- 前端按失败测试到修复通过执行；最终独立复跑 `pnpm.cmd run test`：8 个文件、77/77 项通过。
+- `pnpm.cmd run typecheck`、`pnpm.cmd run build`、`git diff --check` 均通过；相关文件 UTF-8 无 BOM、中文抽样正常。
+- 构建仍有压缩后 chunk 超过 500 kB 的警告，未在本批优化。未执行浏览器端到端、生产部署、容量或全平台验证。
+
+### 当前成熟度与下一步
+
+Agent/Server 核心闭环已形成，但 Web 前端仍主要依赖 Mock，真实管理产品尚未接通。普通 HTTP 目前只有 `/api/v1/health`；`WEB_API.md` 为未实现草案，不能计入功能完成度。
+
+下一阶段建议先统一契约，再打通“登录授权 → Agent 列表/详情 → 下发采集任务 → 查询真实报告”的最小 Web 链路；需另行确认安全与数据库设计。指标聚合/保留、告警、Rustic 备份和生产交付仍待后续实现。本批无阻塞。
+
+---
+
+## 历史交接记录
+
 日期：2026-09-05
 
 ## 本次目标

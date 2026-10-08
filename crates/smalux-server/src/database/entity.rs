@@ -20,3 +20,4 @@ pub mod plugin_schema;
 pub mod registration_token;
 pub mod server_keyring;
 pub mod task_report;
+pub mod web_job_operation;

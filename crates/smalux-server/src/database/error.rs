@@ -45,6 +45,9 @@ pub enum DatabaseError {
     /// 权威 Agent Job 目录、定义或存储内容无效。
     #[error("invalid persisted Agent Job catalog: {0}")]
     InvalidJobCatalog(String),
+    /// A client reused one idempotency key for different normalized request content.
+    #[error("Web Job mutation idempotency conflict")]
+    WebJobIdempotencyConflict,
     /// 控制面提交的目录版本已经落后于数据库当前版本。
     #[error("{resource} revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict {

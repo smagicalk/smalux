@@ -5,6 +5,8 @@
 //! 不再修改这个初始迁移。
 
 mod m20260804_000001_create_server_database;
+mod m20260805_000001_create_web_auth;
+mod m20260806_000001_create_web_job_operations;
 
 use sea_orm_migration::prelude::*;
 
@@ -14,6 +16,10 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20260804_000001_create_server_database::Migration)]
+        vec![
+            Box::new(m20260804_000001_create_server_database::Migration),
+            Box::new(m20260805_000001_create_web_auth::Migration),
+            Box::new(m20260806_000001_create_web_job_operations::Migration),
+        ]
     }
 }

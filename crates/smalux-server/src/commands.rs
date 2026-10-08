@@ -1,8 +1,9 @@
 //! Server CLI 命令执行器。
 //!
-//! `run` 和 `config check` 在当前进程执行；其余命令只通过本地 IPC 操作已经运行的
-//! Server。危险操作在请求发出前统一确认，避免不同命令产生不一致的脚本行为。
+//! `run`、`config check` 和本地 `auth bootstrap` 在当前进程执行；其余命令通过本地 IPC
+//! 操作运行中的 Server。危险操作在请求发出前统一确认。
 
+use secrecy::{ExposeSecret, SecretString};
 use std::{
     fs,
     fs::OpenOptions,
@@ -13,8 +14,8 @@ use std::{
 
 use crate::{
     cli::{
-        AgentCommand, Cli, CliCommand, ConfigCommand, KeyringCommand, OutputFormat, PluginCommand,
-        RegistrationTokenCommand, ServerJobCommand, SessionCommand,
+        AgentCommand, AuthCommand, Cli, CliCommand, ConfigCommand, KeyringCommand, OutputFormat,
+        PluginCommand, RegistrationTokenCommand, ServerJobCommand, SessionCommand,
     },
     management::{ControlRequest, ControlResponse},
 };
@@ -22,15 +23,44 @@ use crate::{
 /// 分发顶层命令：启动/配置校验在本进程执行，其余命令转发给运行中的 Server。
 pub(crate) async fn execute(cli: Cli) -> anyhow::Result<()> {
     let (endpoint, request_timeout, command) = cli.command_or_default();
+    if let CliCommand::Auth { command } = &command {
+        match command {
+            AuthCommand::Bootstrap { username } => {
+                anyhow::ensure!(
+                    std::io::stdin().is_terminal(),
+                    "auth bootstrap requires a local interactive terminal"
+                );
+                let config = crate::config::ServerConfig::from_env()?;
+                let database = crate::database::ServerDatabase::connect(config.database).await?;
+                let password = SecretString::from(rpassword::prompt_password("Admin password: ")?);
+                let confirmation =
+                    SecretString::from(rpassword::prompt_password("Confirm password: ")?);
+                anyhow::ensure!(
+                    password.expose_secret() == confirmation.expose_secret(),
+                    "password confirmation did not match"
+                );
+                crate::web_auth::bootstrap(
+                    std::sync::Arc::new(database),
+                    &username,
+                    password.expose_secret(),
+                )
+                .await?;
+                println!("initial administrator created");
+                return Ok(());
+            }
+        }
+    }
     match command {
         CliCommand::Run(args) => {
             let config = args.resolve()?;
+            config.validate_web()?;
             crate::bootstrap::run_server(config, endpoint).await
         }
         CliCommand::Config {
             command: ConfigCommand::Check(args),
         } => {
             let config = args.resolve()?;
+            config.validate_web()?;
             println!(
                 "configuration is valid: listen={}:{} database={}",
                 config.address,
@@ -335,6 +365,7 @@ async fn execute_remote(
         | CliCommand::Config {
             command: ConfigCommand::Check(_),
         } => unreachable!(),
+        CliCommand::Auth { .. } => unreachable!(),
     };
 
     // 先以 create_new 预留目标，防止请求成功后才发现文件已存在而丢失唯一一次的秘密。

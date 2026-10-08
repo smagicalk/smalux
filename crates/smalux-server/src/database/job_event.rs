@@ -8,7 +8,7 @@ use super::{
 };
 use prost::Message;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::OnConflict,
 };
 use smalux_protocol::agent::v1::{JobEvent, JobEventKind};
@@ -32,6 +32,13 @@ pub struct JobEventRecord {
     /// 该事件到达时是否发现同一进程实例的序号缺口。
     pub gap_detected: bool,
     pub payload: Vec<u8>,
+}
+
+/// JobEvent 分页游标；`emitted_at` 使用数据库存储单位微秒。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobEventCursor {
+    pub emitted_at: i64,
+    pub event_id: String,
 }
 
 /// Server 接收并保存一条 Agent Scheduler 事件。
@@ -211,6 +218,76 @@ impl ServerDatabase {
             })
             .collect())
     }
+
+    /// 按事件时间与 ID 稳定倒序分页；from/to 为毫秒时间戳，区间为 [from, to)。
+    /// `after` 使用记录返回的微秒时间戳与 ID，查询结果只包含游标之后的更旧记录。
+    pub async fn query_job_events(
+        &self,
+        agent_id: Option<&str>,
+        job_id: Option<&[u8]>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        after: Option<&JobEventCursor>,
+        limit: u64,
+    ) -> Result<Vec<JobEventRecord>, DatabaseError> {
+        let mut query = job_event::Entity::find();
+        if let Some(agent_id) = agent_id {
+            query = query.filter(job_event::Column::AgentId.eq(agent_id));
+        }
+        if let Some(job_id) = job_id {
+            query = query.filter(job_event::Column::JobId.eq(job_id.to_vec()));
+        }
+        if let Some(from_ms) = from_ms {
+            query =
+                query.filter(job_event::Column::EmittedAt.gte(query_timestamp_micros(from_ms)?));
+        }
+        if let Some(to_ms) = to_ms {
+            query = query.filter(job_event::Column::EmittedAt.lt(query_timestamp_micros(to_ms)?));
+        }
+        if let Some(after) = after {
+            query = query.filter(
+                Condition::any()
+                    .add(job_event::Column::EmittedAt.lt(after.emitted_at))
+                    .add(
+                        Condition::all()
+                            .add(job_event::Column::EmittedAt.eq(after.emitted_at))
+                            .add(job_event::Column::EventId.lt(after.event_id.as_str())),
+                    ),
+            );
+        }
+        Ok(query
+            .order_by_desc(job_event::Column::EmittedAt)
+            .order_by_desc(job_event::Column::EventId)
+            .limit(limit.clamp(1, 101))
+            .all(self.connection())
+            .await?
+            .into_iter()
+            .map(|row| JobEventRecord {
+                event_id: row.event_id,
+                agent_id: row.agent_id,
+                instance_id: row.instance_id,
+                sequence: row.sequence,
+                kind: row.kind,
+                job_id: row.job_id,
+                revision: row.revision,
+                run_id: row.run_id,
+                attempt: row.attempt,
+                emitted_at: row.emitted_at,
+                message: row.message,
+                will_retry: row.will_retry,
+                gap_detected: row.gap_detected,
+                payload: row.payload,
+            })
+            .collect())
+    }
+}
+
+fn query_timestamp_micros(timestamp_ms: i64) -> Result<i64, DatabaseError> {
+    timestamp_ms.checked_mul(1_000).ok_or_else(|| {
+        DatabaseError::InvalidJobEvent(
+            "query timestamp in milliseconds exceeds i64 microseconds".to_owned(),
+        )
+    })
 }
 
 /// 把 16 字节事件实例编码成固定长度的小写十六进制文本。
@@ -394,5 +471,117 @@ mod tests {
             database.append_job_event("agent-a", &event).await,
             Err(DatabaseError::InvalidJobEvent(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn query_job_events_filters_and_pages_by_timestamp_then_id() {
+        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .unwrap();
+        let job_id: &[u8] = b"job-a";
+        for (event_id, agent_id, row_job_id, emitted_at) in [
+            ("z", "agent-a", job_id, 2_500),
+            ("m", "agent-a", job_id, 2_500),
+            ("a", "agent-a", job_id, 2_500),
+            ("q", "agent-a", job_id, 2_499),
+            ("from-inclusive", "agent-a", job_id, 2_000),
+            ("before-from", "agent-a", job_id, 1_999),
+            ("at-to", "agent-a", job_id, 3_000),
+            ("other-agent", "agent-b", job_id, 2_600),
+            ("other-job", "agent-a", &b"job-b"[..], 2_600),
+        ] {
+            insert_job_event(&database, event_id, agent_id, row_job_id, emitted_at).await;
+        }
+
+        let page = database
+            .query_job_events(Some("agent-a"), Some(job_id), Some(2), Some(3), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "m", "a", "q", "from-inclusive"]
+        );
+
+        let next_page = database
+            .query_job_events(
+                Some("agent-a"),
+                Some(job_id),
+                Some(2),
+                Some(3),
+                Some(&JobEventCursor {
+                    emitted_at: 2_500,
+                    event_id: "m".to_owned(),
+                }),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next_page
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "q", "from-inclusive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_job_events_clamps_limit_to_one_through_one_hundred() {
+        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .unwrap();
+        for index in 0..101 {
+            insert_job_event(
+                &database,
+                &format!("event-{index:03}"),
+                "agent-a",
+                b"job-a",
+                i64::from(index),
+            )
+            .await;
+        }
+        let minimum = database
+            .query_job_events(None, None, None, None, None, 0)
+            .await
+            .unwrap();
+        let maximum = database
+            .query_job_events(None, None, None, None, None, 500)
+            .await
+            .unwrap();
+        assert_eq!(minimum.len(), 1);
+        assert_eq!(maximum.len(), 101);
+    }
+
+    async fn insert_job_event(
+        database: &ServerDatabase,
+        event_id: &str,
+        agent_id: &str,
+        job_id: &[u8],
+        emitted_at: i64,
+    ) {
+        job_event::Entity::insert(job_event::ActiveModel {
+            event_id: Set(event_id.to_owned()),
+            agent_id: Set(agent_id.to_owned()),
+            instance_id: Set(event_id.as_bytes().to_vec()),
+            sequence: Set(1),
+            kind: Set(JobEventKind::SchedulerStarted as i32),
+            job_id: Set(job_id.to_vec()),
+            revision: Set(0),
+            run_id: Set(Vec::new()),
+            attempt: Set(0),
+            emitted_at: Set(emitted_at),
+            run_at: Set(None),
+            duration_ms: Set(0),
+            message: Set(String::new()),
+            will_retry: Set(false),
+            pending_count: Set(0),
+            gap_detected: Set(false),
+            payload: Set(Vec::new()),
+        })
+        .exec(database.connection())
+        .await
+        .unwrap();
     }
 }

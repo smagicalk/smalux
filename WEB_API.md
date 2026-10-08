@@ -3,15 +3,27 @@ title: Smalux Web API v1 设计参考
 status: draft / proposed
 apiVersion: v1
 designVersion: 1.0.0
-implementation: 未实现；本文为设计草案，不是可调用接口清单
+implementation: 已实现登录、session.info、Agent 只读目录、Job 只读目录、Report/Event 摘要查询及 CPU/内存 metrics WS 子集；写 API 等仍为规划
 scope: 单 Server 管理域；首版按 Rust 优先分期
 ---
 
 # Smalux Web API v1 设计参考
 
-> **草案（draft / proposed）**。本文只定义拟议契约、权限和安全边界，不代表任一 Web API 已实现或可通过 `curl` 调用。普通 HTTP 当前仅有 `/api/v1/health`；Agent gRPC 与本地 CLI 属于既有通道，不因此获得本文定义的 Web 能力。前端 `api.md` 是 Mock 需求索引，不是后端实现证据。
+> **总体仍为分期草案（draft / proposed）**。当前已实现并默认关闭的子集包括本地管理员 bootstrap、`POST /api/v1/auth/login`、`GET /api/v1/auth/session`、`POST /api/v1/auth/logout`、`GET /api/v1/meta`，以及 `/api/v1/rpc` 的 `session.info`、`metrics.latest`、`agent.list/get`、`job.list/get`、`report.list`、`event.list`；`/api/v1/ws` 已实现 CPU/内存 metrics 订阅。其余方法不能因出现在本文或前端 Mock 清单而视为可调用；既有 health、Agent gRPC 与本地 CLI 保持原用途。
 >
-> v1 是面向单个 Smalux Server 管理域的 Web 契约版本；Agent 是被管理主机，不是 Server 实例。本文推荐方案尚待设计验收，特别是部署域名、保留期、会话期限、角色策略细节和具体生产容量需在实施前确认。本文不含代码、数据库迁移或依赖变更。
+> v1 是面向单个 Smalux Server 管理域的 Web 契约版本；Agent 是被管理主机，不是 Server 实例。本文包含已实现子集与后续提案；列于后续分期的接口仍需设计验收，不代表当前已实现或已批准。当前 Web 只读子集无需新增 Agent/Job/Report 迁移；生产容量、数据库后端和 TLS 反代仍待验收。
+
+### 当前已实现的 Web 子集
+
+实现位于 `crates/smalux-server/src/web_auth.rs` 与 `web_auth/store.rs`，安全边界见 `web_auth/SPEC.md`，运行配置见 Server README。用户已批准同源 HTTPS 反代、仅显式回环 HTTP 开发例外、CLI 隐藏输入初始化、独立迁移，以及默认 absolute=24h / idle=30min。数据库包含用户、会话摘要、安全事件和唯一 bootstrap claim；不保存原始 Cookie。
+
+认证写入要求 `Origin`、`Content-Type: application/json`、`X-Smalux-Client: web`；有效会话 logout 另需 `X-CSRF-Token`。REST 错误为 `{error:{kind,message}}`，HTTP JSON-RPC 仅接受单请求对象、显式 id。已开放 `session.info`、`metrics.latest`、`agent.list/get`、`job.list/get`、`report.list`、`event.list`；写操作、用户管理及完整资源级授权仍未实现。metrics 查询沿用显式绑定与 CPU/内存约束；报告/事件列表要求 admin/operator，Agent 列表详情可由已登录角色读取。
+
+CPU/内存通过 `SMALUX_WEB_METRICS_BINDINGS` 显式绑定现有 CLI Job；配置格式和上限见 Server README。每次查询在读事务内校验 Agent、当前启用 Job revision/type 与报告 oneof；按 `started_at DESC NULLS LAST, received_at DESC, report_id DESC LIMIT 1` 选择报告，不按最后到达覆盖旧样本。各组时间独立；默认 60 秒后 stale，缺数据/非法值保持 null 和质量原因。绑定配置排序后 SHA-256 前 16 字节转十进制字符串作为 `bindingRevision`；改配置需重启，无绑定管理写入或新增迁移。
+
+WS 仅同源 Cookie + 精确 Origin，不要求浏览器自定义认证头、不接受 URL 凭据。每 2 秒查询相同投影并在快照变化时推送；非事件总线、无重放日志。logout 主动断开对应流，独立 1 秒周期复查用户/会话/Agent；快照与 WS 心跳/推送不延长 idle TTL。详细控制协议与边界见 §5.5。
+
+前端尚未接入本次新增的 Agent/Job/Report/Event 查询，真实模式仍显示登录与身份/能力状态；指标/WS 面板也待前端适配。Job 写 API、操作状态 API、用户管理、改密、MFA、历史指标、网络/operation topic 均未交付。不代表 R0–R3 全量完成。生产 TLS 由同机反代承担，跨进程限流、实际 PostgreSQL/MySQL 与生产容量待独立验收。
 
 ## 1. 目标、原则与非目标
 
@@ -247,9 +259,24 @@ HTTP 401/403/413/429 是认证、授权、传输体积和限流边界；已通�
 
 内联结果 VO 在对应方法行逐字段定义。
 
-## 5. 已规划 RPC 方法目录
+## 5. RPC 方法目录与实现状态
 
-下表 method 均拟经 `POST /api/v1/rpc` JSON-RPC 2.0 调用，当前均未实现。`req`/`opt` 列分别表示必需/可选参数；普通写入还需 `clientMutationId` 和相应 CAS revision。通用 `page/pageSize/limit` 默认值见 §2.2。错误按 §3；方法需在实施版本目录显式声明实际状态。
+下表定义的目标契约经 `POST /api/v1/rpc` 以 JSON-RPC 2.0 调用。实现状态以本段及 `session.info` 能力目录为准：当前实现 `session.info`、CPU/内存 `metrics.latest`、`agent.list/get`、`job.list/get`、`report.list`、`event.list`。其中 R2 方法目前为不改库的过渡只读 DTO，参数和返回形状尚不等同下表目标 VO，详见“当前已实现只读 RPC 过渡契约”；其余方法仍为规划或 unsupported。`req`/`opt` 列分别表示目标契约必需/可选参数；目标写接口需要幂等键与适用的 CAS。
+### 当前已实现只读 RPC 过渡契约
+
+以下是当前 wire 响应，不等同于下表拟定的完整 `AgentSummary` / `JobView` / `CursorPage`。前端或集成客户端现阶段应按此处的 DTO 调用；未来升级至目标契约时需显式版本化或兼容迁移，不应悄然改变响应形状。
+
+| 方法 | 请求 params | 当前 result | 限制与语义 |
+| --- | --- | --- | --- |
+| `agent.list` | `{status?,name?,online?,limit?,after?}` | `{items,nextCursor,hasMore}` | limit 默认 50，范围 1..100；游标为稳定 Agent ID；字段只有 `agentId,displayName,authorizationStatus,online,createdAtMs,updatedAtMs,revokedAtMs`。列表只用已登录会话授权，不依赖客户端传入角色。 |
+| `agent.get` | `{agentId}` | 同一 Agent summary | 缺失 ID 返回 `NOT_FOUND`。 |
+| `job.list` | `{agentId}` | `{agentId,catalogRevision,jobs}` | 返回完整权威目录 summary；最多 1024 项/1 MiB；无目录表示 revision `"0"`、空 jobs。summary 仅含 Job ID、revision、enabled、taskKind。 |
+| `job.get` | `{agentId,jobId}` | `{agentId,catalogRevision,job}` | 返回当前只读 Job summary，与 `job.list` 同字段；不向 Web 暴露原始 Protobuf。Job ID 必须为规范小写 UUID。 |
+| `report.list` | `{agentId,jobId?,fromMs?,toMs?,cursor?,limit?}` | `{items,nextCursor,hasMore}` | 仅 admin/operator；limit 默认 50，范围 1..100；from/to 必须成对，范围 `[fromMs,toMs)`；按 receivedAtMs 倒序和 reportId 倒序稳定分页；仅摘要，无原始 payload。 |
+| `event.list` | `{agentId,jobId?,fromMs?,toMs?,cursor?,limit?}` | `{items,nextCursor,hasMore}` | 仅 admin/operator；limit 和时间范围同上；按 emittedAtMs 倒序和 eventId 倒序；只返回已存事件摘要。 |
+
+报告与事件游标在当前实现中编码为 `timestampMicros|recordId`；它是分页位置，不承担授权或签名功能。数据库时间过滤从 Unix 毫秒换算到存储微秒。API 查询不新增表或迁移。
+
 
 ### 5.1 会话、用户和注册接入
 
@@ -342,8 +369,6 @@ desired config（数据库中的 Job/runtime 期望状态）、apply operation�
   "id": "request-uuid",
   "method": "job.create",
   "params": {
-    "clientMutationId": "mutation-uuid",
-    "clientMutationId": "00000000-0000-4000-8000-000000000004",
     "clientMutationId": "00000000-0000-4000-8000-000000000004",
       "name": "CPU 采集",
       "task": { "kind": "smalux.collect.cpu.v1", "config": {} },
@@ -395,20 +420,22 @@ desired config（数据库中的 Job/runtime 期望状态）、apply operation�
 
 ### 5.5 WebSocket 实时控制
 
-WS 端点为 `GET /api/v1/ws` Upgrade。仅接受 JSON-RPC 2.0 的 `stream.subscribe`、`stream.unsubscribe`、`stream.ping` 控制请求。业务写、普通 CRUD、Job 操作和公开站点管理一律拒绝。握手校验有效会话与 allowlisted Origin；每个订阅在创建、重连和每次数据推送时应用权限与资源授权。
+WS 端点为 `GET /api/v1/ws` Upgrade，随 Web 开关启用。只接受 JSON-RPC 2.0 单对象控制请求，id 为 1–128 字符串或 JS 安全整数；最近 128 个 id 禁止重复。业务写、普通 CRUD 和 Job 操作拒绝。握手要求有效 Cookie 和精确可信 Origin，订阅与推送都重新授权；输入上限 64 KiB，单连接每分钟最多 120 条文本控制请求。
 
-| 方法/通知 | 阶段 | 权限 | 输入 | 输出/失败 |
+| 方法/通知 | 实现状态 | 权限 | 输入 | 输出/失败 |
 | --- | --- | --- | --- | --- |
-| `stream.subscribe` | R3 | viewer+ | `topic,agentIds,metrics?,sinceCursor?` | `SubscriptionAck`；超订阅数、无权资源、空 agentIds 均拒绝。 |
-| `stream.subscribe` | R3 | viewer+；订阅 operation 仅 operator+ | `topic,agentIds?,metrics?,sinceCursor?` | `SubscriptionAck`；超订阅数、无权资源或空 topic 范围均拒绝。 |
-| `stream.unsubscribe` | R3 | 原订阅主体 | `subscriptionId,streamEpoch` | `UnsubscribeAck`；epoch 不匹配不取消新流。 |
-| `stream.notification` | R3 | 订阅授权范围 | 服务端推送 `StreamEnvelope` | 数据通知、`resyncRequired` 或 operation 状态；断线后 HTTP 查询为权威恢复方式。 |
+| `stream.subscribe` | 已实现 metrics | viewer+ | `topic:"metrics",agentIds,metrics?,sinceCursor?` | `SubscriptionAck`；其他 topic 返回 UNSUPPORTED_FEATURE。 |
+| `stream.unsubscribe` | 已实现 | 原连接订阅主体 | `subscriptionId,streamEpoch` | `{subscriptionId,streamEpoch,unsubscribed:boolean}`；epoch 不匹配不取消新流。 |
+| `stream.ping` | 已实现 | 有效会话 | `{}` | `{serverTimeMs,streamEpoch}`，不延长 idle TTL。 |
+| `stream.notification` | 已实现 metrics/resync | 订阅授权范围 | 服务端推送 | `{subscriptionId,streamEpoch,sequence,kind,data}`。 |
 
-`SubscriptionAck` 字段：`subscriptionId:string`、`streamEpoch:string`、`sequence:UInt64String`、`snapshot:MetricsLatest[]|null`。`UnsubscribeAck` 为 `{subscriptionId,streamEpoch,unsubscribed:boolean}`；`Pong` 为 `{serverTimeMs,streamEpoch}`。`StreamEnvelope` 为 `{subscriptionId,streamEpoch,sequence:UInt64String,kind:string,data:JsonObject}`；kind=`metrics.update|operation.update|resyncRequired`。metrics payload 为 §4 VO，operation payload 为 `OperationView`。
+`SubscriptionAck` 为 `{subscriptionId:string,streamEpoch:string,sequence:"0",snapshot:MetricsLatest[]}`。每次订阅生成新的 UUID epoch 和全量快照；`sequence` 为递增十进制字符串。更新通知 kind=`metrics.update`，data=`{items:MetricsLatest[]}`，为该订阅当前完整投影；客户端不得合入旧 epoch 消息。未选指标组不输出，未知值不填零。
 
-`SubscriptionAck` 字段：`subscriptionId:string`、`streamEpoch:string`、`sequence:UInt64String`、`snapshot:MetricsLatest[]|OperationSnapshot[]|null`；topic=`metrics|operation`，metrics 的 agentIds 必需且快照为 MetricsLatest[]，operation 的 agentIds 可省略但资源集由 operator+ 授权且快照为 OperationSnapshot[]（`{items:OperationView[],cursor:string|null}`）。viewer 订阅 operation 返回 FORBIDDEN。`UnsubscribeAck` 为 `{subscriptionId,streamEpoch,unsubscribed:boolean}`；`Pong` 为 `{serverTimeMs,streamEpoch}`。`StreamEnvelope` 为 `{subscriptionId,streamEpoch,sequence:UInt64String,kind:"metrics.update"|"operation.update"|"resyncRequired",data:JsonObject}`；resyncRequired data 固定 `{reason:"sequenceGap"|"queueOverflow"|"epochChanged",snapshotRequired:true,latestSequence:UInt64String|null}`。snapshot 与通知均按 topic/权限裁剪；普通写仍只走 HTTP RPC。
+本版无跨连接重放日志：可选 `sinceCursor` 为 1–256 字符字符串，但不承诺续传。带 cursor 的订阅先返回新 epoch 全量 ACK，再发 sequence=`"1"` 的 `resyncRequired`，data=`{reason:"epochChanged",snapshotRequired:true,latestSequence:"1"}`。后续序号从 2 开始。重连、序号缺口或队列过载后必须重新取得权威快照；不能回退 Mock。
 
-建议初始消息上限 `1 MiB`、每连接 16 个订阅、每订阅最多 200 个 Agent、最小推送间隔 1s/默认 2s；上线前通过容量测试确定配置。轮询模式使用 `metrics.latest` 同一 VO（建议 5s，页面隐藏时可降频），不得以 no-op subscribe 或旧 Mock 维持画面。WS 数据不含原始 Process/Socket、凭据、未授权 report。
+固定资源上限：全进程 32 个连接、每连接 16 个订阅，每订阅及连接内去重 Agent 总数最多 100；输出单消息最多 1 MiB，发送队列 32 条，读库/发送超时 5 秒。默认每 2 秒合并检查变化。满队列/出站过大/发送超时直接关闭（1013），不保证拥塞时能再排入 resync 通知；认证失效关闭（1008）。外部吊销或到期在独立 1 秒检查及有界读库完成后断流，Server 关闭取消任务。
+
+operation topic、operation 快照/通知、可恢复 cursor 重放仍为后续设计，不在能力目录标为 available。普通写始终只走 HTTP RPC；当前 WS 不含原始 Process/Socket、凭据或未授权 report。以上上限不是已完成生产容量验证的声明。
 
 ## 6. REST 身份、元信息和文件传输
 

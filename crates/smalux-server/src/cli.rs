@@ -47,6 +47,13 @@ impl Cli {
     }
 }
 
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    Bootstrap {
+        #[arg(long, value_name = "USERNAME")]
+        username: String,
+    },
+}
 /// Server 的启动命令和本地管理命令集合。
 #[derive(Subcommand)]
 pub enum CliCommand {
@@ -97,6 +104,11 @@ pub enum CliCommand {
         /// 具体密钥环只读操作。
         #[command(subcommand)]
         command: KeyringCommand,
+    },
+    /// 初始化唯一首个 Web 管理员；密码仅通过本地隐藏提示输入。
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     /// 请求正在运行的 Server 优雅关闭。
     Shutdown(ConfirmationArgs),

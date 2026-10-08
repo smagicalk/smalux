@@ -17,6 +17,7 @@ pub(crate) fn build_app_router(app_state: AppState) -> anyhow::Result<Router> {
     let request_id_header = HeaderName::from_static("x-request-id");
     tracing::debug!(header = %request_id_header, "installing common Server request ID propagation");
     Ok(Router::new()
+        .merge(crate::web_auth::router())
         .merge(frontend_routes)
         .merge(agent_routes)
         .layer(
@@ -73,6 +74,14 @@ mod tests {
             max_agent_sessions: crate::config::DEFAULT_MAX_AGENT_SESSIONS,
             max_registration_sessions: crate::config::DEFAULT_MAX_REGISTRATION_SESSIONS,
             max_grpc_message_bytes: crate::config::DEFAULT_MAX_GRPC_MESSAGE_BYTES,
+            web_enabled: false,
+            web_origin: None,
+            web_development: false,
+            web_absolute_ttl_seconds: 86_400,
+            web_idle_ttl_seconds: 1_800,
+            web_login_limit: 30,
+            web_metrics_bindings: "[]".to_owned(),
+            web_metrics_stale_seconds: 60,
         }
     }
 

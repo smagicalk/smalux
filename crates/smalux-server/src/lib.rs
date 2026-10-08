@@ -12,6 +12,8 @@ pub(crate) mod route;
 /// Server 业务服务，包括 Agent 注册、密钥环、Session 和 gRPC transport。
 pub mod service;
 mod state;
+mod web_auth;
+mod web_metrics;
 
 /// SeaORM 连接、实体和滚动迁移层。
 pub mod database;

@@ -14,6 +14,7 @@ pub(crate) async fn run_server(
     server_config: crate::config::ServerConfig,
     control_endpoint: std::path::PathBuf,
 ) -> anyhow::Result<()> {
+    server_config.validate_web()?;
     tracing::info!(
         address = %server_config.address,
         port = server_config.port,

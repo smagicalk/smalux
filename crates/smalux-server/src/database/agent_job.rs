@@ -6,7 +6,7 @@ use prost::Message;
 use sea_orm::{
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
     sea_query::{Expr, OnConflict},
 };
 use smalux_protocol::agent::v1::{
@@ -15,9 +15,13 @@ use smalux_protocol::agent::v1::{
 };
 use uuid::Uuid;
 
+use super::web_job_operations::{
+    WEB_OPERATION_BLOCKED, WEB_OPERATION_PENDING, WEB_OPERATION_SENT, WEB_OPERATION_SUPERSEDED,
+    WEB_OPERATION_WAITING_AGENT,
+};
 use super::{
     DatabaseError, ServerDatabase,
-    entity::{agent_job, agent_job_catalog, agent_job_version},
+    entity::{agent_job, agent_job_catalog, agent_job_version, web_job_operation},
 };
 
 /// 数据库目录提交后的完整权威快照。
@@ -53,6 +57,47 @@ impl ServerDatabase {
         jobs: Vec<JobDefinition>,
         expected_revision: Option<u64>,
     ) -> Result<AgentJobCatalogRecord, DatabaseError> {
+        let transaction = self.connection().begin().await?;
+        let record = Self::replace_agent_job_catalog_in_transaction(
+            &transaction,
+            agent_id,
+            jobs,
+            expected_revision,
+        )
+        .await?;
+        let target_revision = i64::try_from(record.catalog.catalog_revision).map_err(|_| {
+            DatabaseError::InvalidJobCatalog("catalog revision exceeds i64".to_owned())
+        })?;
+        web_job_operation::Entity::update_many()
+            .col_expr(
+                web_job_operation::Column::State,
+                Expr::value(WEB_OPERATION_SUPERSEDED),
+            )
+            .col_expr(
+                web_job_operation::Column::UpdatedAt,
+                Expr::value(record.updated_at),
+            )
+            .filter(web_job_operation::Column::AgentId.eq(agent_id))
+            .filter(web_job_operation::Column::TargetCatalogRevision.lt(target_revision))
+            .filter(web_job_operation::Column::State.is_in([
+                WEB_OPERATION_PENDING,
+                WEB_OPERATION_WAITING_AGENT,
+                WEB_OPERATION_SENT,
+                WEB_OPERATION_BLOCKED,
+            ]))
+            .exec(&transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    /// 在调用方持有的事务中校验并替换目录，供 Web operation 一并原子提交。
+    pub(super) async fn replace_agent_job_catalog_in_transaction(
+        transaction: &DatabaseTransaction,
+        agent_id: &str,
+        jobs: Vec<JobDefinition>,
+        expected_revision: Option<u64>,
+    ) -> Result<AgentJobCatalogRecord, DatabaseError> {
         validate_agent_id(agent_id)?;
         let mut validated = Vec::with_capacity(jobs.len());
         for definition in jobs {
@@ -69,7 +114,6 @@ impl ServerDatabase {
             ));
         }
 
-        let transaction = self.connection().begin().await?;
         let now = unix_micros()?;
         let expected_revision = expected_revision
             .map(|value| {
@@ -81,7 +125,7 @@ impl ServerDatabase {
             })
             .transpose()?;
         let previous = agent_job_catalog::Entity::find_by_id(agent_id)
-            .one(&transaction)
+            .one(transaction)
             .await?;
         let actual_revision = previous.as_ref().map(|value| value.revision).unwrap_or(0);
         if let Some(expected_revision) = expected_revision
@@ -108,13 +152,13 @@ impl ServerDatabase {
                     .do_nothing()
                     .to_owned(),
             )
-            .exec(&transaction)
+            .exec(transaction)
             .await;
             match insert {
                 Ok(_) => {}
                 Err(sea_orm::DbErr::RecordNotInserted) => {
                     let actual = agent_job_catalog::Entity::find_by_id(agent_id)
-                        .one(&transaction)
+                        .one(transaction)
                         .await?
                         .map(|value| value.revision)
                         .unwrap_or(0);
@@ -146,11 +190,11 @@ impl ServerDatabase {
                 .col_expr(agent_job_catalog::Column::UpdatedAt, Expr::value(now))
                 .filter(agent_job_catalog::Column::AgentId.eq(agent_id))
                 .filter(agent_job_catalog::Column::Revision.eq(expected_revision))
-                .exec(&transaction)
+                .exec(transaction)
                 .await?;
             if updated.rows_affected != 1 {
                 let actual = agent_job_catalog::Entity::find_by_id(agent_id)
-                    .one(&transaction)
+                    .one(transaction)
                     .await?
                     .map(|value| value.revision)
                     .unwrap_or(0);
@@ -172,7 +216,7 @@ impl ServerDatabase {
                 .filter(agent_job_version::Column::AgentId.eq(agent_id))
                 .filter(agent_job_version::Column::JobId.eq(definition.job_id.clone()))
                 .order_by_desc(agent_job_version::Column::Revision)
-                .one(&transaction)
+                .one(transaction)
                 .await?
                 && revision < latest.revision
             {
@@ -184,7 +228,7 @@ impl ServerDatabase {
 
         agent_job::Entity::delete_many()
             .filter(agent_job::Column::AgentId.eq(agent_id))
-            .exec(&transaction)
+            .exec(transaction)
             .await?;
         for (definition, task_kind) in &validated {
             let job_id = Uuid::from_slice(&definition.job_id).map_err(|_| {
@@ -193,7 +237,7 @@ impl ServerDatabase {
             let definition_payload = definition.encode_to_vec();
             let version_key = format!("{agent_id}:{job_id}:{}", definition.revision);
             if let Some(previous_version) = agent_job_version::Entity::find_by_id(&version_key)
-                .one(&transaction)
+                .one(transaction)
                 .await?
             {
                 if previous_version.task_kind != *task_kind
@@ -215,7 +259,7 @@ impl ServerDatabase {
                     definition: Set(definition_payload.clone()),
                     created_at: Set(now),
                 })
-                .exec(&transaction)
+                .exec(transaction)
                 .await?;
             }
             agent_job::Entity::insert(agent_job::ActiveModel {
@@ -231,7 +275,7 @@ impl ServerDatabase {
                 created_at: Set(now),
                 updated_at: Set(now),
             })
-            .exec(&transaction)
+            .exec(transaction)
             .await?;
         }
 
@@ -243,7 +287,7 @@ impl ServerDatabase {
                     let mut active: agent_job_catalog::ActiveModel = previous.into();
                     active.revision = Set(revision);
                     active.updated_at = Set(now);
-                    active.update(&transaction).await?;
+                    active.update(transaction).await?;
                 }
             }
             None => {
@@ -253,13 +297,11 @@ impl ServerDatabase {
                         revision: Set(revision),
                         updated_at: Set(now),
                     })
-                    .exec(&transaction)
+                    .exec(transaction)
                     .await?;
                 }
             }
         }
-        transaction.commit().await?;
-
         Ok(AgentJobCatalogRecord {
             agent_id: agent_id.to_owned(),
             catalog: ReplaceAllJobs {

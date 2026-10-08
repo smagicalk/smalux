@@ -726,6 +726,7 @@ mod tests {
                     max_agent_sessions: 256,
                     max_registration_sessions: 32,
                     max_grpc_message_bytes: 1024 * 1024,
+                    ..crate::config::ServerConfig::default().runtime_config()
                 },
                 CancellationToken::new(),
             ),

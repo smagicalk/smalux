@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::OnConflict,
 };
 use smalux_protocol::agent::v1::{TaskReport, task_result};
@@ -29,6 +29,13 @@ pub struct TaskReportRecord {
     pub result_kind: String,
     pub payload: Vec<u8>,
     pub received_at: i64,
+}
+
+/// TaskReport 分页游标；`received_at` 使用数据库存储单位微秒。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskReportCursor {
+    pub received_at: i64,
+    pub report_id: String,
 }
 
 impl ServerDatabase {
@@ -160,6 +167,74 @@ impl ServerDatabase {
             })
             .collect())
     }
+
+    /// 按接收时间与 ID 稳定倒序分页；from/to 为毫秒时间戳，区间为 [from, to)。
+    /// `after` 使用记录返回的微秒时间戳与 ID，查询结果只包含游标之后的更旧记录。
+    pub async fn query_task_reports(
+        &self,
+        agent_id: Option<&str>,
+        job_id: Option<&[u8]>,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        after: Option<&TaskReportCursor>,
+        limit: u64,
+    ) -> Result<Vec<TaskReportRecord>, DatabaseError> {
+        let mut query = task_report::Entity::find();
+        if let Some(agent_id) = agent_id {
+            query = query.filter(task_report::Column::AgentId.eq(agent_id));
+        }
+        if let Some(job_id) = job_id {
+            query = query.filter(task_report::Column::JobId.eq(job_id.to_vec()));
+        }
+        if let Some(from_ms) = from_ms {
+            query =
+                query.filter(task_report::Column::ReceivedAt.gte(query_timestamp_micros(from_ms)?));
+        }
+        if let Some(to_ms) = to_ms {
+            query =
+                query.filter(task_report::Column::ReceivedAt.lt(query_timestamp_micros(to_ms)?));
+        }
+        if let Some(after) = after {
+            query = query.filter(
+                Condition::any()
+                    .add(task_report::Column::ReceivedAt.lt(after.received_at))
+                    .add(
+                        Condition::all()
+                            .add(task_report::Column::ReceivedAt.eq(after.received_at))
+                            .add(task_report::Column::ReportId.lt(after.report_id.as_str())),
+                    ),
+            );
+        }
+        Ok(query
+            .order_by_desc(task_report::Column::ReceivedAt)
+            .order_by_desc(task_report::Column::ReportId)
+            .limit(limit.clamp(1, 101))
+            .all(self.connection())
+            .await?
+            .into_iter()
+            .map(|row| TaskReportRecord {
+                report_id: row.report_id,
+                agent_id: row.agent_id,
+                job_id: row.job_id,
+                job_revision: row.job_revision,
+                run_id: row.run_id,
+                attempt: row.attempt,
+                scheduled_at: row.scheduled_at,
+                started_at: row.started_at,
+                result_kind: row.result_kind,
+                payload: row.payload,
+                received_at: row.received_at,
+            })
+            .collect())
+    }
+}
+
+fn query_timestamp_micros(timestamp_ms: i64) -> Result<i64, DatabaseError> {
+    timestamp_ms.checked_mul(1_000).ok_or_else(|| {
+        DatabaseError::InvalidTaskReport(
+            "query timestamp in milliseconds exceeds i64 microseconds".to_owned(),
+        )
+    })
 }
 
 fn result_kind(report: &TaskReport) -> Result<String, DatabaseError> {
@@ -439,5 +514,161 @@ mod tests {
             database.append_task_report("agent-a", &report).await,
             Err(DatabaseError::InvalidTaskReport(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn query_task_reports_filters_and_pages_by_timestamp_then_id() {
+        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .unwrap();
+        let job_id = Uuid::new_v4();
+        let other_job = Uuid::new_v4();
+        seed_report_agent(&database, "agent-a", 1, &[job_id, other_job]).await;
+        seed_report_agent(&database, "agent-b", 2, &[job_id]).await;
+        for (report_id, agent_id, row_job_id, received_at) in [
+            ("z", "agent-a", job_id.as_bytes(), 2_500),
+            ("m", "agent-a", job_id.as_bytes(), 2_500),
+            ("a", "agent-a", job_id.as_bytes(), 2_500),
+            ("q", "agent-a", job_id.as_bytes(), 2_499),
+            ("from-inclusive", "agent-a", job_id.as_bytes(), 2_000),
+            ("before-from", "agent-a", job_id.as_bytes(), 1_999),
+            ("at-to", "agent-a", job_id.as_bytes(), 3_000),
+            ("other-agent", "agent-b", job_id.as_bytes(), 2_600),
+            ("other-job", "agent-a", other_job.as_bytes(), 2_600),
+        ] {
+            insert_task_report(&database, report_id, agent_id, row_job_id, received_at).await;
+        }
+
+        let page = database
+            .query_task_reports(
+                Some("agent-a"),
+                Some(job_id.as_bytes()),
+                Some(2),
+                Some(3),
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|row| row.report_id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "m", "a", "q", "from-inclusive"]
+        );
+
+        let next_page = database
+            .query_task_reports(
+                Some("agent-a"),
+                Some(job_id.as_bytes()),
+                Some(2),
+                Some(3),
+                Some(&TaskReportCursor {
+                    received_at: 2_500,
+                    report_id: "m".to_owned(),
+                }),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next_page
+                .iter()
+                .map(|row| row.report_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "q", "from-inclusive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_task_reports_clamps_limit_to_one_through_one_hundred() {
+        let database = ServerDatabase::connect(DatabaseConfig::new("sqlite::memory:"))
+            .await
+            .unwrap();
+
+        let job_id = Uuid::new_v4();
+        seed_report_agent(&database, "agent-a", 3, &[job_id]).await;
+        for index in 0..101 {
+            insert_task_report(
+                &database,
+                &format!("report-{index:03}"),
+                "agent-a",
+                job_id.as_bytes(),
+                i64::from(index),
+            )
+            .await;
+        }
+        let minimum = database
+            .query_task_reports(None, None, None, None, None, 0)
+            .await
+            .unwrap();
+        let maximum = database
+            .query_task_reports(None, None, None, None, None, 500)
+            .await
+            .unwrap();
+        assert_eq!(minimum.len(), 1);
+        assert_eq!(maximum.len(), 101);
+    }
+
+    async fn seed_report_agent(
+        database: &ServerDatabase,
+        agent_id: &str,
+        public_key_byte: u8,
+        job_ids: &[Uuid],
+    ) {
+        let now = unix_micros().unwrap();
+        agent::Entity::insert(agent::ActiveModel {
+            agent_id: Set(agent_id.to_owned()),
+            name: Set(agent_id.to_owned()),
+            public_key: Set(vec![public_key_byte; 32]),
+            status: Set("active".to_owned()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            revoked_at: Set(None),
+        })
+        .exec(database.connection())
+        .await
+        .unwrap();
+        let definitions = job_ids
+            .iter()
+            .map(|job_id| JobDefinition {
+                job_id: job_id.as_bytes().to_vec(),
+                revision: 1,
+                enabled: true,
+                task: Some(TaskDefinition {
+                    task: Some(task_definition::Task::Cpu(Default::default())),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        database
+            .replace_agent_job_catalog(agent_id, definitions)
+            .await
+            .unwrap();
+    }
+
+    async fn insert_task_report(
+        database: &ServerDatabase,
+        report_id: &str,
+        agent_id: &str,
+        job_id: &[u8],
+        received_at: i64,
+    ) {
+        task_report::Entity::insert(task_report::ActiveModel {
+            report_id: Set(report_id.to_owned()),
+            agent_id: Set(agent_id.to_owned()),
+            job_id: Set(job_id.to_vec()),
+            job_revision: Set(1),
+            run_id: Set(Uuid::new_v4().as_bytes().to_vec()),
+            attempt: Set(1),
+            scheduled_at: Set(None),
+            started_at: Set(None),
+            result_kind: Set("cpu".to_owned()),
+            payload: Set(Vec::new()),
+            received_at: Set(received_at),
+        })
+        .exec(database.connection())
+        .await
+        .unwrap();
     }
 }

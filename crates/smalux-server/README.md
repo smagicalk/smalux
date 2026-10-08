@@ -25,12 +25,13 @@
 - 注册 Token 签发、查询、吊销，以及 Agent、实时 Session 和 keyring 状态管理；
 - `Ctrl+C` 取消通知和优雅关闭；
 - `tracing` 控制台日志与按日期/大小滚动的文本日志。
+- 默认关闭的 Web 登录基础：本地管理员初始化、Cookie 会话登录/恢复/退出、meta 和 `session.info`；Argon2id、Origin/CSRF、限流及脱敏安全事件。
 
 仍未完成的应用能力包括：
 
-- 面向 Web 页面的管理 HTTP API、用户登录和操作审计；
+- Web 写操作 API、用户管理/改密和完整操作审计；当前仅有 Agent/Job/Report/Event 只读查询子集；
 - 面向 Web 页面的 Job 编辑 API、任务模板和批量 Agent 分配；
-- Web 管理端和租户/用户授权；
+- Agent/Job 等 Web 业务页面适配、租户和资源级授权；
 - Server 进程自身的 TLS listener（生产环境建议由 Nginx/Cloudflare 终止 TLS）；
 - 多实例之间的注册表、Token 和业务数据一致性策略。
 
@@ -70,6 +71,69 @@ crates/smalux-server/
     ├── migration/              # 数据库 schema
     └── keyring.rs              # Server keyring 快照读写
 ```
+
+## Web 登录基础（可选）
+
+首次在本地交互终端初始化管理员，命令直接使用数据库配置，不依赖运行中的 Server：
+
+```powershell
+cargo run -p smalux-server -- auth bootstrap --username admin
+```
+
+密码隐藏输入两次，要求 12–128 个字符且 UTF-8 不超过 512 字节；无默认密码、无公开注册接口，重复初始化拒绝。用户名为 3–64 个 ASCII 字母/数字/`.`/`_`/`-`，统一小写。先备份现有数据库；启动自动追加独立迁移，不改写旧迁移。新增 `web_users`、`web_sessions`、`web_auth_events` 和防并发重复初始化的 `web_bootstrap`。
+
+开发环境必须让浏览器与 API 同源，例如同源开发反代监听 `127.0.0.1:5173`，转发 `/api/` 到 Server 的 `127.0.0.1:12345`：
+
+```powershell
+$env:SMALUX_WEB_ENABLED = "true"
+$env:SMALUX_WEB_DEVELOPMENT = "true"
+$env:SMALUX_WEB_ORIGIN = "http://127.0.0.1:5173"
+cargo run -p smalux-server -- run
+```
+
+`SMALUX_WEB_ORIGIN` 是浏览器访问的规范 origin，不带末尾 `/`、路径或通配符。生产设置 `SMALUX_WEB_DEVELOPMENT=false`，origin 使用 `https://console.example.com`，由同机反代终止 TLS，Server 必须回环监听；反代应覆盖/丢弃客户端提供的转发头。Server 不信任 `Forwarded`/`X-Forwarded-*`，不开放跨域 CORS，也不自带 TLS listener。不要开启包含绑定参数的数据库调试日志或请求正文日志。
+
+可选配置：`SMALUX_WEB_SESSION_TTL_SECONDS=86400`、`SMALUX_WEB_IDLE_TTL_SECONDS=1800`、`SMALUX_WEB_LOGIN_LIMIT_PER_MINUTE=30`。TTL 为正、idle 不超过 absolute，absolute 最长一年；登录限流 1–10000 次/分钟，另有 2 个并发哈希上限。限流是单进程内存状态，重启清空。
+
+独立前端 `app-config.json` 设 `enableMock:false`、`transport:"http"`、`authApiBaseUrl:"/api/v1"`；保留其他已有配置，避免把 `/api` 再拼进认证路径。真实模式只显示登录与服务端身份/能力状态，不挂载尚未接通的 Mock 业务页面。默认 Mock 模式保持不变。
+
+登录/退出要求 JSON、精确 `Origin` 和 `X-Smalux-Client: web`；退出另需 `X-CSRF-Token`。Cookie 为 HttpOnly/SameSite=Strict，生产带 Secure；所有认证响应 no-store。数据库仅存 Cookie 摘要，退出持久吊销并主动关闭该会话 WS；会话校验读取用户启用状态及绝对/空闲期限。启动和登录时清理过期/吊销超过 7 天的会话和超过 30 天的安全事件。完整权限管理、改密、MFA、Agent/Job/Report/Event 只读 RPC 已接入；用户管理、改密、Job 写入、Operation 和完整资源级授权仍未实现。
+
+### CPU/内存快照与 WebSocket（Rust 已实现）
+
+先用既有 CLI 创建 CPU 和内存采集 Job，再配置 Agent 到 Job 的只读绑定。例如下面 UUID 仅为格式示例，必须替换为当前 Agent 的真实 Job ID：
+
+```powershell
+$env:SMALUX_WEB_METRICS_BINDINGS = '[{"agentId":"agent-a","cpuJobId":"00000000-0000-4000-8000-000000000001","memoryJobId":"00000000-0000-4000-8000-000000000002"}]'
+$env:SMALUX_WEB_METRICS_STALE_SECONDS = "60"
+```
+
+绑定默认 `[]`，最多 1000 项/256 KiB；Agent ID 为 1–128 个可打印非空白 ASCII 字符，Job ID 为规范小写带连字符 UUID。每组 Job 可省略，但 CPU/内存不能绑定同一个 Job；重复 Agent、未知字段和非法值启动时拒绝。stale 阈值 1–86400 秒。修改配置需重启；不自动创建 Job、不提供绑定管理写 API、不新增数据库迁移。
+
+HTTP：登录后调用 `POST /api/v1/rpc`，附带同源 Cookie、Origin、JSON 和 `X-Smalux-Client: web`：
+
+```json
+{"jsonrpc":"2.0","id":"latest-1","method":"metrics.latest","params":{"agentIds":["agent-a"],"metrics":["cpu","memory"]}}
+```
+
+`metrics` 省略时查询两组；Agent 1–100 个且唯一，指标 1–2 个且唯一。未配置/不存在/吊销的 Agent 一律 FORBIDDEN；未绑定组、无报告返回 unknown/null，来源缺失/禁用/类型不符返回 unavailable/null。真实零值保留；过期样本保留值并标 stale，非法百分比、不安全整数字节或未来时间不能标 valid。来源只取当前启用 Job revision 的报告，按采样时间而非到达时间选最新，不暴露原始 payload。
+
+WS：同源浏览器连接 `/api/v1/ws`（生产 wss；反代需转发 Upgrade），只用现有 HttpOnly Cookie + 精确 Origin，不把凭据放 URL，也不要求浏览器自定义认证头。发送：
+
+```json
+{"jsonrpc":"2.0","id":"sub-1","method":"stream.subscribe","params":{"topic":"metrics","agentIds":["agent-a"]}}
+```
+
+先收到 `{subscriptionId,streamEpoch,sequence:"0",snapshot:[...]}`；随后 `stream.notification` 的 `params.kind="metrics.update"`，`params.data={items:[...]}`。每 2 秒读库检查，仅变化时推送。`stream.unsubscribe` 传 subscriptionId/streamEpoch；`stream.ping` 传 `{}`。每次订阅均新 epoch 和全量快照；带旧 sinceCursor 时另发 resyncRequired，不提供历史重放。
+
+快照、心跳和推送不续 idle TTL；独立 1 秒检查禁用/吊销/过期，读库超时 5 秒，失败关闭。上限为 32 连接/进程、16 订阅/连接、100 去重 Agent/连接、64 KiB 输入、1 MiB 输出、32 条发送队列、120 条文本控制/分钟；过载或发送超时关闭后须重新取快照。此为有界数据库轮询驱动的服务端推送，不是事件总线或已验收的生产容量。
+
+本批没有修改独立前端，指标面板/WS 适配待下批接入。Report/Event 摘要只读 RPC 已实现；metrics.history、网络速率、operation topic 和 Job CRUD 仍未实现。协议细节见根目录 `WEB_API.md` §5.5。
+### Agent/Job/Report/Event 只读 RPC（Rust 已实现）
+
+默认 Web 登录开启后，`POST /api/v1/rpc` 还提供 `agent.list`、`agent.get`、`job.list`、`job.get`、`report.list`、`event.list`。它们复用 Server `AdminService`、Job catalog 与已有报告/事件表，无需新增迁移；查询有界、拒绝未知参数字段，报告/事件仅返回摘要，不暴露 payload。列表采用 Agent ID 游标或时间+记录 ID 的稳定游标；报告/事件时间过滤单位为 UTC Unix 毫秒，范围 `[fromMs,toMs)`。
+
+`agent.list`/`agent.get` 当前只返回数据库已有的身份元数据与进程内在线状态，不伪造 region/labels/note 等未存字段；在线状态只反映当前 Server 进程观察到的已认证 Session。列表请求 `{status?,name?,online?,limit?,after?}`，使用 Agent ID 字典序游标。`job.list/get` 返回 Server 权威 Job catalog 与 revision；Job 仍使用 Protobuf `JobDefinition`，Web 只读 DTO 只提供 jobId/revision/enabled/taskKind 等 summary，不提供完整调度参数或插件私有配置。`report.list`/`event.list` 请求按 Agent、可选 Job、`fromMs/toMs` 半开时间窗和游标分页；Report 按 `received_at`，Event 按 `emitted_at`，均以时间和 ID 稳定倒序。列表只返回摘要、不含 payload；默认仅 admin/operator 可读，其他角色返回 FORBIDDEN。此批未实现 Job 写入、metadata 修改、Operation 状态、raw report payload 读取或细粒度 Agent ACL。
 
 ## 启动
 
@@ -204,8 +268,8 @@ Invoke-RestMethod http://127.0.0.1:12345/api/v1/health
 
 Server 的 gRPC 路由使用 `tonic::service::Routes::into_axum_router()` 后再 `nest` 到
 `/api/v1/grpc`。因此它可以和 Axum 普通 HTTP 路由共用端口，但普通 HTTP、WebSocket 和
-gRPC 仍然由不同路径区分。当前正式 Server 只装配 health 和 Agent gRPC；完整 REST/WebSocket
-对照流程请运行 Protocol Example。
+gRPC 仍然由不同路径区分。正式 Server 保留 health 与 Agent gRPC；显式启用 Web 后额外提供
+`/api/v1/auth/login`、`/api/v1/auth/session`、`/api/v1/auth/logout`、`/api/v1/meta`，以及 `/api/v1/rpc` 上的 `session.info`、CPU/内存 `metrics.latest`、Agent/Job 只读目录和 Report/Event 摘要查询；`/api/v1/ws` 提供 CPU/内存 metrics 订阅。写 API、完整资源级授权和 Web 业务页面仍未实现。
 
 顶层 Router 会：
 

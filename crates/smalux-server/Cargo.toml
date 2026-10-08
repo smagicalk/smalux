@@ -13,11 +13,13 @@ tokio = { version = "1.52.3", features = ["full"] }
 # Tokio 扩展工具，用于 codec、IO、超时和取消控制。
 tokio-util = { version = "0.7.18", features = ["codec", "io", "io-util", "time", "rt"] }
 # HTTP 服务框架，用于管理 API 和后续 gRPC 路由装配。
-axum = { version = "0.8.9", features = ["http2", "macros", "multipart"] }
+axum = { version = "0.8.9", features = ["http2", "macros", "multipart", "ws"] }
 # Axum 扩展能力，提供 typed header、cookie、文件流和增强路由。
 axum-extra = { version = "0.12.6", features = ["async-read-body", "attachment", "cached", "cookie", "cookie-key-expansion", "cookie-private", "cookie-signed", "erased-json", "error-response", "file-stream", "form", "handler", "json-deserializer", "json-lines", "middleware", "multipart", "optional-path", "query", "routing", "scheme", "typed-header", "typed-routing", "with-rejection"] }
 # 通用 Service 中间件，用于超时、重试、缓冲、限流和负载保护。
 tower = { version = "0.5.3", features = ["full"] }
+# WebSocket 分离读写与有界发送。
+futures-util = { version = "0.3", features = ["sink"] }
 # HTTP 专用中间件，用于 trace、CORS、压缩、request ID 和静态文件。
 tower-http = { version = "0.7.0", features = ["full"] }
 # 基于 governor 的 Axum 限流中间件。
@@ -58,15 +60,20 @@ validator = { version = "0.20.0", features = ["derive"] }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 # 使用操作系统密码学随机源生成注册 Token ID 和 XXpsk3 PSK。
 getrandom = "0.3.4"
-# 时间处理与序列化，用于数据库字段、过期时间和 API 输出。
+# Password hashing with Argon2id, SHA-256 session digests, constant-time comparisons, and local hidden prompts.
+argon2 = "0.5"
+sha2 = "0.10"
+subtle = "2.6"
+rpassword = "7.4"
+# Time handling and serialization for database fields, expiry, and API output.
 time = { version = "0.3.53", features = ["serde", "formatting", "parsing", "macros", "local-offset"] }
-# URL 构造与编码，用于数据库连接地址和外部链接。
+# URL construction and encoding for database connections and external links.
 url = "2.5.8"
-# 敏感值包装，避免 token、secret 和 PSK 被 Debug 或日志泄露。
+# Sensitive value wrapper to prevent accidental debug/log disclosure.
 secrecy = { version = "0.10.3", features = ["serde"] }
-# 编译期嵌入前端资源，仅在 frontend-embed feature 开启时使用。
+# Compile-time embed frontend assets; only used when frontend-embed feature is enabled.
 rust-embed = { version = "8.12.0", optional = true }
-# 根据资源文件名推断 Content-Type，仅用于内嵌前端资源。
+# Infer Content-Type by embedded resource filename.
 mime_guess = { version = "2.0.5", optional = true }
 # 项目公共基础库，复用日志、工具和跨 crate 类型。
 smalux-core = { path = "../smalux-core" }
@@ -89,6 +96,8 @@ snow = "0.10.0"
 ctor = "1.0.8"
 # 使用正式 Agent Client 验证 Token 注册、状态落盘和 IK 重连链路。
 smalux-agent = { path = "../smalux-agent" }
+# 使用真实客户端验证 WS Upgrade、订阅及会话撤销。
+tokio-tungstenite = "0.29"
 
 [target.'cfg(windows)'.dependencies]
 # 为本地管理命名管道设置仅本机所有者/管理员可访问的 ACL。

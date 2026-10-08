@@ -27,6 +27,7 @@ pub(crate) struct AppState {
     pub(crate) shutdown: CancellationToken,
     /// CLI 与未来管理 API 共用的应用服务。
     pub(crate) management: Arc<crate::management::AdminService>,
+    pub(crate) web_auth: crate::web_auth::WebAuth,
     /// 只有最后一个 AppState 所有者释放时才取消后台任务，避免普通 Clone 提前关闭。
     _shutdown_owner: Arc<ShutdownOwner>,
 }
@@ -81,10 +82,26 @@ impl AppState {
             "Server application state assembled"
         );
         Ok(Self {
-            database,
+            database: Arc::clone(&database),
             agent,
             shutdown,
             management,
+            web_auth: crate::web_auth::WebAuth::new(
+                Arc::clone(&database),
+                crate::web_auth::WebAuthConfig {
+                    enabled: runtime_config.web_enabled,
+                    origin: runtime_config.web_origin.clone().unwrap_or_default(),
+                    absolute_ms: runtime_config.web_absolute_ttl_seconds as i64 * 1000,
+                    idle_ms: runtime_config.web_idle_ttl_seconds as i64 * 1000,
+                    login_limit: runtime_config.web_login_limit,
+                    secure: !runtime_config.web_development,
+                },
+                crate::web_metrics::MetricsConfig::parse(
+                    &runtime_config.web_metrics_bindings,
+                    runtime_config.web_metrics_stale_seconds,
+                )?,
+            )
+            .await?,
             _shutdown_owner: shutdown_owner,
         })
     }

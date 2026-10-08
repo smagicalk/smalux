@@ -25,6 +25,12 @@ const MAX_GRPC_MESSAGE_BYTES_ENV: &str = "SMALUX_AGENT_MAX_MESSAGE_BYTES";
 const SHUTDOWN_GRACE_SECONDS_ENV: &str = "SMALUX_SERVER_SHUTDOWN_GRACE_SECONDS";
 const LISTEN_ADDRESS_ENV: &str = "SMALUX_SERVER_LISTEN_ADDRESS";
 const LISTEN_PORT_ENV: &str = "SMALUX_SERVER_LISTEN_PORT";
+const WEB_ENABLED_ENV: &str = "SMALUX_WEB_ENABLED";
+const WEB_ORIGIN_ENV: &str = "SMALUX_WEB_ORIGIN";
+const WEB_DEV_ENV: &str = "SMALUX_WEB_DEVELOPMENT";
+const WEB_ABSOLUTE_TTL_ENV: &str = "SMALUX_WEB_SESSION_TTL_SECONDS";
+const WEB_IDLE_TTL_ENV: &str = "SMALUX_WEB_IDLE_TTL_SECONDS";
+const WEB_LOGIN_LIMIT_ENV: &str = "SMALUX_WEB_LOGIN_LIMIT_PER_MINUTE";
 
 /// Server 启动配置错误。
 ///
@@ -55,6 +61,14 @@ pub(crate) struct ServerConfig {
     pub(crate) max_grpc_message_bytes: usize,
     /// Server 收到关闭信号后等待长期会话退出的最长秒数。
     pub(crate) shutdown_grace_seconds: u64,
+    pub(crate) web_enabled: bool,
+    pub(crate) web_origin: Option<String>,
+    pub(crate) web_development: bool,
+    pub(crate) web_absolute_ttl_seconds: u64,
+    pub(crate) web_idle_ttl_seconds: u64,
+    pub(crate) web_login_limit: usize,
+    pub(crate) web_metrics_bindings: String,
+    pub(crate) web_metrics_stale_seconds: u64,
 }
 
 /// 已经进入运行态的安全 Server 配置。
@@ -68,6 +82,14 @@ pub(crate) struct RuntimeConfig {
     pub(crate) max_agent_sessions: usize,
     pub(crate) max_registration_sessions: usize,
     pub(crate) max_grpc_message_bytes: usize,
+    pub(crate) web_enabled: bool,
+    pub(crate) web_origin: Option<String>,
+    pub(crate) web_development: bool,
+    pub(crate) web_absolute_ttl_seconds: u64,
+    pub(crate) web_idle_ttl_seconds: u64,
+    pub(crate) web_login_limit: usize,
+    pub(crate) web_metrics_bindings: String,
+    pub(crate) web_metrics_stale_seconds: u64,
 }
 
 impl ServerConfig {
@@ -96,10 +118,76 @@ impl ServerConfig {
                 SHUTDOWN_GRACE_SECONDS_ENV,
                 DEFAULT_SHUTDOWN_GRACE_SECONDS,
             )?,
+            web_enabled: read_bool(WEB_ENABLED_ENV, false)?,
+            web_origin: env::var(WEB_ORIGIN_ENV).ok().filter(|v| !v.is_empty()),
+            web_development: read_bool(WEB_DEV_ENV, false)?,
+            web_absolute_ttl_seconds: read_positive_u64(WEB_ABSOLUTE_TTL_ENV, 86_400)?,
+            web_idle_ttl_seconds: read_positive_u64(WEB_IDLE_TTL_ENV, 1_800)?,
+            web_login_limit: read_positive_usize(WEB_LOGIN_LIMIT_ENV, 30)?,
+            web_metrics_bindings: env::var("SMALUX_WEB_METRICS_BINDINGS")
+                .unwrap_or_else(|_| "[]".to_owned()),
+            web_metrics_stale_seconds: read_positive_u64("SMALUX_WEB_METRICS_STALE_SECONDS", 60)?,
         })
     }
+    pub(crate) fn validate_web(&self) -> anyhow::Result<()> {
+        crate::web_metrics::MetricsConfig::parse(
+            &self.web_metrics_bindings,
+            self.web_metrics_stale_seconds,
+        )?;
+        if !self.web_enabled {
+            return Ok(());
+        }
+        let origin = self
+            .web_origin
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("SMALUX_WEB_ORIGIN is required when Web is enabled"))?;
+        let url = url::Url::parse(origin)?;
+        anyhow::ensure!(
+            origin == url.origin().ascii_serialization() && !origin.contains('*'),
+            "SMALUX_WEB_ORIGIN must be an exact canonical origin without a trailing slash"
+        );
+        anyhow::ensure!(
+            url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.path() == "/",
+            "SMALUX_WEB_ORIGIN must contain only a scheme, host, and optional port"
+        );
+        let host = url
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("SMALUX_WEB_ORIGIN must include a host"))?;
+        let ip = match host {
+            url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+            url::Host::Domain(_) => None,
+        };
+        let listener: std::net::IpAddr = self.address.parse()?;
+        anyhow::ensure!(listener.is_loopback(), "Web requires a loopback listener");
+        if self.web_development {
+            anyhow::ensure!(
+                url.scheme() == "http" && ip.is_some_and(|v| v.is_loopback()),
+                "development Web origin must use loopback HTTP"
+            );
+        } else {
+            anyhow::ensure!(
+                url.scheme() == "https",
+                "production Web origin must use HTTPS"
+            );
+        }
+        anyhow::ensure!(
+            (1..=31_536_000).contains(&self.web_absolute_ttl_seconds)
+                && self.web_idle_ttl_seconds > 0
+                && (1..=10_000).contains(&self.web_login_limit),
+            "Web TTL must be positive and at most one year; login limit must be 1-10000"
+        );
+        anyhow::ensure!(
+            self.web_idle_ttl_seconds <= self.web_absolute_ttl_seconds,
+            "Web idle TTL must not exceed absolute TTL"
+        );
+        Ok(())
+    }
 
-    /// 提取不包含数据库秘密的运行态配置。
     pub(crate) fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
             address: self.address.clone(),
@@ -107,10 +195,17 @@ impl ServerConfig {
             max_agent_sessions: self.max_agent_sessions,
             max_registration_sessions: self.max_registration_sessions,
             max_grpc_message_bytes: self.max_grpc_message_bytes,
+            web_enabled: self.web_enabled,
+            web_origin: self.web_origin.clone(),
+            web_development: self.web_development,
+            web_absolute_ttl_seconds: self.web_absolute_ttl_seconds,
+            web_idle_ttl_seconds: self.web_idle_ttl_seconds,
+            web_login_limit: self.web_login_limit,
+            web_metrics_bindings: self.web_metrics_bindings.clone(),
+            web_metrics_stale_seconds: self.web_metrics_stale_seconds,
         }
     }
 }
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -121,7 +216,27 @@ impl Default for ServerConfig {
             max_registration_sessions: DEFAULT_MAX_REGISTRATION_SESSIONS,
             max_grpc_message_bytes: DEFAULT_MAX_GRPC_MESSAGE_BYTES,
             shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
+            web_enabled: false,
+            web_origin: None,
+            web_development: false,
+            web_absolute_ttl_seconds: 86_400,
+            web_idle_ttl_seconds: 1_800,
+            web_login_limit: 30,
+            web_metrics_bindings: "[]".to_owned(),
+            web_metrics_stale_seconds: 60,
         }
+    }
+}
+fn read_bool(name: &'static str, default: bool) -> Result<bool, ServerConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| ServerConfigError::InvalidEnvironment { name, value }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(value)) => Err(ServerConfigError::InvalidEnvironment {
+            name,
+            value: value.to_string_lossy().into_owned(),
+        }),
     }
 }
 

@@ -20,6 +20,7 @@ mod plugin_runtime;
 mod plugin_schema;
 pub(crate) use plugin_runtime::{AgentPluginRuntimeRecord, StoredPluginRuntime};
 mod task_report;
+mod web_job_operations;
 
 pub use crate::config::{
     DATABASE_ACQUIRE_TIMEOUT_ENV, DATABASE_CONNECT_TIMEOUT_ENV, DATABASE_IDLE_TIMEOUT_ENV,
@@ -34,8 +35,9 @@ pub(crate) use agent_registration::{
 };
 pub use connection::ServerDatabase;
 pub use error::DatabaseError;
-pub(crate) use job_event::JobEventRecord;
+pub(crate) use job_event::{JobEventCursor, JobEventRecord};
 pub use keyring::ServerKeyRingRecord;
 pub(crate) use management::{AgentRecord, RegistrationTokenRecord, RevokeTokenOutcome};
 pub use plugin_schema::PluginSchemaRecord;
-pub(crate) use task_report::TaskReportRecord;
+pub(crate) use task_report::{TaskReportCursor, TaskReportRecord};
+pub(crate) use web_job_operations::{WebJobOperationDraft, WebJobOperationRecord};
